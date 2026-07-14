@@ -38,10 +38,54 @@ don't use.
 
 ## The central question, answered: does `sysinfo` surface udisks/KDE USB mounts?
 
-**No USB was attached during this research** — verified: `/run/media/` is empty, `/media`
-does not exist, `/mnt` is empty, and `/dev/disk/by-id/` contains *no* `usb-*` symlinks
-(only the internal NVMe). So the removable-mount path was **not exercised at runtime**.
-The answer below is therefore read off the crate's source, not an observed USB row.
+**Runtime-confirmed on 2026-07-15 with two external USB disks attached.** The initial
+research (below) settled this from source because no USB was attached; a follow-up then
+plugged in two external drives and observed both the unmounted and mounted states directly.
+The source-level prediction held exactly.
+
+### Runtime confirmation (two external USB disks)
+
+Two disks attached: `sda` = 58.6 GB USB stick (vfat), `sdb` = 953.9 GB USB **SSD** (exfat,
+label `Youri`).
+
+**State 1 — plugged in but NOT mounted** (`/run/media/$USER` empty). `sysinfo` returned
+**only the 2 internal mounts** (`/`, `/boot/efi`); neither USB disk appeared. This confirms
+the caveat at runtime: **a present-but-unmounted drive is invisible** — `sysinfo` lists
+mounts, not devices.
+
+**State 2 — both mounted via udisks** (`udisksctl mount`, landing at
+`/run/media/youri/0D21-5F9B` and `/run/media/youri/Youri`, the exact KDE path). `sysinfo`
+then returned **4 disks**:
+
+```
+mount=/                          fs=ext4  removable=false avail= 74.2G total= 600.4G
+mount=/boot/efi                  fs=vfat  removable=false avail=  1.1G total=   1.1G
+mount=/run/media/youri/0D21-5F9B fs=vfat  removable=true  avail= 56.1G total=  62.9G
+mount=/run/media/youri/Youri     fs=exfat removable=true  avail=973.1G total=1024.2G
+```
+
+Both `/run/media` mounts appeared, with correct fstype, correct free space, and
+`is_removable = true`.
+
+### Nuance found at runtime: `is_removable` ≠ kernel RM flag
+
+`sdb` (the USB SSD) reports kernel `RM=0` in `lsblk` — it is *not* a "removable" device in
+the traditional sense — yet `sysinfo` reports `is_removable = true` for it. That is because
+`sysinfo` derives the flag from **USB attachment** (`/dev/disk/by-id/usb-*`), not the block
+layer's RM bit. For #5 this is the *better* behaviour: our "is there an external drive?"
+preselection catches USB-attached SSDs/HDDs that the `lsblk RM` flag would miss. Treat
+`is_removable` as "USB-attached," not "thumb-drive."
+
+### Design implication for #5 (surfaced, not decided here)
+
+#5's Rescan flow assumes the user's target drive is *mounted*. State 1 shows that on this
+KDE setup, **plugging a disk in does not auto-mount it** — the disk is invisible to the
+pick-list until the user opens it in Dolphin (or otherwise mounts it). The alpha may want to
+detect plugged-but-unmounted removable devices and offer to mount them (udisks/`udisksctl`),
+rather than silently omitting a drive the user just connected. Logged to the map's *Not yet
+specified* fog.
+
+### Original source-level analysis
 
 Reading `sysinfo-0.39.6/src/unix/linux/disk.rs`, enumeration works like this:
 
@@ -61,12 +105,12 @@ Reading `sysinfo-0.39.6/src/unix/linux/disk.rs`, enumeration works like this:
    node matches. A udisks-mounted USB partition (e.g. `/dev/sdb1`) has a
    `by-id/usb-…-part1` symlink, so it would report `is_removable = true`.
 
-**Conclusion:** a plugged-in, udisks/KDE-mounted USB stick under `/run/media/$USER/…`
-**will** appear in `Disks::list()` with `is_removable = true`. This is a source-level
-certainty (the `/run/media` carve-out and the `usb-` by-id scan are unambiguous), pending a
-future runtime confirmation with an actual stick attached. Caveat: a USB drive that is
-*present but not mounted* is **not** returned — `sysinfo` only ever lists mounts, so the
-pick-list shows removable targets only once the user (or udisks) has mounted them.
+**Conclusion:** a plugged-in, udisks/KDE-mounted USB drive under `/run/media/$USER/…`
+appears in `Disks::list()` with `is_removable = true` — predicted from source and since
+**runtime-confirmed** (see the runtime section above). Caveat, also confirmed at runtime: a
+USB drive that is *present but not mounted* is **not** returned — `sysinfo` only ever lists
+mounts, so the pick-list shows removable targets only once the user (or udisks) has mounted
+them.
 
 ## What it actually returns on this machine
 
@@ -134,9 +178,12 @@ detecting bind mounts. `statvfs(3)` is available via `rustix::fs::statvfs` or
 - `sysinfo` `Cargo.toml`: `default = ["component","disk","network","system","user"]`;
   `disk`, `linux-tmpfs`, `linux-netdevs` features.
 - Runtime probe: a throwaway crate calling `Disks::new_with_refreshed_list()`, built and
-  run on this machine (2 disks returned, as above).
-- Machine state: `lsblk`, `df -hT`, `/proc/self/mountinfo` (62 mounts; 34 squashfs, 6
-  tmpfs), `/run/media` (empty), `/dev/disk/by-id/` (no `usb-*` symlinks).
+  run on this machine — first with no external media (2 disks), then with two USB disks
+  unmounted (still 2 disks), then udisks-mounted (4 disks, both `/run/media` rows with
+  `is_removable = true`).
+- Machine state: `lsblk` (USB SSD `sdb` shows `RM=0` yet `sysinfo` flags it removable),
+  `df -hT`, `/proc/self/mountinfo`, `/run/media/$USER`, `/dev/disk/by-id/usb-*` symlinks for
+  both attached disks.
 - crates.io API (`/api/v1/crates/{sysinfo,nix,rustix}`), fetched 2026-07-15.
 </content>
 </invoke>
