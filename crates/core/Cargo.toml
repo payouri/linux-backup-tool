@@ -1,0 +1,8 @@
+[package]
+name = "linux-backup-core"
+version.workspace = true
+edition.workspace = true
+description = "linux-backup domain logic: Selection model, scanning, crypto, manifest, archive, restore. Zero UI dependencies (ADR-0001) — must never depend on inquire, ratatui, or any terminal/rendering crate."
+
+[dependencies]
+thiserror = "2.0.18"
