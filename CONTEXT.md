@@ -8,6 +8,10 @@ Single-user Linux **environment** backup and restore: capture a user's configs, 
 The thing this tool backs up — the *customization layer* of a user account (configs, keys, shell setup, Plasma layout, package lists, custom paths), as opposed to bulk user data. The content boundary is environment-only.
 _Avoid_: dotfiles (too narrow), user data (that's one specific, default-off Category), files/stuff (too vague)
 
+**Fixture environment**:
+A synthetic, tempdir-rooted, disposable stand-in for a real Environment, built by tests to exercise backup/restore. Distinct from an Environment: it is never a user's actual account, it carries only known files/modes/sensitivity so the round-trip can assert against exactly what was written, and it is thrown away when the test ends.
+_Avoid_: test env, fake home, mock (reserve "mock" for behavior doubles, which this is not)
+
 **Category**:
 One of the ten named groups a path can belong to (e.g. SSH, KDE Plasma, Shell, Program configs, Package lists, User data, Custom paths). Every backed-up path lives in exactly one Category. Each carries a Curated allowlist, a default on/off, and per-entry sensitivity.
 _Avoid_: source, group, section, type
