@@ -3,12 +3,56 @@
 //! will grow this with variants for scan/crypto/archive/restore/profile failures (e.g. the
 //! backup-fails-fast vs. restore-is-best-effort asymmetry from ADR-0002).
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
-/// Placeholder error type for `core`. Variants will be added as each module (scan,
-/// crypto, archive, restore, profile, ...) grows real fallible behavior.
+/// `core`'s single error type. Variants will keep growing as each module (scan, crypto,
+/// archive, restore, profile, ...) grows real fallible behavior.
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),
+
+    /// The target Backup dir already exists. Per story 33 / ADR "collision unit", a
+    /// backup run must refuse rather than silently overwrite a previous one.
+    #[error("backup dir already exists: {0}")]
+    BackupDirExists(PathBuf),
+
+    /// A real read error while scanning or reading an Entry's bytes during backup
+    /// (permission-denied, I/O error, device-gone). Per ADR-0002 this is fatal: the run
+    /// aborts and the freshly-created Backup dir is deleted. Distinct from a Vanished
+    /// (ENOENT) entry, which is benign and does not produce this variant.
+    #[error("failed to read {path}: {source}")]
+    ReadFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Any other I/O failure that isn't specifically one of the above (creating the
+    /// Backup dir, writing the archive/manifest files, cleaning up on failure, ...).
+    #[error("I/O error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Manifest (de)serialization failed.
+    #[error("manifest (de)serialization failed: {0}")]
+    Manifest(#[from] serde_json::Error),
+
+    /// The Backup dir's Manifest could not be found or read during restore.
+    #[error("manifest not found or unreadable in backup dir {0}")]
+    ManifestMissing(PathBuf),
+
+    /// The Archive's checksum did not match `manifest.archive_sha256`. Per ADR-0002 this
+    /// is the one pre-flight condition that aborts a restore before any file is touched.
+    #[error("archive checksum mismatch: expected {expected}, got {actual}")]
+    ArchiveChecksumMismatch { expected: String, actual: String },
+
+    /// The Archive could not be built (tar/zstd pipeline failure) during backup.
+    #[error("failed to build archive: {0}")]
+    ArchiveBuildFailed(String),
 }
