@@ -4,11 +4,19 @@
 //! This is `core`'s authoritative model of what will be backed up; `crates/tui` is a thin
 //! view over it, owning only cursor/scroll state and rendering.
 //!
-//! #19 scope: just enough to represent "these Entries are selected" and derive
-//! `selected_paths`/`total_size` for the round-trip seam. Category defaults, Drill-down
-//! toggles, `encryption_required`, and `warnings` are later sub-issues' jobs (#20-#22).
+//! #20 scope: `SelectionModel::from_smart_defaults` composes a Smart-default Selection
+//! across the full ten-Category taxonomy (`scan::scan_taxonomy`'s precedence + Hide-empty
+//! result), and `warnings()` derives the User-data size warning (story 4) over whatever
+//! Categories ended up in the Selection. Drill-down toggling and `encryption_required` are
+//! #21/#22's jobs — this only needs to represent the *result* of Smart-default composition.
 
 use std::path::{Path, PathBuf};
+
+use crate::catalog;
+use crate::scan::CategoryScan;
+
+/// The size threshold (story 4: ">1GB") above which a User-data Selection earns a warning.
+const USER_DATA_WARNING_THRESHOLD_BYTES: u64 = 1_000_000_000;
 
 /// Whether an Entry's path is anchored under `$HOME` or stands on its own. See
 /// CONTEXT.md's "Re-rooting" entry — this is the Manifest's `root` tag.
@@ -61,10 +69,27 @@ pub struct SelectionModel {
 }
 
 impl SelectionModel {
-    /// Builds a Selection from an already-scanned, already-selected set of Entries.
-    /// Smart defaults / Drill-down toggling over the full Category taxonomy are #20-#21's
-    /// job; #19 only needs to represent the result of that process.
+    /// Builds a Selection from an already-scanned, already-selected set of Entries. Useful
+    /// on its own for a single Category (as the round-trip seam's `shell_selection` helper
+    /// does) or once Drill-down (#21) has finished toggling individual Entries within an
+    /// otherwise Smart-defaulted Selection.
     pub fn new(entries: Vec<Entry>) -> Self {
+        Self { entries }
+    }
+
+    /// Builds a Selection from a full taxonomy scan (`scan::scan_taxonomy`), keeping only
+    /// the Entries of Categories whose Smart default is ON (story 2) — the state the
+    /// Selection surface opens in, before any user toggling or Drill-down deselection.
+    ///
+    /// `scanned` has already had precedence resolution and Hide-empty applied by
+    /// `scan_taxonomy`, so this only has to filter on `smart_default`; it never re-decides
+    /// which Category owns a path.
+    pub fn from_smart_defaults(scanned: &[CategoryScan]) -> Self {
+        let entries = scanned
+            .iter()
+            .filter(|scan| scan.category.smart_default)
+            .flat_map(|scan| scan.entries.iter().cloned())
+            .collect();
         Self { entries }
     }
 
@@ -98,5 +123,94 @@ impl SelectionModel {
     /// than proceed — the bounce itself is `tui` UX, this is the predicate it checks).
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Human-readable warnings derived from the current Selection. Today this is only the
+    /// User-data size warning (story 4: ">1GB"); the live running-total *display* as
+    /// Categories are toggled is `tui`'s job (#30) — this is the pure fact it would render.
+    pub fn warnings(&self) -> Vec<String> {
+        let user_data_size: u64 = self
+            .entries
+            .iter()
+            .filter(|e| e.category == catalog::USER_DATA.name)
+            .filter_map(|e| std::fs::metadata(&e.absolute_path).ok())
+            .map(|m| m.len())
+            .sum();
+
+        let mut warnings = Vec::new();
+        if user_data_size > USER_DATA_WARNING_THRESHOLD_BYTES {
+            warnings.push(format!(
+                "User data selection is {:.2} GB — this Category is large and default-OFF for a reason",
+                user_data_size as f64 / USER_DATA_WARNING_THRESHOLD_BYTES as f64
+            ));
+        }
+        warnings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::CategoryScan;
+    use std::path::PathBuf;
+
+    fn entry(category: &'static str, sensitive: bool, name: &str) -> Entry {
+        Entry {
+            absolute_path: PathBuf::from(format!("/tmp/does-not-need-to-exist/{name}")),
+            relative_path: PathBuf::from(name),
+            root: EntryRoot::Home,
+            category,
+            sensitive,
+        }
+    }
+
+    #[test]
+    fn from_smart_defaults_keeps_only_smart_default_categories() {
+        let scanned = vec![
+            CategoryScan {
+                category: catalog::SSH,
+                entries: vec![entry(catalog::SSH.name, true, "id_ed25519")],
+            },
+            CategoryScan {
+                category: catalog::USER_DATA,
+                entries: vec![entry(catalog::USER_DATA.name, false, "Documents/report.pdf")],
+            },
+        ];
+
+        let selection = SelectionModel::from_smart_defaults(&scanned);
+
+        // SSH defaults ON (story 3) so its Entry is kept; User data defaults OFF (story 4)
+        // so its Entry must not appear even though it was present in the scan.
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(selection.entries()[0].category, catalog::SSH.name);
+    }
+
+    #[test]
+    fn warnings_is_empty_below_the_user_data_threshold() {
+        let selection = SelectionModel::new(vec![entry(catalog::USER_DATA.name, false, "Documents/small.txt")]);
+        assert!(selection.warnings().is_empty());
+    }
+
+    #[test]
+    fn warnings_flags_user_data_over_one_gigabyte() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let big_file = tmp.path().join("Documents/huge.bin");
+        std::fs::create_dir_all(big_file.parent().unwrap()).expect("create dir");
+        // A sparse file: reports the requested length via metadata without actually using
+        // that much disk, which is all `warnings()` reads.
+        let file = std::fs::File::create(&big_file).expect("create big file");
+        file.set_len(USER_DATA_WARNING_THRESHOLD_BYTES + 1).expect("set_len");
+
+        let selection = SelectionModel::new(vec![Entry {
+            absolute_path: big_file,
+            relative_path: PathBuf::from("Documents/huge.bin"),
+            root: EntryRoot::Home,
+            category: catalog::USER_DATA.name,
+            sensitive: false,
+        }]);
+
+        let warnings = selection.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("User data"));
     }
 }

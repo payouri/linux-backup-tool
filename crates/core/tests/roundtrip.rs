@@ -10,9 +10,10 @@
 //! exist so a new test case can be a few lines of setup + assertions rather than
 //! re-deriving the whole seam.
 //!
-//! Per #19's scope, the only Category exercised here is Shell (`catalog::SHELL`,
-//! `.oh-my-zsh/custom/` only) — enough to drive the seam end-to-end without needing the
-//! full ten-Category taxonomy (#20) or sensitivity/encryption policy (#22/#23).
+//! #19's original scope only exercised Shell (`catalog::SHELL`, `.oh-my-zsh/custom/` only).
+//! #20 adds `taxonomy_round_trip_composes_multiple_categories` alongside it (not replacing
+//! it — see that test's doc), proving the full ten-Category taxonomy's precedence + Smart
+//! defaults + Hide-empty compose correctly through the same backup/restore seam.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -95,6 +96,28 @@ fn run_backup(
 
 fn run_restore(backup_dir: &Path, ctx: &RunContext) -> Result<RestoreOutcome, CoreError> {
     linux_backup_core::restore::restore(backup_dir, ctx)
+}
+
+/// Builds a synthetic `$HOME` under `root` exercising more than one Category at once
+/// (#20's taxonomy, composed on top of #19's single-Category seam):
+/// - an SSH key (`catalog::SSH`, Sensitive, default-ON) alongside the Shell fixture files
+///   from [`build_fixture_home`],
+/// - a User-data file (`catalog::USER_DATA`, default-OFF) that must be discoverable by
+///   `scan::scan_taxonomy` but must NOT make it into a Smart-defaults Selection.
+///
+/// Returns the Fixture environment's home path.
+fn build_multi_category_fixture_home(root: &Path) -> PathBuf {
+    let home = build_fixture_home(root);
+
+    let ssh_dir = home.join(".ssh");
+    fs::create_dir_all(&ssh_dir).expect("create .ssh dir");
+    fs::write(ssh_dir.join("id_ed25519"), b"fake-private-key-bytes\n").expect("write id_ed25519");
+
+    let documents_dir = home.join("Documents");
+    fs::create_dir_all(&documents_dir).expect("create Documents dir");
+    fs::write(documents_dir.join("report.pdf"), b"fake-pdf-bytes\n").expect("write report.pdf");
+
+    home
 }
 
 /// Asserts a completed backup+restore round-trip landed correctly: no restore failures,
@@ -289,4 +312,73 @@ fn backup_dir_collides_and_refuses() {
         }
         other => panic!("expected CoreError::BackupDirExists, got {other:?}"),
     }
+}
+
+/// Proves the full ten-Category taxonomy (#20) composes through the same seam #19 proved
+/// for Shell alone: `scan::scan_taxonomy`'s precedence + Hide-empty feeds
+/// `SelectionModel::from_smart_defaults`, and the resulting multi-Category Selection
+/// backs up and restores exactly like a single-Category one.
+///
+/// Fixture has three kinds of content (see `build_multi_category_fixture_home`):
+/// - Shell (default-ON) and SSH (Sensitive, default-ON) both have real matches and must
+///   both land in the Backup;
+/// - User data (default-OFF) has a real match too, but must be *discoverable* by the scan
+///   without being *selected* by Smart defaults — proving default on/off, not just
+///   Hide-empty, drives what a Smart-defaults Selection contains;
+/// - Categories with zero matches on this fixture (GPG, Cloud creds, ...) must not appear
+///   in the scan at all (Hide-empty), except Custom paths, which is exempt.
+#[test]
+fn taxonomy_round_trip_composes_multiple_categories() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_multi_category_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home.clone(), output.clone());
+
+    let scanned = scan::scan_taxonomy(&ctx);
+    let scanned_names: Vec<&str> = scanned.iter().map(|s| s.category.name).collect();
+    assert!(scanned_names.contains(&"Shell"));
+    assert!(scanned_names.contains(&"SSH"));
+    assert!(scanned_names.contains(&"User data"), "User data has a real match and must be discoverable");
+    assert!(scanned_names.contains(&"Custom paths"), "Custom paths is exempt from Hide-empty");
+    assert!(!scanned_names.contains(&"GPG"), "GPG has zero matches on this fixture and must be hidden");
+
+    let selection = SelectionModel::from_smart_defaults(&scanned);
+    let selected_categories: std::collections::BTreeSet<&str> =
+        selection.entries().iter().map(|e| e.category).collect();
+    assert_eq!(
+        selected_categories,
+        std::collections::BTreeSet::from(["Shell", "SSH"]),
+        "Smart defaults must include the default-ON categories and exclude default-OFF User data"
+    );
+    assert!(
+        selection.warnings().is_empty(),
+        "User data isn't in the Smart-defaults Selection at all, so its size warning must not fire"
+    );
+
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    // Three Entries: the two Shell fixture files plus the one SSH key — User data's
+    // report.pdf must be absent because Smart defaults excluded it, not because it wasn't
+    // found.
+    assert_eq!(outcome.manifest.entries.len(), 3);
+    let manifest_categories: std::collections::BTreeSet<&str> =
+        outcome.manifest.entries.iter().map(|e| e.category.as_str()).collect();
+    assert_eq!(manifest_categories, std::collections::BTreeSet::from(["Shell", "SSH"]));
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_outcome = run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+
+    assert!(restore_outcome.failures.is_empty(), "unexpected restore failures: {:?}", restore_outcome.failures);
+    assert_eq!(restore_outcome.restored_paths.len(), 3);
+    assert_eq!(
+        fs::read(restore_home.join(".ssh/id_ed25519")).expect("restored ssh key should exist"),
+        fs::read(home.join(".ssh/id_ed25519")).expect("original ssh key should exist"),
+    );
+    assert!(
+        !restore_home.join("Documents").exists(),
+        "User data was never selected, so nothing should land under Documents on restore"
+    );
 }

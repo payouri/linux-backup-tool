@@ -89,4 +89,9 @@ pub enum CoreError {
     /// already claims that conversion and a type can only implement `From` once.
     #[error("failed to parse lsblk output: {0}")]
     LsblkParseFailed(String),
+
+    /// A Custom path outside `$HOME` was rejected because the current run is non-root
+    /// (stories 10/11). Root may add any path; only non-root is constrained this way.
+    #[error("custom path {path} is outside home ({home}); non-root runs are constrained to under home")]
+    CustomPathOutsideHome { path: PathBuf, home: PathBuf },
 }
