@@ -1107,6 +1107,51 @@ mod tests {
         assert!(parts.is_empty());
     }
 
+    /// `LSBLK_FIXTURE` above always supplies every key, `null` or not — it never exercises
+    /// a key being *absent* outright. Real `lsblk` output omits `children` on every leaf
+    /// device (already covered above) but can plausibly omit other optional columns too
+    /// (e.g. `size`/`fstype` on a device the kernel hasn't finished probing); this pins
+    /// down that an entirely-missing optional key degrades to `None`/`0` rather than
+    /// panicking or erroring, matching serde's documented `Option<T>`-defaults-when-absent
+    /// behavior rather than merely assuming it holds.
+    #[test]
+    fn partition_missing_optional_keys_outright_does_not_panic_and_degrades_gracefully() {
+        let json = r#"{
+           "blockdevices": [
+              {
+                 "name": "sde", "type": "disk", "tran": "usb", "mountpoint": null,
+                 "path": "/dev/sde",
+                 "children": [
+                    { "name": "sde1", "type": "part", "tran": "usb", "path": "/dev/sde1" }
+                 ]
+              }
+           ]
+        }"#;
+        let parts = parse_lsblk_unmounted_usb_partitions(json).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].size, 0);
+        assert_eq!(parts[0].fstype, None);
+    }
+
+    /// A device missing `path` outright can't be turned into a mountable row (there's
+    /// nothing to hand `udisksctl mount -b`), so it must be dropped silently rather than
+    /// panicking — not surfaced as a row with a fabricated or empty device path.
+    #[test]
+    fn partition_missing_path_outright_is_silently_skipped() {
+        let json = r#"{
+           "blockdevices": [
+              {
+                 "name": "sdf", "type": "disk", "tran": "usb", "mountpoint": null,
+                 "children": [
+                    { "name": "sdf1", "type": "part", "tran": "usb", "size": 4000000000 }
+                 ]
+              }
+           ]
+        }"#;
+        let parts = parse_lsblk_unmounted_usb_partitions(json).unwrap();
+        assert!(parts.is_empty());
+    }
+
     // --- mount-outcome parsing (pure, fixture-driven) --------------------------------
 
     #[test]
