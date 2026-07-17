@@ -7,7 +7,12 @@ A Rust desktop tool for backing up and restoring a Linux user's environment — 
 Read before working on any feature:
 
 - **`CONTEXT.md`** at the repo root — the project's ubiquitous language (glossary). Use these exact terms in code, issues, and tests.
-- **`docs/adr/`** — architectural decision records. Read the ones touching your area before changing it, and flag contradictions rather than silently overriding.
+- **`docs/adr/`** — architectural decision records. Read the ones touching your area before changing it, and flag contradictions rather than silently overriding:
+  - [`0001`](docs/adr/0001-core-tui-split-no-dedup-trait.md) — `core`/`tui` Cargo split; no `ArchiveBackend` trait until a second backend exists.
+  - [`0002`](docs/adr/0002-backup-restore-failure-asymmetry.md) — backup fails fast and cleans up; restore is best-effort and reports per-file failures.
+  - [`0003`](docs/adr/0003-plasma-raw-config-copy-not-konsave.md) — Plasma capture copies raw config via a curated allowlist; no `konsave` dependency.
+  - [`0004`](docs/adr/0004-core-runcontext-injection.md) — `core` takes a full injected `RunContext`, reads nothing ambient (see Testing gates below).
+- **`docs/research/`** — dated research notes backing early tickets (package inventory, Plasma capture, Rust crate choices). Check for an existing note before re-researching a settled question.
 
 ## Testing gates
 
