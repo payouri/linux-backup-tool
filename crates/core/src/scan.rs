@@ -1,8 +1,10 @@
 //! `walkdir`-based discovery of Categories' Entries on the current machine: precedence
 //! resolution across overlapping allowlists, Hide-empty computation (a Category with no
-//! matching paths is hidden from Selection), sizing, and the Safety-net scan for
-//! credential-like filenames/extensions outside declared-sensitive Categories (CONTEXT.md's
-//! "Safety-net scan", story 16).
+//! matching paths is hidden from Selection), sizing, and the two per-Entry sensitivity
+//! origins beyond a Category's own blanket tag: `catalog::entry_is_individually_sensitive`
+//! (a declared per-entry tag, e.g. Agents' `.mcp-auth`) and the Safety-net scan for
+//! credential-like filenames/extensions (CONTEXT.md's "Safety-net scan", story 16). All
+//! three origins OR together per CONTEXT.md's "Sensitive" entry.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,9 +28,11 @@ pub fn scan_category(category: &Category, ctx: &RunContext) -> Vec<Entry> {
 
     for allowlist_root in category.allowlist {
         for (absolute_path, relative_path) in walk_allowlist_root(&ctx.home, allowlist_root) {
-            // Strict superset (CONTEXT.md's "Safety-net scan"): the scan can only *add*
-            // sensitivity on top of the Category's own tag, never remove it.
-            let sensitive = category.sensitive || is_safety_net_match(&relative_path);
+            // Strict superset (CONTEXT.md's "Safety-net scan"): each origin can only *add*
+            // sensitivity, never remove what another origin already set.
+            let sensitive = category.sensitive
+                || catalog::entry_is_individually_sensitive(category, &relative_path)
+                || is_safety_net_match(&relative_path);
             entries.push(Entry {
                 absolute_path,
                 relative_path,
@@ -101,9 +105,11 @@ pub fn scan_taxonomy(ctx: &RunContext) -> Vec<CategoryScan> {
             .iter()
             .position(|c| c.name == owner.name)
             .expect("owner came from categories");
-        // Strict superset, same as `scan_category`: Safety-net can only add sensitivity on
-        // top of the owning Category's own tag, never remove it.
-        let sensitive = owner.sensitive || is_safety_net_match(&relative_path);
+        // Strict superset, same as `scan_category`: each origin can only add sensitivity on
+        // top of what another already set, never remove it.
+        let sensitive = owner.sensitive
+            || catalog::entry_is_individually_sensitive(owner, &relative_path)
+            || is_safety_net_match(&relative_path);
         entries_by_category[owner_index].push(Entry {
             absolute_path,
             relative_path,
@@ -377,6 +383,32 @@ mod tests {
             entries[0].sensitive,
             "SSH is a sensitive Category regardless of the filename ('config' matches no \
              Safety-net pattern)"
+        );
+    }
+
+    #[test]
+    fn scan_category_flags_a_per_entry_tagged_file_the_safety_net_scan_would_miss() {
+        // "session.json" matches no Safety-net keyword/extension/prefix at all, and Agents
+        // is not a blanket-Sensitive Category — the only way this Entry can end up
+        // `sensitive: true` is the per-entry tag on `.mcp-auth`
+        // (`catalog::entry_is_individually_sensitive`), proving that origin is real and not
+        // just a rationalization that the Safety-net scan happens to also catch it.
+        assert!(!is_safety_net_match(Path::new("session.json")));
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let mcp_auth_dir = home.join(".mcp-auth");
+        fs::create_dir_all(&mcp_auth_dir).expect("create .mcp-auth dir");
+        fs::write(mcp_auth_dir.join("session.json"), b"{}\n").expect("write session.json");
+
+        let ctx = test_ctx(home);
+        let entries = scan_category(&catalog::AGENTS, &ctx);
+
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].sensitive,
+            "the per-entry tag on .mcp-auth must flag this Entry Sensitive even though \
+             neither the Category nor the Safety-net scan would"
         );
     }
 }

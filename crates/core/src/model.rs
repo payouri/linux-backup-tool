@@ -45,10 +45,11 @@ pub struct Entry {
     pub root: EntryRoot,
     /// The Category name this Entry belongs to.
     pub category: &'static str,
-    /// Whether this Entry is Sensitive: true if its Category is Sensitive, OR the
+    /// Whether this Entry is Sensitive: true if its Category is Sensitive, OR it carries a
+    /// per-entry sensitivity tag (`catalog::entry_is_individually_sensitive`), OR the
     /// Safety-net scan flagged its filename (`scan::is_safety_net_match`) — a strict
-    /// superset, per CONTEXT.md's "Sensitive" entry. Set once at scan time; never
-    /// re-derived here.
+    /// superset of all three origins, per CONTEXT.md's "Sensitive" entry. Set once at scan
+    /// time; never re-derived here.
     pub sensitive: bool,
 }
 
@@ -131,9 +132,10 @@ impl SelectionModel {
     }
 
     /// Whether Auto-insist requires whole-archive encryption for this Selection (stories
-    /// 15/17: any Sensitive Entry — Category-level or Safety-net — forces it on). A thin
-    /// delegate to `crypto::evaluate`, which also exposes exactly which Categories/Entries
-    /// triggered it (story 18) for a TUI to show before prompting for a passphrase.
+    /// 15/17: any Sensitive Entry — Category-level, per-entry tag, or Safety-net — forces it
+    /// on). A thin delegate to `crypto::evaluate`, which also exposes exactly which
+    /// Categories/Entries triggered it (story 18) for a TUI to show before prompting for a
+    /// passphrase.
     pub fn encryption_required(&self) -> bool {
         crypto::evaluate(self).encryption_required
     }

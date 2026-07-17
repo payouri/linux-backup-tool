@@ -22,8 +22,9 @@ pub struct Category {
     pub name: &'static str,
     /// Whether every Entry in this Category is Sensitive (a "sensitive Category" origin,
     /// per CONTEXT.md's "Sensitive" entry). `scan::scan_category`/`scan_taxonomy` OR this
-    /// with the per-Entry Safety-net scan result (#22) — this field alone is never the
-    /// whole story for a given Entry's final `sensitive` bool.
+    /// with [`Category::sensitive_entries`] (the per-entry tag origin) and the per-Entry
+    /// Safety-net scan result (#22) — this field alone is never the whole story for a given
+    /// Entry's final `sensitive` bool.
     pub sensitive: bool,
     /// Whether this Category starts checked (Smart default, story 2). Sensitive Categories
     /// (SSH/GPG/Cloud-creds) and the everyday non-bulk Categories default ON; User data
@@ -36,6 +37,14 @@ pub struct Category {
     /// at start) and for Package lists (its content is captured via `packages::capture_all`
     /// straight into the Manifest, not via filesystem paths — see that module's doc).
     pub allowlist: &'static [&'static str],
+    /// The subset of `allowlist` roots that are individually Sensitive even though the
+    /// Category as a whole is not (CONTEXT.md's "Sensitive" entry: "a per-entry sensitivity
+    /// tag (e.g. some Agents Entries)" — a third origin distinct from both the Category-level
+    /// `sensitive` flag and the Safety-net scan). Each entry here must also appear in
+    /// `allowlist`; an Entry is individually-tagged-sensitive if its relative path starts
+    /// with one of these roots (`entry_is_individually_sensitive`). Empty for every Category
+    /// with no such finer-grained tagging.
+    pub sensitive_entries: &'static [&'static str],
     /// Whether this Category is exempt from Hide-empty (shown even with zero matching
     /// paths). True only for Custom paths — the always-available escape hatch (story 6).
     pub always_shown: bool,
@@ -48,6 +57,7 @@ pub const SSH: Category = Category {
     sensitive: true,
     smart_default: true,
     allowlist: &[".ssh"],
+    sensitive_entries: &[],
     always_shown: false,
 };
 
@@ -57,6 +67,7 @@ pub const GPG: Category = Category {
     sensitive: true,
     smart_default: true,
     allowlist: &[".gnupg"],
+    sensitive_entries: &[],
     always_shown: false,
 };
 
@@ -67,6 +78,7 @@ pub const CLOUD_CREDS: Category = Category {
     sensitive: true,
     smart_default: true,
     allowlist: &[".aws", ".config/gcloud", ".azure"],
+    sensitive_entries: &[],
     always_shown: false,
 };
 
@@ -89,19 +101,22 @@ pub const KDE_PLASMA: Category = Category {
         ".local/share/icons",
         ".local/share/wallpapers",
     ],
+    sensitive_entries: &[],
     always_shown: false,
 };
 
-/// Agents: AI-agent tool state (`.claude`/`.agents`/`.mcp-auth`). The Category itself is
-/// not blanket-Sensitive, but individual auth files under `.mcp-auth` are typically
-/// credential-like enough to be caught by the Safety-net scan (`scan::is_safety_net_match`,
-/// #22) on their filename alone — a separate declarative per-entry tag would need the
-/// allowlist restructured from bare paths into structured entries, which #22 did not do.
+/// Agents: AI-agent tool state (`.claude`/`.agents`/`.mcp-auth`). The Category itself is not
+/// blanket-Sensitive, but `.mcp-auth` (MCP server auth tokens/sessions) is individually
+/// sensitivity-tagged (CONTEXT.md's "Sensitive" entry: "a per-entry sensitivity tag (e.g.
+/// some Agents Entries)") — a declarative tag, not a hope that the Safety-net scan's
+/// keyword/extension list happens to match whatever a given MCP server names its auth
+/// files.
 pub const AGENTS: Category = Category {
     name: "Agents",
     sensitive: false,
     smart_default: true,
     allowlist: &[".claude", ".agents", ".mcp-auth"],
+    sensitive_entries: &[".mcp-auth"],
     always_shown: false,
 };
 
@@ -112,6 +127,7 @@ pub const SHELL: Category = Category {
     sensitive: false,
     smart_default: true,
     allowlist: &[".oh-my-zsh/custom"],
+    sensitive_entries: &[],
     always_shown: false,
 };
 
@@ -134,6 +150,7 @@ pub const PROGRAM_CONFIGS: Category = Category {
         ".config/git",
         ".local/share/fonts",
     ],
+    sensitive_entries: &[],
     always_shown: false,
 };
 
@@ -149,6 +166,7 @@ pub const PACKAGE_LISTS: Category = Category {
     sensitive: false,
     smart_default: true,
     allowlist: &[],
+    sensitive_entries: &[],
     always_shown: false,
 };
 
@@ -168,6 +186,7 @@ pub const USER_DATA: Category = Category {
         "Public",
         "Templates",
     ],
+    sensitive_entries: &[],
     always_shown: false,
 };
 
@@ -179,6 +198,7 @@ pub const CUSTOM_PATHS: Category = Category {
     sensitive: false,
     smart_default: false,
     allowlist: &[],
+    sensitive_entries: &[],
     always_shown: true,
 };
 
@@ -204,6 +224,19 @@ pub const ALL: [Category; 10] = [
 fn category_matches(category: &Category, relative_path: &Path) -> bool {
     category
         .allowlist
+        .iter()
+        .any(|root| relative_path.starts_with(root))
+}
+
+/// Whether `relative_path` falls under one of `category`'s [`Category::sensitive_entries`]
+/// roots — the per-entry sensitivity tag origin (CONTEXT.md's "Sensitive" entry), distinct
+/// from both `category.sensitive` (the whole-Category origin) and the Safety-net scan.
+/// Independent of `category_matches`: a Category's `sensitive_entries` is always a subset of
+/// its `allowlist`, so this only needs to be consulted for a path already resolved to
+/// `category`.
+pub fn entry_is_individually_sensitive(category: &Category, relative_path: &Path) -> bool {
+    category
+        .sensitive_entries
         .iter()
         .any(|root| relative_path.starts_with(root))
 }
@@ -263,6 +296,7 @@ mod tests {
         sensitive: true,
         smart_default: true,
         allowlist: &[".config/shared"],
+        sensitive_entries: &[],
         always_shown: false,
     };
     const LOW: Category = Category {
@@ -270,8 +304,38 @@ mod tests {
         sensitive: false,
         smart_default: true,
         allowlist: &[".config/shared/nested", ".config/only-low"],
+        sensitive_entries: &[],
         always_shown: false,
     };
+
+    #[test]
+    fn agents_category_individually_tags_mcp_auth_but_not_claude_or_agents_dirs() {
+        // `.mcp-auth` carries a per-entry sensitivity tag distinct from both the Category
+        // flag (AGENTS.sensitive is false — a whole-Category tag would be too broad, since
+        // `.claude`/`.agents` aren't credential-bearing) and the Safety-net scan (CONTEXT.md's
+        // third "Sensitive" origin) — pinned down here so a future reshuffle of AGENTS's
+        // allowlist can't silently drop it.
+        assert!(entry_is_individually_sensitive(
+            &AGENTS,
+            Path::new(".mcp-auth/session.json")
+        ));
+        assert!(!entry_is_individually_sensitive(
+            &AGENTS,
+            Path::new(".claude/settings.json")
+        ));
+        assert!(!entry_is_individually_sensitive(
+            &AGENTS,
+            Path::new(".agents/config.toml")
+        ));
+    }
+
+    #[test]
+    fn entry_is_individually_sensitive_is_false_with_no_tagged_entries() {
+        assert!(!entry_is_individually_sensitive(
+            &LOW,
+            Path::new(".config/only-low/file.txt")
+        ));
+    }
 
     #[test]
     fn resolve_category_prefers_higher_precedence_on_overlap() {

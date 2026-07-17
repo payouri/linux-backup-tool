@@ -6,10 +6,12 @@
 //! the interactive passphrase prompt itself is off-seam (lives in `crates/tui`).
 //!
 //! #22 scope: [`evaluate`] computes Auto-insist from a Selection's already-tagged Entries
-//! (Category-level OR Safety-net sensitivity, both resolved by `scan` — see that module's
-//! `is_safety_net_match`). This module adds no new sensitivity source of its own; it only
-//! decides what a Selection's existing tags *imply* for encryption. Real `age` encryption
-//! (`Encryption::Passphrase`'s stubbed body in `archive.rs`) is #23's job, not this ticket's.
+//! (Category-level, per-entry tag, or Safety-net sensitivity — all three resolved upstream by
+//! `catalog`/`scan`, see `catalog::entry_is_individually_sensitive` and
+//! `scan::is_safety_net_match`). This module adds no new sensitivity source of its own; it
+//! only decides what a Selection's existing tags *imply* for encryption. Real `age`
+//! encryption (`Encryption::Passphrase`'s stubbed body in `archive.rs`) is #23's job, not
+//! this ticket's.
 
 use std::path::PathBuf;
 
@@ -54,10 +56,32 @@ impl AutoInsist {
 
 /// The result of a user disabling Auto-insist (story 19): the disclosure a
 /// second-confirmation TUI must name before the plaintext archive is actually written.
+///
+/// Fields are deliberately private with read-only accessors, not `pub`: the doc comment on
+/// [`AutoInsist::disable`] promises a caller can never opt out of Auto-insist without also
+/// holding the disclosure of what it's opting out of protecting. If the fields were `pub`,
+/// that would only be a convention — any caller could construct an `AutoInsistOverride` with
+/// empty (or fabricated) disclosure lists directly, bypassing `disable()` entirely. Making
+/// the fields private and the struct constructible only from this module means `disable()`
+/// is the *sole* way to obtain one, so the guarantee is enforced by the type system rather
+/// than by nobody happening to reach for a struct literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoInsistOverride {
-    pub disclosed_categories: Vec<&'static str>,
-    pub disclosed_entries: Vec<PathBuf>,
+    disclosed_categories: Vec<&'static str>,
+    disclosed_entries: Vec<PathBuf>,
+}
+
+impl AutoInsistOverride {
+    /// The Sensitive Category names that would land in plaintext if this override is honored.
+    pub fn disclosed_categories(&self) -> &[&'static str] {
+        &self.disclosed_categories
+    }
+
+    /// The Sensitive Entries' relative paths that would land in plaintext if this override is
+    /// honored.
+    pub fn disclosed_entries(&self) -> &[PathBuf] {
+        &self.disclosed_entries
+    }
 }
 
 /// Computes Auto-insist policy for `selection`: pure logic over its Entries' already-tagged
@@ -178,10 +202,25 @@ mod tests {
         let policy = evaluate(&selection);
 
         let override_ = policy.disable().expect("should disclose sensitive content");
-        assert_eq!(override_.disclosed_categories, vec!["SSH"]);
+        assert_eq!(override_.disclosed_categories(), &["SSH"]);
         assert_eq!(
-            override_.disclosed_entries,
-            vec![PathBuf::from("id_ed25519")]
+            override_.disclosed_entries(),
+            &[PathBuf::from("id_ed25519")]
         );
+    }
+
+    #[test]
+    fn auto_insist_override_is_only_constructible_via_disable() {
+        // No struct literal for `AutoInsistOverride` is reachable from outside this module
+        // (its fields are private) — this test exists so that claim stays checked by the
+        // compiler rather than living only in a doc comment. If this test still compiles
+        // after someone makes the fields `pub`, that alone doesn't prove the guarantee is
+        // broken, but it does mean this test stopped being able to catch it — the real
+        // enforcement is `disclosed_categories`/`disclosed_entries` staying private.
+        let selection = SelectionModel::new(vec![entry("GPG", true, "pubring.kbx")]);
+        let policy = evaluate(&selection);
+        let override_ = policy.disable().expect("should disclose sensitive content");
+
+        assert_eq!(override_.disclosed_categories(), &["GPG"]);
     }
 }
