@@ -21,6 +21,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use linux_backup_core::archive::Encryption;
 use linux_backup_core::context::{Privilege, RunContext};
 use linux_backup_core::model::SelectionModel;
+use linux_backup_core::packages::NoCommandRunner;
 use linux_backup_core::restore::RestoreOutcome;
 use linux_backup_core::{catalog, manifest, scan, BackupOutcome, CoreError};
 
@@ -76,8 +77,12 @@ fn shell_selection(ctx: &RunContext) -> SelectionModel {
     SelectionModel::new(entries)
 }
 
+/// Runs `core::backup` with [`NoCommandRunner`] injected for package-list capture (#25):
+/// the round-trip seam stays off the real-package-manager system boundary and fully
+/// deterministic regardless of what's installed on whatever machine runs this suite — see
+/// `packages::NoCommandRunner`'s doc.
 fn run_backup(selection: &SelectionModel, ctx: &RunContext, encryption: &Encryption) -> Result<BackupOutcome, CoreError> {
-    linux_backup_core::backup(selection, ctx, encryption)
+    linux_backup_core::backup(selection, ctx, encryption, &NoCommandRunner)
 }
 
 fn run_restore(backup_dir: &Path, ctx: &RunContext) -> Result<RestoreOutcome, CoreError> {
@@ -173,6 +178,8 @@ fn round_trip_unencrypted() {
     assert_eq!(m.os, ctx.os);
     assert_eq!(m.home, ctx.home);
     assert_eq!(m.created_at, "2023-11-14T22:13:20Z");
+    // Empty because run_backup injects NoCommandRunner (#25), not because packages are
+    // unimplemented — package-list parsing is unit-tested directly in `packages`.
     assert!(m.packages.is_empty());
 
     let archive_bytes_on_disk = fs::read(&archive_path).unwrap();

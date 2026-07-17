@@ -17,6 +17,7 @@ pub mod error;
 pub mod location;
 pub mod manifest;
 pub mod model;
+pub mod packages;
 pub mod profile;
 pub mod progress;
 pub mod restore;
@@ -32,6 +33,7 @@ use std::time::UNIX_EPOCH;
 
 use archive::Encryption;
 use manifest::Manifest;
+use packages::CommandRunner;
 
 /// The result of a completed backup run: where the Backup dir landed and the Manifest
 /// that was written into it.
@@ -53,17 +55,23 @@ pub struct BackupOutcome {
 /// Per ADR-0002, backup fails fast: any error after the Backup dir is created deletes it
 /// again before returning `Err`, so a Backup dir with a Manifest in it is always a
 /// complete, trustworthy one (story 41).
+///
+/// `package_runner` is the injected seam (see `packages::CommandRunner`'s doc) that
+/// captures each present package manager's Package list into the Manifest (story 47).
+/// `crates/tui`'s `main` passes `&packages::SystemCommandRunner`; tests that don't want to
+/// touch the real system (e.g. the round-trip seam) pass `&packages::NoCommandRunner`.
 pub fn backup(
     selection: &SelectionModel,
     ctx: &RunContext,
     encryption: &Encryption,
+    package_runner: &dyn CommandRunner,
 ) -> Result<BackupOutcome, CoreError> {
     // Delegate the collision check to `location::ensure_backup_dir_available` (#27) rather
     // than re-testing `.exists()` here, so there's one implementation of story 33's
     // refusal instead of two that could drift apart.
     let backup_dir = location::ensure_backup_dir_available(&ctx.output_location, &backup_dir_name(ctx))?;
 
-    run_backup(selection, ctx, encryption, &backup_dir).inspect_err(|_| {
+    run_backup(selection, ctx, encryption, package_runner, &backup_dir).inspect_err(|_| {
         // Fail-fast cleanup (ADR-0002): the Backup dir was created fresh by this call, so
         // removing it on any error is always safe.
         let _ = fs::remove_dir_all(&backup_dir);
@@ -74,6 +82,7 @@ fn run_backup(
     selection: &SelectionModel,
     ctx: &RunContext,
     encryption: &Encryption,
+    package_runner: &dyn CommandRunner,
     backup_dir: &Path,
 ) -> Result<BackupOutcome, CoreError> {
     fs::create_dir_all(backup_dir).map_err(|source| CoreError::Io {
@@ -97,6 +106,8 @@ fn run_backup(
         })
         .collect();
 
+    let captured_packages = packages::capture_all(package_runner);
+
     let manifest = manifest::build(manifest::ManifestInputs {
         ctx,
         tool_version: env!("CARGO_PKG_VERSION"),
@@ -104,6 +115,7 @@ fn run_backup(
         checksums: built.checksums,
         archive_sha256,
         vanished,
+        packages: captured_packages,
     });
 
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;

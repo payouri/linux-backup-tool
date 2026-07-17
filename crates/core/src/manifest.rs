@@ -3,10 +3,11 @@
 //! Entries (root, root-tag, Category, sensitivity), a per-file SHA-256 checksum map, a
 //! top-level `archive_sha256`, the `vanished` array, and per-manager Package lists.
 //!
-//! #19 scope: every field the parent spec's "Manifest schema" section describes is
-//! present, but `packages` is always empty — real package-list capture is #25's job. No
-//! POSIX metadata table here by design: mode/uid/gid/symlink live in the tar stream (see
-//! `archive`), not duplicated in the Manifest, so the two can't drift out of sync.
+//! Package lists (`packages`) are captured by the `packages` module (#25) and passed in
+//! through [`ManifestInputs`] — this module just carries the shape, agnostic to how the
+//! per-manager entries were gathered. No POSIX metadata table here by design: mode/uid/gid
+//! /symlink live in the tar stream (see `archive`), not duplicated in the Manifest, so the
+//! two can't drift out of sync.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -42,8 +43,9 @@ pub struct Manifest {
     /// verifies this before untarring (ADR-0002's pre-flight abort condition).
     pub archive_sha256: String,
     pub vanished: Vec<VanishedEntry>,
-    /// Per-manager Package lists. Always empty in #19 — real capture is #25's job; the
-    /// field exists now so the schema doesn't need to change shape when #25 lands.
+    /// Per-manager Package lists (pacman, aur, flatpak, snap, cargo, npm — see
+    /// `packages::capture_all`), keyed by manager name. Empty when the manager didn't run
+    /// (e.g. a fake/`NoCommandRunner` in tests) or when nothing was captured.
     #[serde(default)]
     pub packages: BTreeMap<String, Vec<PackageInfo>>,
 }
@@ -95,13 +97,21 @@ pub struct VanishedEntry {
     pub sensitive: bool,
 }
 
-/// One package record within a Package list (versions informational only, per story 48).
+/// One package record within a Package list.
+///
+/// `version` is informational only, per story 48 — nothing in this crate reads it back to
+/// pin a reinstall (there is deliberately no "pin_version" field or similar); reinstalling
+/// on a rolling-release distro must not chase an unavailable exact version. `origin` (e.g.
+/// flatpak's remote) and `channel` (e.g. snap's tracking channel) are per-manager extras;
+/// most managers leave both `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageInfo {
     pub name: String,
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// The pieces a completed backup run assembles into a [`Manifest`].
@@ -112,10 +122,12 @@ pub struct ManifestInputs<'a> {
     pub checksums: BTreeMap<String, String>,
     pub archive_sha256: String,
     pub vanished: Vec<VanishedEntry>,
+    /// Per-manager Package lists, already captured (see `packages::capture_all`) — this
+    /// module just carries them into the Manifest, agnostic to how they were gathered.
+    pub packages: BTreeMap<String, Vec<PackageInfo>>,
 }
 
-/// Assembles a [`Manifest`] from a completed backup run's pieces. `packages` is always
-/// empty (see the module doc); everything else comes straight from `inputs`.
+/// Assembles a [`Manifest`] from a completed backup run's pieces.
 pub fn build(inputs: ManifestInputs<'_>) -> Manifest {
     Manifest {
         schema_version: SCHEMA_VERSION,
@@ -130,7 +142,7 @@ pub fn build(inputs: ManifestInputs<'_>) -> Manifest {
         checksums: inputs.checksums,
         archive_sha256: inputs.archive_sha256,
         vanished: inputs.vanished,
-        packages: BTreeMap::new(),
+        packages: inputs.packages,
     }
 }
 
