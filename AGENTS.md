@@ -14,7 +14,12 @@ Read before working on any feature:
   - [`0004`](docs/adr/0004-core-runcontext-injection.md) — `core` takes a full injected `RunContext`, reads nothing ambient (see Testing gates below).
 - **`docs/research/`** — dated research notes backing early tickets (package inventory, Plasma capture, Rust crate choices). Check for an existing note before re-researching a settled question.
 
-## Testing gates
+## Gates
+
+Checks a change must pass before it's considered done — run them, don't just assume:
+
+- **`cargo fmt --check`** and **`cargo clippy --workspace --all-targets -- -D warnings`** — required, not advisory. Run both before considering a change done.
+- **`cargo test --workspace --all-targets`** — must pass, including the round-trip seam below.
 
 Read before writing or changing tests:
 
@@ -26,6 +31,16 @@ Read before writing or changing tests:
 - **`trunk` only moves by fast-forward.** No merge commits onto `trunk`, ever.
 - Before merging a branch, **rebase it onto `trunk`** (`git rebase trunk`), resolving any conflicts on the branch — not by merging `trunk` into it.
 - Only merge/push once the rebased branch fast-forwards cleanly (`git merge --ff-only`).
+
+## Coding conventions
+
+- **Comments explain why, never what or how.** Well-named code already says what/how; a comment earns its place only by carrying a reason the code can't: a non-obvious constraint, an invariant, a workaround for a specific bug. If removing it wouldn't confuse a future reader, don't write it.
+- **Error handling**: `Result`/`?` throughout, no `unwrap()`/`expect()`/`panic!()` outside tests and `main`. `core` errors use `thiserror`; `tui`'s boundary uses `anyhow`. Don't mix the two within a crate.
+- **`core`'s public API stays minimal.** Default everything private; promote to `pub` only when `tui` (or a future `gui`) actually needs it.
+- **No `unsafe` without justification.** `core` carries `#![forbid(unsafe_code)]`; if `unsafe` is ever unavoidable elsewhere, a comment must state why (see the why-not-what rule above).
+- **New dependencies need a one-line justification** (health/maintenance, why this crate over alternatives) — follow the pattern in `docs/research/rust-crates.md` rather than adding a dep ad hoc.
+- **No premature abstraction.** Don't introduce a trait/interface for a single implementation "for cleanliness" — see ADR-0001's `ArchiveBackend` reasoning, which generalizes: the abstraction waits for a second real implementation.
+- **Commit messages**: imperative mood, `refs #N` / `closes #N` linking to the originating issue.
 
 ## Agent skills
 
