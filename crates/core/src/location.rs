@@ -8,12 +8,17 @@
 //! expansion, and location validation — is pure logic over an injected `&[DiskInfo]` (or
 //! plain paths), kept deliberately thin-and-injectable so it *is* unit-tested.
 //!
-//! The `lsblk`/unmounted-USB delta and `udisksctl` mounting (stories 34-36) are explicitly
-//! out of scope here — see issue #28.
+//! Issue #28 adds the same shape for stories 34-36: [`run_lsblk`] and [`mount_partition`]
+//! are the thin real-subprocess boundaries (not unit-tested, mirroring [`discover_disks`]),
+//! while [`parse_lsblk_unmounted_usb_partitions`] and the mount-outcome parsing are pure
+//! functions over captured text and so are unit-tested against fixtures.
 
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::Deserialize;
 
 use crate::error::CoreError;
 
@@ -42,6 +47,15 @@ pub enum LocationRow {
         total_space: u64,
         is_removable: bool,
     },
+    /// A USB partition `lsblk` reports with no mountpoint yet — shown below every mounted
+    /// row, never above (story 34). Selecting it drives [`mount_partition`]; the resulting
+    /// re-scan is what moves it into an ordinary `Mount` row (story 35), not any special
+    /// casing here.
+    UnmountedUsbPartition {
+        device: PathBuf,
+        size: u64,
+        fstype: Option<String>,
+    },
     /// "↻ Rescan drives" (story 29).
     RescanDrives,
     /// "Custom path…" (story 30).
@@ -56,6 +70,16 @@ pub struct LocationPickList {
     /// removable mount is present (story 28). `None` otherwise — never guess among
     /// several candidates.
     pub preselected: Option<usize>,
+}
+
+/// One USB-attached partition `lsblk` reports as not yet mounted (story 34). Shaped like
+/// [`DiskInfo`]'s injection pattern: pick-list logic takes this as plain data so it's
+/// exercised against fixtures rather than a running `lsblk`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmountedPartition {
+    pub device: PathBuf,
+    pub size: u64,
+    pub fstype: Option<String>,
 }
 
 /// The root-partition mount point, hidden from the pick-list (story 27).
@@ -79,13 +103,22 @@ fn is_candidate_mount(mount_point: &Path, user: &str) -> bool {
         || mount_point.starts_with("/mnt")
 }
 
-/// Build the Output-location pick-list from injected disk data (story 25).
+/// Build the Output-location pick-list from injected disk data (story 25) plus the
+/// injected unmounted-USB-partition delta (story 34).
 ///
 /// Always includes a `$HOME` row, then every writable candidate mount (sorted by mount
-/// point for determinism), then `RescanDrives`, then `CustomPath`. Root/EFI partitions and
-/// non-writable mounts are hidden (story 27); the sole qualifying external drive is
-/// preselected (story 28).
-pub fn build_pick_list(disks: &[DiskInfo], home: &Path, user: &str) -> LocationPickList {
+/// point for determinism), then unmounted USB partitions (sorted by device for the same
+/// reason, below every mounted row per story 34), then `RescanDrives`, then `CustomPath`.
+/// Root/EFI partitions and non-writable mounts are hidden (story 27); the sole qualifying
+/// external drive is preselected (story 28). `unmounted` is expected to already exclude
+/// LUKS/LVM member partitions — see [`parse_lsblk_unmounted_usb_partitions`], the one place
+/// that filtering happens — so this function doesn't re-check `fstype`.
+pub fn build_pick_list(
+    disks: &[DiskInfo],
+    unmounted: &[UnmountedPartition],
+    home: &Path,
+    user: &str,
+) -> LocationPickList {
     let mut candidates: Vec<&DiskInfo> = disks
         .iter()
         .filter(|d| !d.is_read_only)
@@ -94,7 +127,10 @@ pub fn build_pick_list(disks: &[DiskInfo], home: &Path, user: &str) -> LocationP
         .collect();
     candidates.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
 
-    let mut rows = Vec::with_capacity(candidates.len() + 3);
+    let mut sorted_unmounted: Vec<&UnmountedPartition> = unmounted.iter().collect();
+    sorted_unmounted.sort_by(|a, b| a.device.cmp(&b.device));
+
+    let mut rows = Vec::with_capacity(candidates.len() + sorted_unmounted.len() + 3);
     rows.push(LocationRow::Home {
         path: home.to_path_buf(),
     });
@@ -110,6 +146,14 @@ pub fn build_pick_list(disks: &[DiskInfo], home: &Path, user: &str) -> LocationP
             available_space: disk.available_space,
             total_space: disk.total_space,
             is_removable: disk.is_removable,
+        });
+    }
+
+    for partition in &sorted_unmounted {
+        rows.push(LocationRow::UnmountedUsbPartition {
+            device: partition.device.clone(),
+            size: partition.size,
+            fstype: partition.fstype.clone(),
         });
     }
 
@@ -336,6 +380,185 @@ pub fn discover_disks() -> Vec<DiskInfo> {
         .collect()
 }
 
+/// Mirrors `lsblk --json -b -o NAME,TYPE,TRAN,MOUNTPOINT,SIZE,FSTYPE,PATH`'s shape closely
+/// enough to deserialize it; kept private since callers only need the filtered result from
+/// [`parse_lsblk_unmounted_usb_partitions`], not `lsblk`'s full device tree.
+#[derive(Debug, Deserialize)]
+struct LsblkOutput {
+    blockdevices: Vec<LsblkDevice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LsblkDevice {
+    path: Option<String>,
+    #[serde(rename = "type")]
+    device_type: Option<String>,
+    tran: Option<String>,
+    mountpoint: Option<String>,
+    size: Option<u64>,
+    fstype: Option<String>,
+    #[serde(default)]
+    children: Vec<LsblkDevice>,
+}
+
+/// fstype signatures that mean the partition is a LUKS container or an LVM physical
+/// volume rather than a directly mountable filesystem — excluded even though they can pass
+/// `tran==usb && type==part && mountpoint==null` (story 28's "excluding ... LUKS, LVM").
+/// Recent `lsblk` propagates the parent disk's `tran` down to partition children, which is
+/// what makes filtering flat over every row (not just top-level disks) correct here.
+fn is_unmounted_usb_partition(dev: &LsblkDevice) -> bool {
+    dev.device_type.as_deref() == Some("part")
+        && dev.tran.as_deref() == Some("usb")
+        && dev.mountpoint.is_none()
+        && !matches!(
+            dev.fstype.as_deref(),
+            Some("crypto_LUKS") | Some("LVM2_member")
+        )
+}
+
+/// Walk `lsblk`'s nested `children` arrays collecting matches, since a USB stick's
+/// partitions are reported as children of its disk entry rather than flattened at the top
+/// level.
+fn collect_unmounted_usb_partitions(devices: &[LsblkDevice], out: &mut Vec<UnmountedPartition>) {
+    for dev in devices {
+        if is_unmounted_usb_partition(dev) {
+            if let Some(path) = &dev.path {
+                out.push(UnmountedPartition {
+                    device: PathBuf::from(path),
+                    size: dev.size.unwrap_or(0),
+                    fstype: dev.fstype.clone(),
+                });
+            }
+        }
+        collect_unmounted_usb_partitions(&dev.children, out);
+    }
+}
+
+/// Parse `lsblk --json -b` output into the unmounted USB partitions story 34 wants offered
+/// (`tran==usb && type==part && mountpoint==null`), excluding internal spares (no `usb`
+/// transport), LUKS, LVM, and network shares (none of which report `tran==usb`). Pure over
+/// the given text so it's unit-testable against fixture JSON without a real `lsblk`.
+pub fn parse_lsblk_unmounted_usb_partitions(
+    json: &str,
+) -> Result<Vec<UnmountedPartition>, CoreError> {
+    let parsed: LsblkOutput =
+        serde_json::from_str(json).map_err(|e| CoreError::LsblkParseFailed(e.to_string()))?;
+    let mut out = Vec::new();
+    collect_unmounted_usb_partitions(&parsed.blockdevices, &mut out);
+    Ok(out)
+}
+
+/// Run the real `lsblk` subprocess (story 34). Mirrors [`discover_disks`] as the
+/// system-boundary edge the Testing Decisions call out — not unit-tested in the alpha;
+/// every other function here takes parsed/injected data instead of calling this itself.
+pub fn run_lsblk() -> Result<Vec<UnmountedPartition>, CoreError> {
+    let output = Command::new("lsblk")
+        .args([
+            "--json",
+            "-b",
+            "-o",
+            "NAME,TYPE,TRAN,MOUNTPOINT,SIZE,FSTYPE,PATH",
+        ])
+        .output()
+        .map_err(|source| CoreError::Io {
+            path: PathBuf::from("lsblk"),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(CoreError::LsblkCommandFailed(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    parse_lsblk_unmounted_usb_partitions(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// A `udisksctl mount` that succeeded (story 35): the device and where it landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountedPartition {
+    pub device: PathBuf,
+    pub mount_point: PathBuf,
+}
+
+/// Why a `udisksctl mount` attempt failed (story 36). `udisksctl` has no machine-readable
+/// error format, so this is necessarily a best-effort classification of its stderr text —
+/// never a reason to crash or exit; the caller shows an inline message and re-lists.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MountError {
+    /// Polkit denied the action (or couldn't auto-authenticate under
+    /// `--no-user-interaction`) — observed as `org.freedesktop.UDisks2.Error.NotAuthorized`
+    /// in `udisksctl`'s stderr.
+    #[error("not authorized to mount {device}")]
+    NotAuthorized { device: PathBuf },
+    /// The device vanished between being listed and being mounted (unplugged mid-flow) —
+    /// observed as "Error looking up object for device ..." in `udisksctl`'s stderr.
+    #[error("device {device} is gone")]
+    DeviceGone { device: PathBuf },
+    /// Any other failure, carrying `udisksctl`'s stderr verbatim since the alpha has no
+    /// richer classification for it.
+    #[error("failed to mount {device}: {message}")]
+    Other { device: PathBuf, message: String },
+}
+
+/// Parse `udisksctl mount`'s success line (observed shape: `Mounted <dev> at <path>.`).
+/// Pure over captured stdout so it's unit-testable without a real mount.
+fn parse_mount_success(stdout: &str, device: &Path) -> Option<MountedPartition> {
+    let line = stdout.lines().find(|l| l.starts_with("Mounted "))?;
+    let (_, after) = line.strip_prefix("Mounted ")?.split_once(" at ")?;
+    Some(MountedPartition {
+        device: device.to_path_buf(),
+        mount_point: PathBuf::from(after.trim().trim_end_matches('.')),
+    })
+}
+
+/// Classify a `udisksctl mount` failure from its stderr text (story 36). Pure over captured
+/// text so it's unit-testable against representative `udisksctl` output.
+fn classify_mount_failure(device: &Path, stderr: &str) -> MountError {
+    if stderr.contains("NotAuthorized") || stderr.contains("Not authorized") {
+        MountError::NotAuthorized {
+            device: device.to_path_buf(),
+        }
+    } else if stderr.contains("Error looking up object for device") {
+        MountError::DeviceGone {
+            device: device.to_path_buf(),
+        }
+    } else {
+        MountError::Other {
+            device: device.to_path_buf(),
+            message: stderr.trim().to_string(),
+        }
+    }
+}
+
+/// Run the real `udisksctl mount -b <device> --no-user-interaction` subprocess (stories
+/// 35-36). Mirrors [`discover_disks`] and [`run_lsblk`] as a system-boundary edge — not
+/// unit-tested in the alpha; [`parse_mount_success`] and [`classify_mount_failure`] carry
+/// the testable parsing.
+pub fn mount_partition(device: &Path) -> Result<MountedPartition, MountError> {
+    let output = Command::new("udisksctl")
+        .arg("mount")
+        .arg("-b")
+        .arg(device)
+        .arg("--no-user-interaction")
+        .output()
+        .map_err(|source| MountError::Other {
+            device: device.to_path_buf(),
+            message: source.to_string(),
+        })?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return parse_mount_success(&stdout, device).ok_or_else(|| MountError::Other {
+            device: device.to_path_buf(),
+            message: format!("unrecognized udisksctl output: {stdout}"),
+        });
+    }
+
+    Err(classify_mount_failure(
+        device,
+        &String::from_utf8_lossy(&output.stderr),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,14 +579,14 @@ mod tests {
     #[test]
     fn home_row_always_present_even_with_no_disks() {
         let home = PathBuf::from("/home/youri");
-        let picks = build_pick_list(&[], &home, "youri");
+        let picks = build_pick_list(&[], &[], &home, "youri");
         assert_eq!(picks.rows[0], LocationRow::Home { path: home });
     }
 
     #[test]
     fn rescan_and_custom_path_rows_always_present() {
         let home = PathBuf::from("/home/youri");
-        let picks = build_pick_list(&[], &home, "youri");
+        let picks = build_pick_list(&[], &[], &home, "youri");
         assert!(picks.rows.contains(&LocationRow::RescanDrives));
         assert!(picks.rows.contains(&LocationRow::CustomPath));
     }
@@ -372,7 +595,7 @@ mod tests {
     fn root_and_efi_partitions_are_hidden() {
         let home = PathBuf::from("/home/youri");
         let disks = vec![disk("/", false, false), disk("/boot/efi", false, false)];
-        let picks = build_pick_list(&disks, &home, "youri");
+        let picks = build_pick_list(&disks, &[], &home, "youri");
         assert!(!picks
             .rows
             .iter()
@@ -383,7 +606,7 @@ mod tests {
     fn writable_mount_under_run_media_user_is_offered() {
         let home = PathBuf::from("/home/youri");
         let disks = vec![disk("/run/media/youri/USBSTICK", true, false)];
-        let picks = build_pick_list(&disks, &home, "youri");
+        let picks = build_pick_list(&disks, &[], &home, "youri");
         assert!(picks.rows.iter().any(
             |r| matches!(r, LocationRow::Mount { mount_point, .. } if mount_point == Path::new("/run/media/youri/USBSTICK"))
         ));
@@ -393,7 +616,7 @@ mod tests {
     fn run_media_mount_under_a_different_user_is_not_offered() {
         let home = PathBuf::from("/home/youri");
         let disks = vec![disk("/run/media/otheruser/USBSTICK", true, false)];
-        let picks = build_pick_list(&disks, &home, "youri");
+        let picks = build_pick_list(&disks, &[], &home, "youri");
         assert!(!picks
             .rows
             .iter()
@@ -407,7 +630,7 @@ mod tests {
             disk("/media/backup", true, false),
             disk("/mnt/data", false, false),
         ];
-        let picks = build_pick_list(&disks, &home, "youri");
+        let picks = build_pick_list(&disks, &[], &home, "youri");
         let mounts: Vec<_> = picks
             .rows
             .iter()
@@ -420,7 +643,7 @@ mod tests {
     fn a_mount_elsewhere_on_the_filesystem_is_not_offered() {
         let home = PathBuf::from("/home/youri");
         let disks = vec![disk("/srv/data", true, false)];
-        let picks = build_pick_list(&disks, &home, "youri");
+        let picks = build_pick_list(&disks, &[], &home, "youri");
         assert!(!picks
             .rows
             .iter()
@@ -431,7 +654,7 @@ mod tests {
     fn read_only_mount_is_hidden() {
         let home = PathBuf::from("/home/youri");
         let disks = vec![disk("/run/media/youri/RODISK", true, true)];
-        let picks = build_pick_list(&disks, &home, "youri");
+        let picks = build_pick_list(&disks, &[], &home, "youri");
         assert!(!picks
             .rows
             .iter()
@@ -442,7 +665,7 @@ mod tests {
     fn sole_external_drive_is_preselected() {
         let home = PathBuf::from("/home/youri");
         let disks = vec![disk("/run/media/youri/USBSTICK", true, false)];
-        let picks = build_pick_list(&disks, &home, "youri");
+        let picks = build_pick_list(&disks, &[], &home, "youri");
         let idx = picks.preselected.expect("expected a preselection");
         assert!(matches!(picks.rows[idx], LocationRow::Mount { .. }));
     }
@@ -454,7 +677,7 @@ mod tests {
             disk("/run/media/youri/USBSTICK1", true, false),
             disk("/run/media/youri/USBSTICK2", true, false),
         ];
-        let picks = build_pick_list(&disks, &home, "youri");
+        let picks = build_pick_list(&disks, &[], &home, "youri");
         assert_eq!(picks.preselected, None);
     }
 
@@ -462,7 +685,7 @@ mod tests {
     fn non_removable_candidate_mount_is_not_preselected() {
         let home = PathBuf::from("/home/youri");
         let disks = vec![disk("/mnt/data", false, false)];
-        let picks = build_pick_list(&disks, &home, "youri");
+        let picks = build_pick_list(&disks, &[], &home, "youri");
         assert_eq!(picks.preselected, None);
     }
 
@@ -663,5 +886,272 @@ mod tests {
         // Per the Testing Decisions, the sysinfo-backed boundary itself isn't asserted
         // against — this just proves the thin wrapper doesn't panic on this machine.
         let _ = discover_disks();
+    }
+
+    // --- build_pick_list: unmounted USB partitions (story 34) -----------------------
+
+    fn unmounted(device: &str, size: u64) -> UnmountedPartition {
+        UnmountedPartition {
+            device: PathBuf::from(device),
+            size,
+            fstype: Some("vfat".to_string()),
+        }
+    }
+
+    #[test]
+    fn unmounted_usb_partition_appears_as_a_distinct_row() {
+        let home = PathBuf::from("/home/youri");
+        let parts = vec![unmounted("/dev/sdb1", 8_000_000_000)];
+        let picks = build_pick_list(&[], &parts, &home, "youri");
+        assert!(picks.rows.iter().any(
+            |r| matches!(r, LocationRow::UnmountedUsbPartition { device, .. } if device == Path::new("/dev/sdb1"))
+        ));
+    }
+
+    #[test]
+    fn unmounted_usb_partition_rows_sit_below_every_mounted_row() {
+        let home = PathBuf::from("/home/youri");
+        let disks = vec![disk("/run/media/youri/USBSTICK", true, false)];
+        let parts = vec![unmounted("/dev/sdc1", 4_000_000_000)];
+        let picks = build_pick_list(&disks, &parts, &home, "youri");
+        let mount_idx = picks
+            .rows
+            .iter()
+            .position(|r| matches!(r, LocationRow::Mount { .. }))
+            .expect("expected a mounted row");
+        let unmounted_idx = picks
+            .rows
+            .iter()
+            .position(|r| matches!(r, LocationRow::UnmountedUsbPartition { .. }))
+            .expect("expected an unmounted-partition row");
+        assert!(unmounted_idx > mount_idx);
+    }
+
+    #[test]
+    fn unmounted_usb_partition_rows_sit_above_rescan_and_custom_path() {
+        let home = PathBuf::from("/home/youri");
+        let parts = vec![unmounted("/dev/sdb1", 8_000_000_000)];
+        let picks = build_pick_list(&[], &parts, &home, "youri");
+        let unmounted_idx = picks
+            .rows
+            .iter()
+            .position(|r| matches!(r, LocationRow::UnmountedUsbPartition { .. }))
+            .unwrap();
+        let rescan_idx = picks
+            .rows
+            .iter()
+            .position(|r| matches!(r, LocationRow::RescanDrives))
+            .unwrap();
+        assert!(unmounted_idx < rescan_idx);
+    }
+
+    #[test]
+    fn no_unmounted_partitions_means_no_such_rows() {
+        let home = PathBuf::from("/home/youri");
+        let picks = build_pick_list(&[], &[], &home, "youri");
+        assert!(!picks
+            .rows
+            .iter()
+            .any(|r| matches!(r, LocationRow::UnmountedUsbPartition { .. })));
+    }
+
+    // --- the re-list invariant (story 35): a plain rescan reflects the new mount state ---
+
+    #[test]
+    fn mounting_a_partition_moves_it_from_unmounted_to_a_normal_mounted_row_on_rescan() {
+        let home = PathBuf::from("/home/youri");
+
+        // Before: udisksctl hasn't mounted anything yet, so the stick only shows up via
+        // the lsblk delta as an unmounted USB partition, not as a DiskInfo.
+        let before = build_pick_list(
+            &[],
+            &[unmounted("/dev/sdb1", 8_000_000_000)],
+            &home,
+            "youri",
+        );
+        assert!(before
+            .rows
+            .iter()
+            .any(|r| matches!(r, LocationRow::UnmountedUsbPartition { .. })));
+        assert!(!before
+            .rows
+            .iter()
+            .any(|r| matches!(r, LocationRow::Mount { .. })));
+
+        // After: per #28's scope, core builds no "insert the newly mounted drive at the
+        // cursor" mechanism (that's presentation-layer, #32) — the caller just re-scans.
+        // A fresh discover_disks() would now report the stick as a normal DiskInfo, and a
+        // fresh lsblk scan no longer reports it as unmounted (mountpoint is now set), so
+        // this asserts a plain rescan over that new data reflects both halves of the
+        // invariant without any special-casing.
+        let after = build_pick_list(
+            &[disk("/run/media/youri/USBSTICK", true, false)],
+            &[],
+            &home,
+            "youri",
+        );
+        assert!(after.rows.iter().any(
+            |r| matches!(r, LocationRow::Mount { mount_point, .. } if mount_point == Path::new("/run/media/youri/USBSTICK"))
+        ));
+        assert!(!after
+            .rows
+            .iter()
+            .any(|r| matches!(r, LocationRow::UnmountedUsbPartition { .. })));
+    }
+
+    // --- parse_lsblk_unmounted_usb_partitions (pure, fixture-driven) -----------------
+
+    /// Realistic `lsblk --json -b -o NAME,TYPE,TRAN,MOUNTPOINT,SIZE,FSTYPE,PATH` output:
+    /// an internal NVMe disk (tran propagates to its partitions, none of them `usb`), a
+    /// mounted USB stick, an unmounted USB stick, a USB-attached LUKS container (excluded
+    /// per story 28's "excluding ... LUKS"), and a USB-attached LVM physical volume
+    /// (excluded per "excluding ... LVM").
+    const LSBLK_FIXTURE: &str = r#"{
+       "blockdevices": [
+          {
+             "name": "nvme0n1", "type": "disk", "tran": "nvme", "mountpoint": null,
+             "size": 1024209543168, "fstype": null, "path": "/dev/nvme0n1",
+             "children": [
+                { "name": "nvme0n1p1", "type": "part", "tran": "nvme", "mountpoint": "/",
+                  "size": 611093315584, "fstype": "ext4", "path": "/dev/nvme0n1p1" }
+             ]
+          },
+          {
+             "name": "sda", "type": "disk", "tran": "usb", "mountpoint": null,
+             "size": 16000000000, "fstype": null, "path": "/dev/sda",
+             "children": [
+                { "name": "sda1", "type": "part", "tran": "usb",
+                  "mountpoint": "/run/media/youri/MOUNTED",
+                  "size": 16000000000, "fstype": "vfat", "path": "/dev/sda1" }
+             ]
+          },
+          {
+             "name": "sdb", "type": "disk", "tran": "usb", "mountpoint": null,
+             "size": 8000000000, "fstype": null, "path": "/dev/sdb",
+             "children": [
+                { "name": "sdb1", "type": "part", "tran": "usb", "mountpoint": null,
+                  "size": 8000000000, "fstype": "vfat", "path": "/dev/sdb1" }
+             ]
+          },
+          {
+             "name": "sdc", "type": "disk", "tran": "usb", "mountpoint": null,
+             "size": 32000000000, "fstype": null, "path": "/dev/sdc",
+             "children": [
+                { "name": "sdc1", "type": "part", "tran": "usb", "mountpoint": null,
+                  "size": 32000000000, "fstype": "crypto_LUKS", "path": "/dev/sdc1" }
+             ]
+          },
+          {
+             "name": "sdd", "type": "disk", "tran": "usb", "mountpoint": null,
+             "size": 64000000000, "fstype": null, "path": "/dev/sdd",
+             "children": [
+                { "name": "sdd1", "type": "part", "tran": "usb", "mountpoint": null,
+                  "size": 64000000000, "fstype": "LVM2_member", "path": "/dev/sdd1" }
+             ]
+          }
+       ]
+    }"#;
+
+    #[test]
+    fn parses_the_one_genuinely_unmounted_usb_partition() {
+        let parts = parse_lsblk_unmounted_usb_partitions(LSBLK_FIXTURE).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].device, PathBuf::from("/dev/sdb1"));
+        assert_eq!(parts[0].size, 8_000_000_000);
+        assert_eq!(parts[0].fstype.as_deref(), Some("vfat"));
+    }
+
+    #[test]
+    fn mounted_usb_partition_is_excluded() {
+        let parts = parse_lsblk_unmounted_usb_partitions(LSBLK_FIXTURE).unwrap();
+        assert!(!parts.iter().any(|p| p.device == Path::new("/dev/sda1")));
+    }
+
+    #[test]
+    fn internal_nvme_partition_is_excluded_despite_matching_mountpoint_and_type() {
+        let parts = parse_lsblk_unmounted_usb_partitions(LSBLK_FIXTURE).unwrap();
+        assert!(!parts
+            .iter()
+            .any(|p| p.device == Path::new("/dev/nvme0n1p1")));
+    }
+
+    #[test]
+    fn luks_partition_on_usb_is_excluded() {
+        let parts = parse_lsblk_unmounted_usb_partitions(LSBLK_FIXTURE).unwrap();
+        assert!(!parts.iter().any(|p| p.device == Path::new("/dev/sdc1")));
+    }
+
+    #[test]
+    fn lvm_member_partition_on_usb_is_excluded() {
+        let parts = parse_lsblk_unmounted_usb_partitions(LSBLK_FIXTURE).unwrap();
+        assert!(!parts.iter().any(|p| p.device == Path::new("/dev/sdd1")));
+    }
+
+    #[test]
+    fn top_level_usb_disk_row_itself_is_not_offered() {
+        // Only `type == "part"` rows qualify — the disk row (sdb, type "disk") that
+        // parents the one genuinely unmounted partition must not itself appear.
+        let parts = parse_lsblk_unmounted_usb_partitions(LSBLK_FIXTURE).unwrap();
+        assert!(!parts.iter().any(|p| p.device == Path::new("/dev/sdb")));
+    }
+
+    #[test]
+    fn malformed_lsblk_output_is_a_typed_parse_error() {
+        let err = parse_lsblk_unmounted_usb_partitions("not json").unwrap_err();
+        assert!(matches!(err, CoreError::LsblkParseFailed(_)));
+    }
+
+    #[test]
+    fn empty_blockdevices_list_parses_to_no_partitions() {
+        let parts = parse_lsblk_unmounted_usb_partitions(r#"{"blockdevices": []}"#).unwrap();
+        assert!(parts.is_empty());
+    }
+
+    // --- mount-outcome parsing (pure, fixture-driven) --------------------------------
+
+    #[test]
+    fn parses_udisksctl_mount_success_line() {
+        let device = Path::new("/dev/sdb1");
+        let stdout = "Mounted /dev/sdb1 at /run/media/youri/USBSTICK.\n";
+        let mounted = parse_mount_success(stdout, device).expect("expected a parsed success");
+        assert_eq!(mounted.device, device);
+        assert_eq!(
+            mounted.mount_point,
+            PathBuf::from("/run/media/youri/USBSTICK")
+        );
+    }
+
+    #[test]
+    fn unrecognized_success_stdout_yields_no_parse() {
+        // A change in udisksctl's wording shouldn't silently fabricate a mount point —
+        // the caller in mount_partition turns this into an explicit MountError instead.
+        assert!(parse_mount_success("Something else entirely\n", Path::new("/dev/sdb1")).is_none());
+    }
+
+    #[test]
+    fn classifies_device_gone_from_stderr() {
+        // Verbatim text observed from a real `udisksctl mount -b <nonexistent>` run.
+        let stderr = "Error looking up object for device /dev/sdb1\n";
+        let err = classify_mount_failure(Path::new("/dev/sdb1"), stderr);
+        assert!(
+            matches!(err, MountError::DeviceGone { device } if device == Path::new("/dev/sdb1"))
+        );
+    }
+
+    #[test]
+    fn classifies_not_authorized_from_stderr() {
+        let stderr = "Error mounting /dev/sdb1: GDBus.Error:org.freedesktop.UDisks2.Error.NotAuthorized: Not authorized to perform operation\n";
+        let err = classify_mount_failure(Path::new("/dev/sdb1"), stderr);
+        assert!(
+            matches!(err, MountError::NotAuthorized { device } if device == Path::new("/dev/sdb1"))
+        );
+    }
+
+    #[test]
+    fn classifies_unrecognized_stderr_as_other() {
+        let stderr = "some future udisksctl wording we don't recognize\n";
+        let err = classify_mount_failure(Path::new("/dev/sdb1"), stderr);
+        assert!(matches!(err, MountError::Other { device, message }
+            if device == Path::new("/dev/sdb1") && message.contains("some future")));
     }
 }

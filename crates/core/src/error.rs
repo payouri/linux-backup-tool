@@ -77,4 +77,16 @@ pub enum CoreError {
     /// stub), carried as `Result` for the same reason as `EncryptionFailed`.
     #[error("failed to decrypt: {0}")]
     DecryptionFailed(String),
+
+    /// The real `lsblk` subprocess (story 34's unmounted-USB delta) exited non-zero.
+    /// Distinct from `LsblkParseFailed`: this is the subprocess itself failing, not its
+    /// (malformed) output.
+    #[error("lsblk failed: {0}")]
+    LsblkCommandFailed(String),
+
+    /// `lsblk --json -b` produced output the parser couldn't read as the expected shape.
+    /// Kept as a message rather than `#[from] serde_json::Error` because `Manifest`
+    /// already claims that conversion and a type can only implement `From` once.
+    #[error("failed to parse lsblk output: {0}")]
+    LsblkParseFailed(String),
 }
