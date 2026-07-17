@@ -10,5 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"
-core = { path = "../core", package = "linux-backup-core" }
+linux_backup_core = { path = "../core", package = "linux-backup-core" }
 inquire = "0.9.4"
