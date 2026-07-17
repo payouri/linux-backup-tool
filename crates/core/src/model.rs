@@ -7,11 +7,24 @@
 //! #20 scope: `SelectionModel::from_smart_defaults` composes a Smart-default Selection
 //! across the full ten-Category taxonomy (`scan::scan_taxonomy`'s precedence + Hide-empty
 //! result), and `warnings()` derives the User-data size warning (story 4) over whatever
-//! Categories ended up in the Selection. Drill-down toggling is #21's job.
+//! Categories ended up in the Selection.
+//!
+//! #21 scope (CONTEXT.md's "Drill-down"): `deselect_entry`/`reselect_entry` let a specific
+//! Entry within an otherwise-checked Category be excluded from the active Selection without
+//! touching the Category-level checkbox (`from_smart_defaults`'s job). A deselected Entry is
+//! physically moved out of `entries` into `withheld`, so every "what's actually selected"
+//! accessor below (`selected_paths`, `total_size`, `warnings`, `encryption_required`, and the
+//! `entries()` slice `backup()` hands to `archive::build`/the Manifest builder) sees it
+//! disappear for free, with no per-accessor filtering to keep in sync. `withheld` and
+//! `deselected` exist side by side because they serve different callers: `withheld` keeps
+//! the full `Entry` around so a Drill-down UI can re-list and reselect it; `deselected` is
+//! the plain `BTreeSet<PathBuf>` of relative paths — the storable shape #34 (Profile
+//! persistence) needs to remember deselections across runs (CONTEXT.md's "Profile").
 //!
 //! #22 scope: `encryption_required` delegates to `crypto::evaluate`'s Auto-insist policy —
 //! see that module for which specific Categories/Entries triggered it.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::catalog;
@@ -71,7 +84,15 @@ impl Entry {
 /// authoritative model of what will be backed up.
 #[derive(Debug, Clone, Default)]
 pub struct SelectionModel {
+    /// The currently active Entries — see the module doc's #21 section for why every
+    /// derived accessor reads only this field.
     entries: Vec<Entry>,
+    /// Entries deselected via Drill-down, held here rather than dropped so
+    /// `entries_in_category`/`reselect_entry` can still find them.
+    withheld: Vec<Entry>,
+    /// The relative paths of every currently-withheld Entry, kept in lockstep with
+    /// `withheld` — the storable shape exposed by `deselected_paths` for #34 to persist.
+    deselected: BTreeSet<PathBuf>,
 }
 
 impl SelectionModel {
@@ -80,7 +101,11 @@ impl SelectionModel {
     /// does) or once Drill-down (#21) has finished toggling individual Entries within an
     /// otherwise Smart-defaulted Selection.
     pub fn new(entries: Vec<Entry>) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            withheld: Vec::new(),
+            deselected: BTreeSet::new(),
+        }
     }
 
     /// Builds a Selection from a full taxonomy scan (`scan::scan_taxonomy`), keeping only
@@ -96,12 +121,71 @@ impl SelectionModel {
             .filter(|scan| scan.category.smart_default)
             .flat_map(|scan| scan.entries.iter().cloned())
             .collect();
-        Self { entries }
+        Self::new(entries)
     }
 
-    /// The selected Entries, in scan order.
+    /// The active (non-deselected) Entries, in scan order — what `archive::build` and the
+    /// Manifest builder actually consume.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// Deselects (Drill-down, #21) the Entry whose relative path is `relative_path`,
+    /// independently of its Category's own checkbox: the Entry moves out of the active
+    /// Selection (so `selected_paths`/`total_size`/`entries()` stop seeing it) into
+    /// `withheld`, where `entries_in_category`/`reselect_entry` can still find it. A no-op
+    /// if no active Entry matches `relative_path` — already deselected, or never part of
+    /// the Selection to begin with.
+    pub fn deselect_entry(&mut self, relative_path: &Path) {
+        let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.relative_path == relative_path)
+        else {
+            return;
+        };
+        let entry = self.entries.remove(pos);
+        self.deselected.insert(entry.relative_path.clone());
+        self.withheld.push(entry);
+    }
+
+    /// Reverses `deselect_entry`: moves the Entry back into the active Selection. A no-op
+    /// if `relative_path` isn't currently withheld.
+    pub fn reselect_entry(&mut self, relative_path: &Path) {
+        let Some(pos) = self
+            .withheld
+            .iter()
+            .position(|e| e.relative_path == relative_path)
+        else {
+            return;
+        };
+        let entry = self.withheld.remove(pos);
+        self.deselected.remove(&entry.relative_path);
+        self.entries.push(entry);
+    }
+
+    /// Whether `relative_path` is currently deselected (withheld from the active
+    /// Selection).
+    pub fn is_deselected(&self, relative_path: &Path) -> bool {
+        self.deselected.contains(relative_path)
+    }
+
+    /// The relative paths of every currently-deselected Entry — the plain, storable shape
+    /// #34 (Profile persistence) needs to remember Drill-down deselections across runs
+    /// (CONTEXT.md's "Drill-down": "Deselections persist in the Profile").
+    pub fn deselected_paths(&self) -> &BTreeSet<PathBuf> {
+        &self.deselected
+    }
+
+    /// Every Entry belonging to `category` — active or withheld — for a Drill-down UI to
+    /// list with per-Entry checkbox state (`is_deselected`), independently of whether the
+    /// Category itself is checked.
+    pub fn entries_in_category(&self, category: &str) -> Vec<&Entry> {
+        self.entries
+            .iter()
+            .chain(self.withheld.iter())
+            .filter(|e| e.category == category)
+            .collect()
     }
 
     /// The absolute, on-disk paths of every selected Entry.
@@ -248,5 +332,144 @@ mod tests {
     fn encryption_required_is_true_with_a_sensitive_entry() {
         let selection = SelectionModel::new(vec![entry(catalog::SSH.name, true, "id_ed25519")]);
         assert!(selection.encryption_required());
+    }
+
+    /// Builds a real on-disk Entry (so `total_size` has something to `fs::metadata` against)
+    /// of `len` bytes under `tmp`, at `relative_path`.
+    fn entry_with_size(tmp: &Path, relative_path: &str, len: u64) -> Entry {
+        let absolute_path = tmp.join(relative_path);
+        std::fs::create_dir_all(absolute_path.parent().unwrap()).expect("create parent dir");
+        let file = std::fs::File::create(&absolute_path).expect("create file");
+        file.set_len(len).expect("set_len");
+        Entry {
+            absolute_path,
+            relative_path: PathBuf::from(relative_path),
+            root: EntryRoot::Home,
+            category: catalog::KDE_PLASMA.name,
+            sensitive: false,
+        }
+    }
+
+    #[test]
+    fn deselect_entry_excludes_it_from_entries_selected_paths_and_total_size() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kwinrc = entry_with_size(tmp.path(), ".config/kwinrc", 100);
+        let heavy_icon = entry_with_size(tmp.path(), ".local/share/icons/heavy.svg", 200);
+        let mut selection = SelectionModel::new(vec![kwinrc, heavy_icon]);
+
+        selection.deselect_entry(Path::new(".local/share/icons/heavy.svg"));
+
+        // Deselecting one Entry within KDE Plasma must not touch the Category-level
+        // checkbox — the rest of the Category (kwinrc here) stays selected (AC2).
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(
+            selection.entries()[0].relative_path,
+            Path::new(".config/kwinrc")
+        );
+        assert_eq!(
+            selection.selected_paths(),
+            vec![tmp.path().join(".config/kwinrc")]
+        );
+        assert_eq!(selection.total_size(), 100);
+    }
+
+    #[test]
+    fn deselect_entry_is_recorded_in_is_deselected_and_deselected_paths() {
+        let mut selection = SelectionModel::new(vec![
+            entry(catalog::KDE_PLASMA.name, false, ".config/kwinrc"),
+            entry(
+                catalog::KDE_PLASMA.name,
+                false,
+                ".local/share/wallpapers/heavy.jpg",
+            ),
+        ]);
+
+        selection.deselect_entry(Path::new(".local/share/wallpapers/heavy.jpg"));
+
+        assert!(selection.is_deselected(Path::new(".local/share/wallpapers/heavy.jpg")));
+        assert!(!selection.is_deselected(Path::new(".config/kwinrc")));
+        assert_eq!(
+            selection.deselected_paths(),
+            &std::collections::BTreeSet::from([PathBuf::from(".local/share/wallpapers/heavy.jpg")])
+        );
+    }
+
+    #[test]
+    fn deselect_entry_is_a_no_op_for_a_path_not_in_the_selection() {
+        let mut selection = SelectionModel::new(vec![entry(
+            catalog::KDE_PLASMA.name,
+            false,
+            ".config/kwinrc",
+        )]);
+
+        selection.deselect_entry(Path::new("nonexistent"));
+
+        assert_eq!(selection.entries().len(), 1);
+        assert!(selection.deselected_paths().is_empty());
+    }
+
+    #[test]
+    fn reselect_entry_restores_a_previously_deselected_entry() {
+        let mut selection = SelectionModel::new(vec![
+            entry(catalog::KDE_PLASMA.name, false, ".config/kwinrc"),
+            entry(
+                catalog::KDE_PLASMA.name,
+                false,
+                ".local/share/icons/heavy.svg",
+            ),
+        ]);
+        let icon_path = Path::new(".local/share/icons/heavy.svg");
+
+        selection.deselect_entry(icon_path);
+        assert_eq!(selection.entries().len(), 1);
+
+        selection.reselect_entry(icon_path);
+
+        assert_eq!(selection.entries().len(), 2);
+        assert!(!selection.is_deselected(icon_path));
+        assert!(selection.deselected_paths().is_empty());
+    }
+
+    #[test]
+    fn reselect_entry_is_a_no_op_when_the_path_was_never_withheld() {
+        let mut selection = SelectionModel::new(vec![entry(
+            catalog::KDE_PLASMA.name,
+            false,
+            ".config/kwinrc",
+        )]);
+
+        selection.reselect_entry(Path::new(".config/kwinrc"));
+
+        assert_eq!(selection.entries().len(), 1);
+    }
+
+    #[test]
+    fn entries_in_category_lists_both_active_and_withheld_entries() {
+        let mut selection = SelectionModel::new(vec![
+            entry(catalog::KDE_PLASMA.name, false, ".config/kwinrc"),
+            entry(
+                catalog::KDE_PLASMA.name,
+                false,
+                ".local/share/icons/heavy.svg",
+            ),
+            entry(catalog::SHELL.name, false, "aliases.zsh"),
+        ]);
+        selection.deselect_entry(Path::new(".local/share/icons/heavy.svg"));
+
+        // Drill-down needs to list every Entry in the Category — including the withheld
+        // one, so a UI can show it unchecked and let the user toggle it back on — not just
+        // whatever remains actively selected.
+        let plasma_entries = selection.entries_in_category(catalog::KDE_PLASMA.name);
+        let plasma_relative_paths: std::collections::BTreeSet<&Path> = plasma_entries
+            .iter()
+            .map(|e| e.relative_path.as_path())
+            .collect();
+        assert_eq!(
+            plasma_relative_paths,
+            std::collections::BTreeSet::from([
+                Path::new(".config/kwinrc"),
+                Path::new(".local/share/icons/heavy.svg"),
+            ])
+        );
     }
 }

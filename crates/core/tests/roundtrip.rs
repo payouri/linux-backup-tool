@@ -122,6 +122,36 @@ fn build_multi_category_fixture_home(root: &Path) -> PathBuf {
     home
 }
 
+/// Builds a synthetic `$HOME` under `root` exercising #21's Drill-down on top of #19's
+/// single-Category Shell fixture: a KDE Plasma Category with three Entries —
+/// `.config/kwinrc` (the Entry that must survive deselection) alongside one file each under
+/// `.local/share/icons/` and `.local/share/wallpapers/` (story 13's concrete example: the
+/// heavy Entries a user drills down to exclude). The fixture files stand in for the real
+/// 226MB icon theme — Drill-down excludes by relative path regardless of size.
+///
+/// Returns the Fixture environment's home path.
+fn build_kde_plasma_fixture_home(root: &Path) -> PathBuf {
+    let home = build_fixture_home(root);
+
+    fs::create_dir_all(home.join(".config")).expect("create .config dir");
+    fs::write(home.join(".config/kwinrc"), b"[Windows]\nfake-kwinrc\n").expect("write kwinrc");
+
+    let icons_dir = home.join(".local/share/icons/hicolor");
+    fs::create_dir_all(&icons_dir).expect("create icons dir");
+    fs::write(icons_dir.join("heavy-icon-theme.svg"), b"fake-icon-bytes\n")
+        .expect("write heavy icon");
+
+    let wallpapers_dir = home.join(".local/share/wallpapers/mywallpaper");
+    fs::create_dir_all(&wallpapers_dir).expect("create wallpapers dir");
+    fs::write(
+        wallpapers_dir.join("1920x1080.jpg"),
+        b"fake-wallpaper-bytes\n",
+    )
+    .expect("write wallpaper");
+
+    home
+}
+
 /// Asserts a completed backup+restore round-trip landed correctly: no restore failures,
 /// both fixture files restored byte-for-byte under `restore_home` (not the original
 /// `original_home` — Re-rooting), and the out-of-allowlist file never appearing anywhere
@@ -673,4 +703,114 @@ fn selection_with_no_sensitive_or_safety_net_matches_does_not_require_encryption
     assert!(policy.sensitive_categories.is_empty());
     assert!(policy.sensitive_entries.is_empty());
     assert!(!selection.encryption_required());
+}
+
+/// Issue #21 / stories 12-13: proves Drill-down deselection through the full backup/restore
+/// seam — deselecting KDE Plasma's `icons/`/`wallpapers/` Entries excludes exactly those two
+/// from the Manifest and Archive while `kwinrc` (the rest of the otherwise-checked Category)
+/// still lands normally, and the Category-level Smart default is never touched to do it.
+#[test]
+fn kde_plasma_drill_down_deselection_excludes_exactly_those_entries_from_the_round_trip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_kde_plasma_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home.clone(), output.clone());
+    let scanned = scan::scan_taxonomy(&ctx);
+    let mut selection = SelectionModel::from_smart_defaults(&scanned);
+
+    // KDE Plasma is a Smart-default-ON Category (story 3's siblings), so all three fixture
+    // Entries start in the active Selection before any Drill-down toggling.
+    let plasma_entries_before: Vec<PathBuf> = selection
+        .entries()
+        .iter()
+        .filter(|e| e.category == catalog::KDE_PLASMA.name)
+        .map(|e| e.relative_path.clone())
+        .collect();
+    assert_eq!(
+        plasma_entries_before.len(),
+        3,
+        "all three KDE Plasma fixture Entries should start selected: {plasma_entries_before:?}"
+    );
+
+    let icon_relative_path = PathBuf::from(".local/share/icons/hicolor/heavy-icon-theme.svg");
+    let wallpaper_relative_path =
+        PathBuf::from(".local/share/wallpapers/mywallpaper/1920x1080.jpg");
+    let kwinrc_relative_path = PathBuf::from(".config/kwinrc");
+
+    selection.deselect_entry(&icon_relative_path);
+    selection.deselect_entry(&wallpaper_relative_path);
+
+    // The Category-level checkbox is untouched by Drill-down: kwinrc is still selected, and
+    // Drill-down listing (`entries_in_category`) still surfaces all three Entries so a UI
+    // could re-toggle the withheld ones — only the *active* Selection shrank.
+    assert!(selection
+        .entries()
+        .iter()
+        .any(|e| e.relative_path == kwinrc_relative_path));
+    assert!(!selection
+        .entries()
+        .iter()
+        .any(|e| e.relative_path == icon_relative_path));
+    assert!(!selection
+        .entries()
+        .iter()
+        .any(|e| e.relative_path == wallpaper_relative_path));
+    assert_eq!(
+        selection
+            .entries_in_category(catalog::KDE_PLASMA.name)
+            .len(),
+        3,
+        "Drill-down listing must still show every Entry, deselected or not"
+    );
+    assert!(selection.is_deselected(&icon_relative_path));
+    assert!(selection.is_deselected(&wallpaper_relative_path));
+    assert_eq!(
+        selection.deselected_paths(),
+        &std::collections::BTreeSet::from([
+            icon_relative_path.clone(),
+            wallpaper_relative_path.clone()
+        ])
+    );
+
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    // Only kwinrc (KDE Plasma) plus the two Shell fixture files land — the deselected icon
+    // and wallpaper Entries never reach the Manifest or Archive at all.
+    let manifest_paths: std::collections::BTreeSet<&str> = outcome
+        .manifest
+        .entries
+        .iter()
+        .map(|e| e.path.as_str())
+        .collect();
+    assert!(manifest_paths.contains(".config/kwinrc"));
+    assert!(!manifest_paths.contains(icon_relative_path.to_str().unwrap()));
+    assert!(!manifest_paths.contains(wallpaper_relative_path.to_str().unwrap()));
+    assert!(outcome.manifest.checksums.keys().all(
+        |archive_path| !archive_path.contains("icons") && !archive_path.contains("wallpapers")
+    ));
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+
+    assert!(
+        restore_outcome.failures.is_empty(),
+        "unexpected restore failures: {:?}",
+        restore_outcome.failures
+    );
+    assert_eq!(
+        fs::read(restore_home.join(".config/kwinrc")).expect("restored kwinrc should exist"),
+        fs::read(home.join(".config/kwinrc")).expect("original kwinrc should exist"),
+    );
+    assert!(
+        !restore_home.join(".local/share/icons").exists(),
+        "deselected icons/ Entry must never land on restore"
+    );
+    assert!(
+        !restore_home.join(".local/share/wallpapers").exists(),
+        "deselected wallpapers/ Entry must never land on restore"
+    );
 }
