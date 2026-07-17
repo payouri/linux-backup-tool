@@ -342,9 +342,18 @@ fn taxonomy_round_trip_composes_multiple_categories() {
     let scanned_names: Vec<&str> = scanned.iter().map(|s| s.category.name).collect();
     assert!(scanned_names.contains(&"Shell"));
     assert!(scanned_names.contains(&"SSH"));
-    assert!(scanned_names.contains(&"User data"), "User data has a real match and must be discoverable");
-    assert!(scanned_names.contains(&"Custom paths"), "Custom paths is exempt from Hide-empty");
-    assert!(!scanned_names.contains(&"GPG"), "GPG has zero matches on this fixture and must be hidden");
+    assert!(
+        scanned_names.contains(&"User data"),
+        "User data has a real match and must be discoverable"
+    );
+    assert!(
+        scanned_names.contains(&"Custom paths"),
+        "Custom paths is exempt from Hide-empty"
+    );
+    assert!(
+        !scanned_names.contains(&"GPG"),
+        "GPG has zero matches on this fixture and must be hidden"
+    );
 
     let selection = SelectionModel::from_smart_defaults(&scanned);
     let selected_categories: std::collections::BTreeSet<&str> =
@@ -365,15 +374,27 @@ fn taxonomy_round_trip_composes_multiple_categories() {
     // report.pdf must be absent because Smart defaults excluded it, not because it wasn't
     // found.
     assert_eq!(outcome.manifest.entries.len(), 3);
-    let manifest_categories: std::collections::BTreeSet<&str> =
-        outcome.manifest.entries.iter().map(|e| e.category.as_str()).collect();
-    assert_eq!(manifest_categories, std::collections::BTreeSet::from(["Shell", "SSH"]));
+    let manifest_categories: std::collections::BTreeSet<&str> = outcome
+        .manifest
+        .entries
+        .iter()
+        .map(|e| e.category.as_str())
+        .collect();
+    assert_eq!(
+        manifest_categories,
+        std::collections::BTreeSet::from(["Shell", "SSH"])
+    );
 
     let restore_home = tmp.path().join("restored-home");
     let restore_ctx = test_ctx(restore_home.clone(), output.clone());
-    let restore_outcome = run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
 
-    assert!(restore_outcome.failures.is_empty(), "unexpected restore failures: {:?}", restore_outcome.failures);
+    assert!(
+        restore_outcome.failures.is_empty(),
+        "unexpected restore failures: {:?}",
+        restore_outcome.failures
+    );
     assert_eq!(restore_outcome.restored_paths.len(), 3);
     assert_eq!(
         fs::read(restore_home.join(".ssh/id_ed25519")).expect("restored ssh key should exist"),

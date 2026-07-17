@@ -173,7 +173,11 @@ mod tests {
             },
             CategoryScan {
                 category: catalog::USER_DATA,
-                entries: vec![entry(catalog::USER_DATA.name, false, "Documents/report.pdf")],
+                entries: vec![entry(
+                    catalog::USER_DATA.name,
+                    false,
+                    "Documents/report.pdf",
+                )],
             },
         ];
 
@@ -187,7 +191,11 @@ mod tests {
 
     #[test]
     fn warnings_is_empty_below_the_user_data_threshold() {
-        let selection = SelectionModel::new(vec![entry(catalog::USER_DATA.name, false, "Documents/small.txt")]);
+        let selection = SelectionModel::new(vec![entry(
+            catalog::USER_DATA.name,
+            false,
+            "Documents/small.txt",
+        )]);
         assert!(selection.warnings().is_empty());
     }
 
@@ -199,7 +207,8 @@ mod tests {
         // A sparse file: reports the requested length via metadata without actually using
         // that much disk, which is all `warnings()` reads.
         let file = std::fs::File::create(&big_file).expect("create big file");
-        file.set_len(USER_DATA_WARNING_THRESHOLD_BYTES + 1).expect("set_len");
+        file.set_len(USER_DATA_WARNING_THRESHOLD_BYTES + 1)
+            .expect("set_len");
 
         let selection = SelectionModel::new(vec![Entry {
             absolute_path: big_file,

@@ -200,7 +200,10 @@ pub const ALL: [Category; 10] = [
 /// Whether `relative_path` (already relative to `$HOME`) falls under one of `category`'s
 /// allowlist roots.
 fn category_matches(category: &Category, relative_path: &Path) -> bool {
-    category.allowlist.iter().any(|root| relative_path.starts_with(root))
+    category
+        .allowlist
+        .iter()
+        .any(|root| relative_path.starts_with(root))
 }
 
 /// Resolves which Category owns `relative_path` when it may match more than one entry in
@@ -212,14 +215,23 @@ fn category_matches(category: &Category, relative_path: &Path) -> bool {
 ///
 /// Returns `None` if `relative_path` matches no Category's allowlist at all (story 8: such
 /// a path is only addable via Custom paths, never silently attributed to one of the ten).
-pub fn resolve_category<'a>(relative_path: &Path, categories: &'a [Category]) -> Option<&'a Category> {
-    categories.iter().find(|category| category_matches(category, relative_path))
+pub fn resolve_category<'a>(
+    relative_path: &Path,
+    categories: &'a [Category],
+) -> Option<&'a Category> {
+    categories
+        .iter()
+        .find(|category| category_matches(category, relative_path))
 }
 
 /// Validates a Custom path against the root/non-root constraint (stories 10/11): root may
 /// add any filesystem path; non-root is constrained to under `home`. `privilege` is always
 /// the injected [`Privilege`] (ADR-0004) — this function never reads the real euid itself.
-pub fn validate_custom_path(candidate: &Path, home: &Path, privilege: Privilege) -> Result<(), CoreError> {
+pub fn validate_custom_path(
+    candidate: &Path,
+    home: &Path,
+    privilege: Privilege,
+) -> Result<(), CoreError> {
     match privilege {
         Privilege::Root => Ok(()),
         Privilege::NonRoot => {
@@ -267,7 +279,8 @@ mod tests {
         // Both HIGH (".config/shared") and LOW (".config/shared/nested") match this path;
         // HIGH must win purely because it comes first in `categories`, regardless of which
         // allowlist entry is the more specific prefix.
-        let resolved = resolve_category(&overlapping, &categories).expect("should resolve to a category");
+        let resolved =
+            resolve_category(&overlapping, &categories).expect("should resolve to a category");
         assert_eq!(resolved.name, "High");
     }
 
@@ -276,7 +289,8 @@ mod tests {
         let categories = [HIGH, LOW];
         let low_only = PathBuf::from(".config/only-low/file.txt");
 
-        let resolved = resolve_category(&low_only, &categories).expect("should resolve to a category");
+        let resolved =
+            resolve_category(&low_only, &categories).expect("should resolve to a category");
         assert_eq!(resolved.name, "Low");
     }
 
@@ -319,9 +333,15 @@ mod tests {
 
         for sensitive_category in ["SSH", "GPG", "Cloud creds"] {
             let category = by_name(sensitive_category);
-            assert!(category.smart_default && category.sensitive, "{sensitive_category} must default ON and be Sensitive");
+            assert!(
+                category.smart_default && category.sensitive,
+                "{sensitive_category} must default ON and be Sensitive"
+            );
         }
-        assert!(!by_name("User data").smart_default, "User data must default OFF (story 4)");
+        assert!(
+            !by_name("User data").smart_default,
+            "User data must default OFF (story 4)"
+        );
         assert!(
             !by_name("Custom paths").smart_default,
             "Custom paths starts empty, nothing to default on"
@@ -330,7 +350,11 @@ mod tests {
 
     #[test]
     fn only_custom_paths_is_exempt_from_hide_empty() {
-        let always_shown: Vec<&str> = ALL.iter().filter(|c| c.always_shown).map(|c| c.name).collect();
+        let always_shown: Vec<&str> = ALL
+            .iter()
+            .filter(|c| c.always_shown)
+            .map(|c| c.name)
+            .collect();
         assert_eq!(always_shown, vec!["Custom paths"]);
     }
 

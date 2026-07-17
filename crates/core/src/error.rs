@@ -92,6 +92,8 @@ pub enum CoreError {
 
     /// A Custom path outside `$HOME` was rejected because the current run is non-root
     /// (stories 10/11). Root may add any path; only non-root is constrained this way.
-    #[error("custom path {path} is outside home ({home}); non-root runs are constrained to under home")]
+    #[error(
+        "custom path {path} is outside home ({home}); non-root runs are constrained to under home"
+    )]
     CustomPathOutsideHome { path: PathBuf, home: PathBuf },
 }

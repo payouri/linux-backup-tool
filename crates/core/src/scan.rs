@@ -93,7 +93,10 @@ pub fn scan_taxonomy(ctx: &RunContext) -> Vec<CategoryScan> {
             // silently attributed to one of the ten here.
             continue;
         };
-        let owner_index = categories.iter().position(|c| c.name == owner.name).expect("owner came from categories");
+        let owner_index = categories
+            .iter()
+            .position(|c| c.name == owner.name)
+            .expect("owner came from categories");
         entries_by_category[owner_index].push(Entry {
             absolute_path,
             relative_path,
@@ -166,23 +169,42 @@ mod tests {
         // absent from this fixture $HOME.
         let custom_dir = home.join(".oh-my-zsh/custom");
         fs::create_dir_all(&custom_dir).expect("create custom dir");
-        fs::write(custom_dir.join("aliases.zsh"), b"alias ll='ls -la'\n").expect("write aliases.zsh");
+        fs::write(custom_dir.join("aliases.zsh"), b"alias ll='ls -la'\n")
+            .expect("write aliases.zsh");
 
         let ctx = test_ctx(home);
         let scanned = scan_taxonomy(&ctx);
 
         let names: Vec<&str> = scanned.iter().map(|s| s.category.name).collect();
-        assert!(names.contains(&"Shell"), "Shell has a match and must be shown");
-        assert!(names.contains(&"Custom paths"), "Custom paths is exempt from Hide-empty");
-        assert!(!names.contains(&"SSH"), "SSH has zero matches on this fixture and must be hidden");
-        assert!(!names.contains(&"GPG"), "GPG has zero matches on this fixture and must be hidden");
+        assert!(
+            names.contains(&"Shell"),
+            "Shell has a match and must be shown"
+        );
+        assert!(
+            names.contains(&"Custom paths"),
+            "Custom paths is exempt from Hide-empty"
+        );
+        assert!(
+            !names.contains(&"SSH"),
+            "SSH has zero matches on this fixture and must be hidden"
+        );
+        assert!(
+            !names.contains(&"GPG"),
+            "GPG has zero matches on this fixture and must be hidden"
+        );
         assert!(
             !names.contains(&"Package lists"),
             "Package lists has no filesystem allowlist and is never populated here"
         );
 
-        let custom_paths_scan = scanned.iter().find(|s| s.category.name == "Custom paths").unwrap();
-        assert!(custom_paths_scan.entries.is_empty(), "Custom paths starts empty (story 6)");
+        let custom_paths_scan = scanned
+            .iter()
+            .find(|s| s.category.name == "Custom paths")
+            .unwrap();
+        assert!(
+            custom_paths_scan.entries.is_empty(),
+            "Custom paths starts empty (story 6)"
+        );
     }
 
     #[test]
@@ -196,17 +218,27 @@ mod tests {
 
         let custom_dir = home.join(".oh-my-zsh/custom");
         fs::create_dir_all(&custom_dir).expect("create custom dir");
-        fs::write(custom_dir.join("aliases.zsh"), b"alias ll='ls -la'\n").expect("write aliases.zsh");
+        fs::write(custom_dir.join("aliases.zsh"), b"alias ll='ls -la'\n")
+            .expect("write aliases.zsh");
 
         let ctx = test_ctx(home);
         let scanned = scan_taxonomy(&ctx);
 
-        let ssh_scan = scanned.iter().find(|s| s.category.name == "SSH").expect("SSH should be present");
+        let ssh_scan = scanned
+            .iter()
+            .find(|s| s.category.name == "SSH")
+            .expect("SSH should be present");
         assert_eq!(ssh_scan.entries.len(), 1);
         assert!(ssh_scan.entries[0].sensitive, "SSH is a sensitive Category");
 
-        let shell_scan = scanned.iter().find(|s| s.category.name == "Shell").expect("Shell should be present");
+        let shell_scan = scanned
+            .iter()
+            .find(|s| s.category.name == "Shell")
+            .expect("Shell should be present");
         assert_eq!(shell_scan.entries.len(), 1);
-        assert!(!shell_scan.entries[0].sensitive, "Shell is not a sensitive Category");
+        assert!(
+            !shell_scan.entries[0].sensitive,
+            "Shell is not a sensitive Category"
+        );
     }
 }
