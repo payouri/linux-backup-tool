@@ -1,0 +1,14 @@
+[package]
+name = "tui"
+version.workspace = true
+edition.workspace = true
+description = "linux-backup's inquire-based terminal wizard: a thin view over core's SelectionModel, owning only cursor/scroll state and rendering."
+
+[[bin]]
+name = "linux-backup"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+core = { path = "../core", package = "linux-backup-core" }
+inquire = "0.9.4"
