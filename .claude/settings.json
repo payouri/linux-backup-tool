@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -n --arg c \"$(cat AGENTS.md)\" '{hookSpecificOutput:{hookEventName:\"SessionStart\",additionalContext:$c}}'"
+          }
+        ]
+      }
+    ]
+  }
+}
