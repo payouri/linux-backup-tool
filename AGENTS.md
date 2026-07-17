@@ -21,6 +21,12 @@ Read before writing or changing tests:
 - **`core` reads nothing from the ambient system** — all run facts (`home`, output location, privilege, `host`, `user`, `uid`, `os`, `now`) arrive via an injected `RunContext`. Never call `std::env`, `dirs`, `hostname`, `getuid`, or the clock inside `core`; add a `RunContext` field instead. See `docs/adr/0004-core-runcontext-injection.md`.
 - **One round-trip seam** through `core`'s public API (`crates/core/tests/roundtrip.rs`), asserting externally-observable behavior only — extend it rather than adding new seams. Full testing decisions live in issue #17 (Testing Decisions section).
 
+## Git workflow
+
+- **`trunk` only moves by fast-forward.** No merge commits onto `trunk`, ever.
+- Before merging a branch, **rebase it onto `trunk`** (`git rebase trunk`), resolving any conflicts on the branch — not by merging `trunk` into it.
+- Only merge/push once the rebased branch fast-forwards cleanly (`git merge --ff-only`).
+
 ## Agent skills
 
 ### Issue tracker
