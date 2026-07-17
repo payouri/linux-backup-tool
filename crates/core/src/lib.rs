@@ -58,11 +58,10 @@ pub fn backup(
     ctx: &RunContext,
     encryption: &Encryption,
 ) -> Result<BackupOutcome, CoreError> {
-    let backup_dir = ctx.output_location.join(backup_dir_name(ctx));
-
-    if backup_dir.exists() {
-        return Err(CoreError::BackupDirExists(backup_dir));
-    }
+    // Delegate the collision check to `location::ensure_backup_dir_available` (#27) rather
+    // than re-testing `.exists()` here, so there's one implementation of story 33's
+    // refusal instead of two that could drift apart.
+    let backup_dir = location::ensure_backup_dir_available(&ctx.output_location, &backup_dir_name(ctx))?;
 
     run_backup(selection, ctx, encryption, &backup_dir).inspect_err(|_| {
         // Fail-fast cleanup (ADR-0002): the Backup dir was created fresh by this call, so
