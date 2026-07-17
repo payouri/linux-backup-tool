@@ -55,7 +55,9 @@ fn build_fixture_home(root: &Path) -> PathBuf {
     fs::create_dir_all(&themes_dir).expect("create themes dir");
     fs::write(themes_dir.join("robbyrussell.zsh-theme"), b"# theme\n").expect("write theme file");
 
-    // Outside oh-my-zsh entirely.
+    // Distinct from the themes case above (same framework, wrong subdir): this file isn't
+    // on *any* Category's allowlist, proving scan_category doesn't fall back to some
+    // broader home-relative default when nothing more specific matches.
     fs::write(home.join("not-included.txt"), b"irrelevant\n").expect("write unrelated file");
 
     home
