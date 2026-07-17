@@ -101,10 +101,11 @@ pub fn build(entries: &[Entry]) -> Result<BuiltArchive, CoreError> {
             }
         };
 
-        let metadata = fs::metadata(&entry.absolute_path).map_err(|source| CoreError::ReadFailed {
-            path: entry.absolute_path.clone(),
-            source,
-        })?;
+        let metadata =
+            fs::metadata(&entry.absolute_path).map_err(|source| CoreError::ReadFailed {
+                path: entry.absolute_path.clone(),
+                source,
+            })?;
 
         checksums.insert(archive_path_str, sha256_hex(&bytes));
 

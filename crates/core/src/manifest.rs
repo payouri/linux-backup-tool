@@ -152,10 +152,17 @@ pub fn build(inputs: ManifestInputs<'_>) -> Manifest {
 /// Manifest's self-identifying `created_at` field (CONTEXT.md), never parsed back by
 /// anything in the alpha, so a minimal calendar conversion is enough.
 pub fn format_rfc3339(time: SystemTime) -> String {
-    let secs = time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let days = (secs / 86_400) as i64;
     let time_of_day = secs % 86_400;
-    let (hour, minute, second) = (time_of_day / 3600, (time_of_day / 60) % 60, time_of_day % 60);
+    let (hour, minute, second) = (
+        time_of_day / 3600,
+        (time_of_day / 60) % 60,
+        time_of_day % 60,
+    );
     let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }

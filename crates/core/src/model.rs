@@ -75,7 +75,10 @@ impl SelectionModel {
 
     /// The absolute, on-disk paths of every selected Entry.
     pub fn selected_paths(&self) -> Vec<&Path> {
-        self.entries.iter().map(|e| e.absolute_path.as_path()).collect()
+        self.entries
+            .iter()
+            .map(|e| e.absolute_path.as_path())
+            .collect()
     }
 
     /// The sum of every selected Entry's current on-disk size in bytes.

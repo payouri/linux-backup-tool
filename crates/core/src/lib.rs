@@ -69,7 +69,8 @@ pub fn backup(
     // Delegate the collision check to `location::ensure_backup_dir_available` (#27) rather
     // than re-testing `.exists()` here, so there's one implementation of story 33's
     // refusal instead of two that could drift apart.
-    let backup_dir = location::ensure_backup_dir_available(&ctx.output_location, &backup_dir_name(ctx))?;
+    let backup_dir =
+        location::ensure_backup_dir_available(&ctx.output_location, &backup_dir_name(ctx))?;
 
     run_backup(selection, ctx, encryption, package_runner, &backup_dir).inspect_err(|_| {
         // Fail-fast cleanup (ADR-0002): the Backup dir was created fresh by this call, so
@@ -132,6 +133,10 @@ fn run_backup(
 /// `linux-backup-<host>-<timestamp>`, built entirely from `ctx` (ADR-0004) so it's
 /// deterministic under a fixed `RunContext` in tests.
 fn backup_dir_name(ctx: &RunContext) -> String {
-    let timestamp = ctx.now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let timestamp = ctx
+        .now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     format!("linux-backup-{}-{}", ctx.host, timestamp)
 }

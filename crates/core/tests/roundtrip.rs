@@ -42,7 +42,11 @@ fn build_fixture_home(root: &Path) -> PathBuf {
 
     let plugin_dir = custom_dir.join("plugins/my-plugin");
     fs::create_dir_all(&plugin_dir).expect("create plugin dir");
-    fs::write(plugin_dir.join("my-plugin.plugin.zsh"), b"# my plugin\necho hi\n").expect("write plugin file");
+    fs::write(
+        plugin_dir.join("my-plugin.plugin.zsh"),
+        b"# my plugin\necho hi\n",
+    )
+    .expect("write plugin file");
 
     // Outside the Curated allowlist (Shell only covers oh-my-zsh/custom/, never the whole
     // framework) — must not be picked up by scan_category.
@@ -81,7 +85,11 @@ fn shell_selection(ctx: &RunContext) -> SelectionModel {
 /// the round-trip seam stays off the real-package-manager system boundary and fully
 /// deterministic regardless of what's installed on whatever machine runs this suite — see
 /// `packages::NoCommandRunner`'s doc.
-fn run_backup(selection: &SelectionModel, ctx: &RunContext, encryption: &Encryption) -> Result<BackupOutcome, CoreError> {
+fn run_backup(
+    selection: &SelectionModel,
+    ctx: &RunContext,
+    encryption: &Encryption,
+) -> Result<BackupOutcome, CoreError> {
     linux_backup_core::backup(selection, ctx, encryption, &NoCommandRunner)
 }
 
@@ -93,7 +101,12 @@ fn run_restore(backup_dir: &Path, ctx: &RunContext) -> Result<RestoreOutcome, Co
 /// both fixture files restored byte-for-byte under `restore_home` (not the original
 /// `original_home` — Re-rooting), and the out-of-allowlist file never appearing anywhere
 /// in the Backup.
-fn assert_round_trip_landed(outcome: &BackupOutcome, restore_outcome: &RestoreOutcome, original_home: &Path, restore_home: &Path) {
+fn assert_round_trip_landed(
+    outcome: &BackupOutcome,
+    restore_outcome: &RestoreOutcome,
+    original_home: &Path,
+    restore_home: &Path,
+) {
     assert!(
         restore_outcome.failures.is_empty(),
         "unexpected restore failures: {:?}",
@@ -105,9 +118,11 @@ fn assert_round_trip_landed(outcome: &BackupOutcome, restore_outcome: &RestoreOu
     assert!(outcome.manifest.vanished.is_empty());
 
     let original_aliases = original_home.join(".oh-my-zsh/custom/aliases.zsh");
-    let original_plugin = original_home.join(".oh-my-zsh/custom/plugins/my-plugin/my-plugin.plugin.zsh");
+    let original_plugin =
+        original_home.join(".oh-my-zsh/custom/plugins/my-plugin/my-plugin.plugin.zsh");
     let restored_aliases = restore_home.join(".oh-my-zsh/custom/aliases.zsh");
-    let restored_plugin = restore_home.join(".oh-my-zsh/custom/plugins/my-plugin/my-plugin.plugin.zsh");
+    let restored_plugin =
+        restore_home.join(".oh-my-zsh/custom/plugins/my-plugin/my-plugin.plugin.zsh");
 
     assert_eq!(
         fs::read(&restored_aliases).expect("restored aliases.zsh should exist"),
@@ -161,14 +176,24 @@ fn round_trip_unencrypted() {
 
     let archive_path = outcome.backup_dir.join("archive.tar.zst");
     let manifest_path = outcome.backup_dir.join("manifest.json");
-    assert!(archive_path.is_file(), "unencrypted Archive should have no .age suffix");
-    assert!(manifest_path.is_file(), "unencrypted Manifest should have no .age suffix");
+    assert!(
+        archive_path.is_file(),
+        "unencrypted Archive should have no .age suffix"
+    );
+    assert!(
+        manifest_path.is_file(),
+        "unencrypted Manifest should have no .age suffix"
+    );
     assert!(!outcome.backup_dir.join("archive.tar.zst.age").exists());
     assert!(!outcome.backup_dir.join("manifest.json.age").exists());
 
     let written_manifest: manifest::Manifest =
-        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).expect("manifest.json should parse");
-    assert_eq!(written_manifest.schema_version, outcome.manifest.schema_version);
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap())
+            .expect("manifest.json should parse");
+    assert_eq!(
+        written_manifest.schema_version,
+        outcome.manifest.schema_version
+    );
 
     let m = &outcome.manifest;
     assert_eq!(m.schema_version, manifest::SCHEMA_VERSION);
@@ -185,12 +210,16 @@ fn round_trip_unencrypted() {
     let archive_bytes_on_disk = fs::read(&archive_path).unwrap();
     // Unencrypted: the archive_sha256 in the Manifest is of the plaintext bytes, which
     // (with Encryption::None) are exactly what's on disk.
-    assert_eq!(m.archive_sha256, linux_backup_core::archive::sha256_hex(&archive_bytes_on_disk));
+    assert_eq!(
+        m.archive_sha256,
+        linux_backup_core::archive::sha256_hex(&archive_bytes_on_disk)
+    );
 
     // Restore into a DIFFERENT fresh root.
     let restore_home = tmp.path().join("restored-home");
     let restore_ctx = test_ctx(restore_home.clone(), output.clone());
-    let restore_outcome = run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
 
     assert_round_trip_landed(&outcome, &restore_outcome, &home, &restore_home);
 }
@@ -213,8 +242,14 @@ fn round_trip_encrypted_stub() {
     // not exist.
     let archive_path = outcome.backup_dir.join("archive.tar.zst.age");
     let manifest_path = outcome.backup_dir.join("manifest.json.age");
-    assert!(archive_path.is_file(), "encrypted Archive should carry the .age suffix");
-    assert!(manifest_path.is_file(), "encrypted Manifest should carry the .age suffix");
+    assert!(
+        archive_path.is_file(),
+        "encrypted Archive should carry the .age suffix"
+    );
+    assert!(
+        manifest_path.is_file(),
+        "encrypted Manifest should carry the .age suffix"
+    );
     assert!(!outcome.backup_dir.join("archive.tar.zst").exists());
     assert!(!outcome.backup_dir.join("manifest.json").exists());
 
@@ -223,7 +258,8 @@ fn round_trip_encrypted_stub() {
     // #23) code path instead.
     let restore_home = tmp.path().join("restored-home");
     let restore_ctx = test_ctx(restore_home.clone(), output.clone());
-    let restore_outcome = run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
 
     assert_round_trip_landed(&outcome, &restore_outcome, &home, &restore_home);
 }
@@ -239,7 +275,10 @@ fn backup_dir_collides_and_refuses() {
     let selection = shell_selection(&ctx);
 
     let first = run_backup(&selection, &ctx, &Encryption::None);
-    assert!(first.is_ok(), "first backup into a fresh Output location should succeed");
+    assert!(
+        first.is_ok(),
+        "first backup into a fresh Output location should succeed"
+    );
 
     // Same ctx (same host + timestamp) => same computed Backup dir name => must refuse
     // rather than silently overwrite (story 33).

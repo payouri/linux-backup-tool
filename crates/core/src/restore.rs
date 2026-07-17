@@ -91,9 +91,12 @@ fn locate_manifest(backup_dir: &Path) -> Result<(PathBuf, bool), CoreError> {
 
 /// Untars every entry in the decrypted, decompressed-on-the-fly Archive bytes, Re-rooting
 /// as it goes. Per ADR-0002, a per-file failure is collected and iteration continues.
-fn unpack_all(archive_bytes: &[u8], ctx: &RunContext) -> Result<(Vec<PathBuf>, Vec<RestoreFailure>), CoreError> {
-    let zstd_decoder =
-        zstd::stream::read::Decoder::new(archive_bytes).map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
+fn unpack_all(
+    archive_bytes: &[u8],
+    ctx: &RunContext,
+) -> Result<(Vec<PathBuf>, Vec<RestoreFailure>), CoreError> {
+    let zstd_decoder = zstd::stream::read::Decoder::new(archive_bytes)
+        .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
     let mut tar_archive = tar::Archive::new(zstd_decoder);
     let tar_entries = tar_archive
         .entries()
@@ -153,7 +156,9 @@ fn unpack_all(archive_bytes: &[u8], ctx: &RunContext) -> Result<(Vec<PathBuf>, V
 /// never the Manifest's original `home` — see CONTEXT.md's "Re-rooting".
 fn resolve_target(entry_path_in_tar: &Path, ctx: &RunContext) -> Result<PathBuf, String> {
     let mut components = entry_path_in_tar.components();
-    let root_tag = components.next().ok_or_else(|| "empty tar path".to_string())?;
+    let root_tag = components
+        .next()
+        .ok_or_else(|| "empty tar path".to_string())?;
     let rest: PathBuf = components.collect();
 
     match root_tag.as_os_str().to_str() {
@@ -163,7 +168,10 @@ fn resolve_target(entry_path_in_tar: &Path, ctx: &RunContext) -> Result<PathBuf,
     }
 }
 
-fn unpack_one<R: std::io::Read>(tar_entry: &mut tar::Entry<'_, R>, target: &Path) -> std::io::Result<()> {
+fn unpack_one<R: std::io::Read>(
+    tar_entry: &mut tar::Entry<'_, R>,
+    target: &Path,
+) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
