@@ -21,7 +21,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use linux_backup_core::archive::Encryption;
 use linux_backup_core::context::{Privilege, RunContext};
-use linux_backup_core::model::SelectionModel;
+use linux_backup_core::model::{Entry, EntryRoot, SelectionModel};
 use linux_backup_core::packages::NoCommandRunner;
 use linux_backup_core::restore::RestoreOutcome;
 use linux_backup_core::{catalog, manifest, scan, BackupOutcome, CoreError};
@@ -403,5 +403,163 @@ fn taxonomy_round_trip_composes_multiple_categories() {
     assert!(
         !restore_home.join("Documents").exists(),
         "User data was never selected, so nothing should land under Documents on restore"
+    );
+}
+
+/// Issue #24 / story 42: an empty Selection must bounce before any filesystem work at all —
+/// no Backup dir created for a caller to clean up, distinct from every other failure mode on
+/// this seam, which all fire after the dir already exists.
+#[test]
+fn empty_selection_is_refused_before_any_filesystem_work() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("create home dir");
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output.clone());
+    let selection = SelectionModel::new(Vec::new());
+
+    match run_backup(&selection, &ctx, &Encryption::None) {
+        Err(CoreError::EmptySelection) => {}
+        other => panic!("expected CoreError::EmptySelection, got {other:?}"),
+    }
+
+    assert!(
+        fs::read_dir(&output)
+            .expect("output location should still exist")
+            .next()
+            .is_none(),
+        "an empty Selection must not create a Backup dir at all"
+    );
+}
+
+/// Issue #24 / ADR-0002: a genuine read error (permission-denied, I/O error, device-gone) is
+/// fatal and distinct from a Vanished entry — the whole run aborts and the freshly-created
+/// Backup dir is deleted, so nothing (including no `manifest.json`) is left behind.
+#[test]
+fn hard_read_error_aborts_run_and_leaves_no_backup_dir_or_manifest() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home.clone(), output.clone());
+    let mut entries = shell_selection(&ctx).entries().to_vec();
+
+    // A directory can't be read as file bytes: `fs::read` fails with something other than
+    // `NotFound` (e.g. `IsADirectory`) — exactly the "real read error" ADR-0002 says is
+    // fatal. Deterministic and portable, unlike a permission-denied probe that a root-run
+    // test suite would sail straight through.
+    let broken_dir = home.join("broken-entry-is-a-directory");
+    fs::create_dir_all(&broken_dir).expect("create broken entry directory");
+    entries.push(Entry {
+        absolute_path: broken_dir,
+        relative_path: PathBuf::from("broken-entry-is-a-directory"),
+        root: EntryRoot::Home,
+        category: catalog::SHELL.name,
+        sensitive: false,
+    });
+    let selection = SelectionModel::new(entries);
+
+    match run_backup(&selection, &ctx, &Encryption::None) {
+        Err(CoreError::ReadFailed { .. }) => {}
+        other => panic!("expected CoreError::ReadFailed, got {other:?}"),
+    }
+
+    let expected_dir_name = format!(
+        "linux-backup-{}-{}",
+        ctx.host,
+        ctx.now.duration_since(UNIX_EPOCH).unwrap().as_secs()
+    );
+    let backup_dir = output.join(expected_dir_name);
+    assert!(
+        !backup_dir.exists(),
+        "an aborted backup run must leave no Backup dir behind"
+    );
+    assert!(
+        !backup_dir.join("manifest.json").exists(),
+        "no Manifest may be written for a run that aborts"
+    );
+}
+
+/// Issue #24 / CONTEXT.md's "Vanished": an Entry that existed at scan time but is gone
+/// (ENOENT) by read time is benign — skipped-with-note, the run still completes, and the
+/// gap shows up in `manifest.vanished` rather than aborting like a real read error would.
+#[test]
+fn vanished_benign_file_is_skipped_and_recorded_without_aborting() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home.clone(), output.clone());
+    let selection = shell_selection(&ctx);
+    let vanishing_entry = selection
+        .entries()
+        .iter()
+        .find(|e| e.relative_path.ends_with("aliases.zsh"))
+        .expect("aliases.zsh should be in the Shell selection")
+        .clone();
+    let expected_archive_path = vanishing_entry
+        .archive_path()
+        .to_string_lossy()
+        .into_owned();
+
+    // Simulate the scan-to-read race: the file existed when `shell_selection` scanned above,
+    // but is gone by the time `backup` gets around to reading it.
+    fs::remove_file(&vanishing_entry.absolute_path).expect("delete file to simulate vanished");
+
+    let outcome = run_backup(&selection, &ctx, &Encryption::None)
+        .expect("a Vanished entry must not abort the run");
+
+    // Both Shell files remain listed as selected roots (Selection metadata doesn't change),
+    // but only the still-present plugin file has an actual checksum.
+    assert_eq!(outcome.manifest.entries.len(), 2);
+    assert_eq!(outcome.manifest.checksums.len(), 1);
+    assert_eq!(outcome.manifest.vanished.len(), 1);
+    assert_eq!(outcome.manifest.vanished[0].path, expected_archive_path);
+    assert!(
+        !outcome.manifest.vanished[0].sensitive,
+        "Shell is not a Sensitive Category"
+    );
+    assert!(
+        outcome.manifest.vanished_sensitive_names().is_empty(),
+        "a non-sensitive Vanished entry must not be called out as sensitive"
+    );
+}
+
+/// Issue #24 / story 40: a Vanished entry that was also Sensitive must be nameable by
+/// `vanished_sensitive_names()` for a later run-summary caller (TUI) to call out — distinct
+/// from a non-sensitive Vanished entry, which is recorded but not specially flagged.
+#[test]
+fn vanished_sensitive_entry_is_named_by_vanished_sensitive_names() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_multi_category_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home.clone(), output.clone());
+    let scanned = scan::scan_taxonomy(&ctx);
+    let selection = SelectionModel::from_smart_defaults(&scanned);
+
+    let ssh_key_entry = selection
+        .entries()
+        .iter()
+        .find(|e| e.category == catalog::SSH.name)
+        .expect("SSH key should be in the Smart-defaults Selection")
+        .clone();
+    assert!(ssh_key_entry.sensitive, "SSH is a Sensitive Category");
+    let expected_archive_path = ssh_key_entry.archive_path().to_string_lossy().into_owned();
+
+    // Simulate the scan-to-read race for a Sensitive entry specifically.
+    fs::remove_file(&ssh_key_entry.absolute_path).expect("delete ssh key to simulate vanished");
+
+    let outcome = run_backup(&selection, &ctx, &Encryption::None)
+        .expect("a Vanished entry, even a Sensitive one, must not abort the run");
+
+    assert_eq!(
+        outcome.manifest.vanished_sensitive_names(),
+        vec![expected_archive_path.as_str()]
     );
 }

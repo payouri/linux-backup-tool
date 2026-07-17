@@ -58,6 +58,7 @@ pub struct VanishedDuringArchive {
 }
 
 /// The in-memory result of building an Archive.
+#[derive(Debug)]
 pub struct BuiltArchive {
     /// The plaintext (pre-encryption) `.tar.zst` bytes.
     pub plaintext_bytes: Vec<u8>,
@@ -101,11 +102,26 @@ pub fn build(entries: &[Entry]) -> Result<BuiltArchive, CoreError> {
             }
         };
 
-        let metadata =
-            fs::metadata(&entry.absolute_path).map_err(|source| CoreError::ReadFailed {
-                path: entry.absolute_path.clone(),
-                source,
-            })?;
+        // Same NotFound-vs-fatal split as the `fs::read` above: the file can vanish in the
+        // narrow window between the two calls just as easily as before the first one, and
+        // ADR-0002 draws the Vanished/fatal line on ENOENT itself, not on which particular
+        // syscall observed it.
+        let metadata = match fs::metadata(&entry.absolute_path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                vanished.push(VanishedDuringArchive {
+                    archive_path: archive_path_str,
+                    sensitive: entry.sensitive,
+                });
+                continue;
+            }
+            Err(source) => {
+                return Err(CoreError::ReadFailed {
+                    path: entry.absolute_path.clone(),
+                    source,
+                });
+            }
+        };
 
         checksums.insert(archive_path_str, sha256_hex(&bytes));
 
@@ -185,4 +201,57 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::EntryRoot;
+
+    fn entry(absolute_path: std::path::PathBuf, sensitive: bool) -> Entry {
+        Entry {
+            absolute_path,
+            relative_path: std::path::PathBuf::from("thing"),
+            root: EntryRoot::Home,
+            category: "Test",
+            sensitive,
+        }
+    }
+
+    #[test]
+    fn vanished_entry_is_skipped_not_fatal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist");
+
+        let built = build(&[entry(missing, false)]).expect("a Vanished entry must not abort");
+
+        assert_eq!(built.vanished.len(), 1);
+        assert!(built.checksums.is_empty());
+    }
+
+    #[test]
+    fn vanished_sensitive_entry_is_recorded_as_sensitive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("gone-key");
+
+        let built = build(&[entry(missing, true)]).expect("build should succeed");
+
+        assert_eq!(built.vanished.len(), 1);
+        assert!(built.vanished[0].sensitive);
+    }
+
+    #[test]
+    fn real_read_error_aborts_the_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A directory can't be read as file bytes: `fs::read` fails with something other
+        // than `NotFound` (e.g. `IsADirectory`) — exactly the "real read error" ADR-0002
+        // says is fatal. Deterministic and portable, unlike a permission-denied probe that
+        // a root-run test suite would sail straight through.
+        let result = build(&[entry(tmp.path().to_path_buf(), false)]);
+
+        match result {
+            Err(CoreError::ReadFailed { .. }) => {}
+            other => panic!("expected CoreError::ReadFailed, got {other:?}"),
+        }
+    }
 }

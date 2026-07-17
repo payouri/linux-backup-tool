@@ -127,6 +127,19 @@ pub struct ManifestInputs<'a> {
     pub packages: BTreeMap<String, Vec<PackageInfo>>,
 }
 
+impl Manifest {
+    /// Paths of Vanished Entries that were also Sensitive (story 40: called out by name in
+    /// the run summary). Pure data derivation over `vanished` — the actual printing/UI is a
+    /// later caller's (TUI) job, not `core`'s.
+    pub fn vanished_sensitive_names(&self) -> Vec<&str> {
+        self.vanished
+            .iter()
+            .filter(|v| v.sensitive)
+            .map(|v| v.path.as_str())
+            .collect()
+    }
+}
+
 /// Assembles a [`Manifest`] from a completed backup run's pieces.
 pub fn build(inputs: ManifestInputs<'_>) -> Manifest {
     Manifest {
@@ -198,5 +211,52 @@ mod tests {
         // 2024-01-02T03:04:05Z, per date -u -d @1704164645
         let t = UNIX_EPOCH + std::time::Duration::from_secs(1_704_164_645);
         assert_eq!(format_rfc3339(t), "2024-01-02T03:04:05Z");
+    }
+
+    fn manifest_with_vanished(vanished: Vec<VanishedEntry>) -> Manifest {
+        Manifest {
+            schema_version: SCHEMA_VERSION,
+            tool_version: "test".to_string(),
+            created_at: "1970-01-01T00:00:00Z".to_string(),
+            host: "test-host".to_string(),
+            user: "test-user".to_string(),
+            uid: 1000,
+            home: PathBuf::from("/home/test-user"),
+            os: "linux-test".to_string(),
+            entries: Vec::new(),
+            checksums: BTreeMap::new(),
+            archive_sha256: "deadbeef".to_string(),
+            vanished,
+            packages: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn vanished_sensitive_names_excludes_non_sensitive_vanished_entries() {
+        let manifest = manifest_with_vanished(vec![
+            VanishedEntry {
+                path: "home/.ssh/id_ed25519".to_string(),
+                sensitive: true,
+            },
+            VanishedEntry {
+                path: "home/.cache/some-temp-file".to_string(),
+                sensitive: false,
+            },
+        ]);
+
+        assert_eq!(
+            manifest.vanished_sensitive_names(),
+            vec!["home/.ssh/id_ed25519"]
+        );
+    }
+
+    #[test]
+    fn vanished_sensitive_names_is_empty_when_nothing_sensitive_vanished() {
+        let manifest = manifest_with_vanished(vec![VanishedEntry {
+            path: "home/.cache/some-temp-file".to_string(),
+            sensitive: false,
+        }]);
+
+        assert!(manifest.vanished_sensitive_names().is_empty());
     }
 }

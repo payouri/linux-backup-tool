@@ -66,6 +66,13 @@ pub fn backup(
     encryption: &Encryption,
     package_runner: &dyn CommandRunner,
 ) -> Result<BackupOutcome, CoreError> {
+    // Story 42: refuse before any filesystem work — an empty Selection must not create a
+    // Backup dir at all, so there is nothing to clean up on this path (unlike every other
+    // error variant below, which only fires after the dir already exists).
+    if selection.is_empty() {
+        return Err(CoreError::EmptySelection);
+    }
+
     // Delegate the collision check to `location::ensure_backup_dir_available` (#27) rather
     // than re-testing `.exists()` here, so there's one implementation of story 33's
     // refusal instead of two that could drift apart.

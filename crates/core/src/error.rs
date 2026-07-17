@@ -19,6 +19,13 @@ pub enum CoreError {
     #[error("backup dir already exists: {0}")]
     BackupDirExists(PathBuf),
 
+    /// The Selection has no Entries. Per story 42, this is refused before any filesystem
+    /// work happens (no Backup dir is created), so there is nothing for the caller to clean
+    /// up — distinct from the other error variants here, which all fail after some work has
+    /// already started.
+    #[error("selection is empty: nothing to back up")]
+    EmptySelection,
+
     /// An Output location that isn't a writable directory (story 31: hard-refuse).
     #[error("output location {0} is not writable")]
     LocationNotWritable(PathBuf),
