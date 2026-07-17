@@ -21,9 +21,9 @@ pub struct Category {
     /// The Category's name, used verbatim in the Manifest's `entries[].category` field.
     pub name: &'static str,
     /// Whether every Entry in this Category is Sensitive (a "sensitive Category" origin,
-    /// per CONTEXT.md's "Sensitive" entry). This is the Category-level tag slot #22's
-    /// per-entry tagging and Safety-net scan build on top of — it is not itself that
-    /// finer-grained tagging.
+    /// per CONTEXT.md's "Sensitive" entry). `scan::scan_category`/`scan_taxonomy` OR this
+    /// with the per-Entry Safety-net scan result (#22) — this field alone is never the
+    /// whole story for a given Entry's final `sensitive` bool.
     pub sensitive: bool,
     /// Whether this Category starts checked (Smart default, story 2). Sensitive Categories
     /// (SSH/GPG/Cloud-creds) and the everyday non-bulk Categories default ON; User data
@@ -92,9 +92,11 @@ pub const KDE_PLASMA: Category = Category {
     always_shown: false,
 };
 
-/// Agents: AI-agent tool state (`.claude`/`.agents`/`.mcp-auth`). Some Entries are
-/// individually sensitivity-tagged (e.g. auth files under `.mcp-auth`) — that finer-grained
-/// tagging is #22's job; the Category itself is not blanket-Sensitive.
+/// Agents: AI-agent tool state (`.claude`/`.agents`/`.mcp-auth`). The Category itself is
+/// not blanket-Sensitive, but individual auth files under `.mcp-auth` are typically
+/// credential-like enough to be caught by the Safety-net scan (`scan::is_safety_net_match`,
+/// #22) on their filename alone — a separate declarative per-entry tag would need the
+/// allowlist restructured from bare paths into structured entries, which #22 did not do.
 pub const AGENTS: Category = Category {
     name: "Agents",
     sensitive: false,

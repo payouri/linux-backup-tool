@@ -24,7 +24,7 @@ use linux_backup_core::context::{Privilege, RunContext};
 use linux_backup_core::model::{Entry, EntryRoot, SelectionModel};
 use linux_backup_core::packages::NoCommandRunner;
 use linux_backup_core::restore::RestoreOutcome;
-use linux_backup_core::{catalog, manifest, scan, BackupOutcome, CoreError};
+use linux_backup_core::{catalog, crypto, manifest, scan, BackupOutcome, CoreError};
 
 /// Builds a synthetic `$HOME` under `root` containing:
 /// - two files *on* the Shell Category's Curated allowlist (`.oh-my-zsh/custom/...`),
@@ -562,4 +562,115 @@ fn vanished_sensitive_entry_is_named_by_vanished_sensitive_names() {
         outcome.manifest.vanished_sensitive_names(),
         vec![expected_archive_path.as_str()]
     );
+}
+
+/// Builds a synthetic `$HOME` under `root` exercising #22's Safety-net scan on top of
+/// #19's single-Category Shell fixture: a `.config/git/credentials` file. `.config/git` is
+/// on the **Program configs** allowlist (`catalog::PROGRAM_CONFIGS`, `sensitive: false`),
+/// so this file's Sensitivity can only come from the Safety-net scan matching "credentials"
+/// against the "credential" keyword (`scan::is_safety_net_match`) — never from its Category.
+///
+/// Returns the Fixture environment's home path.
+fn build_safety_net_fixture_home(root: &Path) -> PathBuf {
+    let home = build_fixture_home(root);
+
+    let git_dir = home.join(".config/git");
+    fs::create_dir_all(&git_dir).expect("create .config/git dir");
+    fs::write(git_dir.join("credentials"), b"fake-git-credential-bytes\n")
+        .expect("write credentials file");
+
+    home
+}
+
+/// Proves #22's Safety-net scan composes through the full backup/restore seam: an Entry
+/// whose Category is not itself Sensitive (Program configs) still ends up `sensitive: true`
+/// end-to-end — in the Selection, in the written Manifest, and in `crypto::evaluate`'s
+/// Auto-insist policy, which must in turn report `encryption_required: true` and name
+/// "Program configs" as a triggering Category even though it isn't a sensitive Category by
+/// declaration.
+#[test]
+fn safety_net_only_entry_flows_sensitive_through_the_round_trip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_safety_net_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home.clone(), output.clone());
+    let scanned = scan::scan_taxonomy(&ctx);
+    let selection = SelectionModel::from_smart_defaults(&scanned);
+
+    let credentials_entry = selection
+        .entries()
+        .iter()
+        .find(|e| e.relative_path == Path::new(".config/git/credentials"))
+        .expect("credentials file should be selected via Program configs' Smart default");
+    assert_eq!(credentials_entry.category, "Program configs");
+    assert!(
+        credentials_entry.sensitive,
+        "Safety-net match must flag this Entry Sensitive even though Program configs isn't \
+         a sensitive Category"
+    );
+
+    let policy = crypto::evaluate(&selection);
+    assert!(
+        policy.encryption_required,
+        "a Safety-net-only match must still Auto-insist on encryption"
+    );
+    assert!(
+        policy.sensitive_categories.contains(&"Program configs"),
+        "Auto-insist must name the triggering Category by name, even though it isn't a \
+         declared-sensitive one: {:?}",
+        policy.sensitive_categories
+    );
+    assert!(policy
+        .sensitive_entries
+        .contains(&PathBuf::from(".config/git/credentials")));
+
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+    let manifest_entry = outcome
+        .manifest
+        .entries
+        .iter()
+        .find(|e| e.path == ".config/git/credentials")
+        .expect("credentials file should be recorded in the Manifest");
+    assert!(
+        manifest_entry.sensitive,
+        "the written Manifest must also carry the Safety-net-derived sensitivity"
+    );
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+    assert!(
+        restore_outcome.failures.is_empty(),
+        "unexpected restore failures: {:?}",
+        restore_outcome.failures
+    );
+    assert_eq!(
+        fs::read(restore_home.join(".config/git/credentials"))
+            .expect("restored credentials file should exist"),
+        fs::read(home.join(".config/git/credentials"))
+            .expect("original credentials file should exist"),
+    );
+}
+
+/// The negative case for #22: a Selection with no sensitive Category Entries and no
+/// Safety-net matches must leave `encryption_required` false (the last of #22's four
+/// acceptance criteria).
+#[test]
+fn selection_with_no_sensitive_or_safety_net_matches_does_not_require_encryption() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output);
+    let selection = shell_selection(&ctx);
+
+    let policy = crypto::evaluate(&selection);
+    assert!(!policy.encryption_required);
+    assert!(policy.sensitive_categories.is_empty());
+    assert!(policy.sensitive_entries.is_empty());
+    assert!(!selection.encryption_required());
 }

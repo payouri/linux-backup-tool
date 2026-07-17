@@ -7,12 +7,15 @@
 //! #20 scope: `SelectionModel::from_smart_defaults` composes a Smart-default Selection
 //! across the full ten-Category taxonomy (`scan::scan_taxonomy`'s precedence + Hide-empty
 //! result), and `warnings()` derives the User-data size warning (story 4) over whatever
-//! Categories ended up in the Selection. Drill-down toggling and `encryption_required` are
-//! #21/#22's jobs — this only needs to represent the *result* of Smart-default composition.
+//! Categories ended up in the Selection. Drill-down toggling is #21's job.
+//!
+//! #22 scope: `encryption_required` delegates to `crypto::evaluate`'s Auto-insist policy —
+//! see that module for which specific Categories/Entries triggered it.
 
 use std::path::{Path, PathBuf};
 
 use crate::catalog;
+use crate::crypto;
 use crate::scan::CategoryScan;
 
 /// The size threshold (story 4: ">1GB") above which a User-data Selection earns a warning.
@@ -42,8 +45,10 @@ pub struct Entry {
     pub root: EntryRoot,
     /// The Category name this Entry belongs to.
     pub category: &'static str,
-    /// Whether this Entry is Sensitive (inherited from its Category for #19; per-entry
-    /// tagging and the Safety-net scan are #22's job).
+    /// Whether this Entry is Sensitive: true if its Category is Sensitive, OR the
+    /// Safety-net scan flagged its filename (`scan::is_safety_net_match`) — a strict
+    /// superset, per CONTEXT.md's "Sensitive" entry. Set once at scan time; never
+    /// re-derived here.
     pub sensitive: bool,
 }
 
@@ -123,6 +128,14 @@ impl SelectionModel {
     /// than proceed — the bounce itself is `tui` UX, this is the predicate it checks).
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whether Auto-insist requires whole-archive encryption for this Selection (stories
+    /// 15/17: any Sensitive Entry — Category-level or Safety-net — forces it on). A thin
+    /// delegate to `crypto::evaluate`, which also exposes exactly which Categories/Entries
+    /// triggered it (story 18) for a TUI to show before prompting for a passphrase.
+    pub fn encryption_required(&self) -> bool {
+        crypto::evaluate(self).encryption_required
     }
 
     /// Human-readable warnings derived from the current Selection. Today this is only the
@@ -221,5 +234,17 @@ mod tests {
         let warnings = selection.warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("User data"));
+    }
+
+    #[test]
+    fn encryption_required_is_false_with_no_sensitive_entries() {
+        let selection = SelectionModel::new(vec![entry(catalog::SHELL.name, false, "aliases.zsh")]);
+        assert!(!selection.encryption_required());
+    }
+
+    #[test]
+    fn encryption_required_is_true_with_a_sensitive_entry() {
+        let selection = SelectionModel::new(vec![entry(catalog::SSH.name, true, "id_ed25519")]);
+        assert!(selection.encryption_required());
     }
 }

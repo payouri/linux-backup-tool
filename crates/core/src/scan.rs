@@ -1,7 +1,8 @@
 //! `walkdir`-based discovery of Categories' Entries on the current machine: precedence
 //! resolution across overlapping allowlists, Hide-empty computation (a Category with no
-//! matching paths is hidden from Selection), and sizing. The Safety-net scan for
-//! credential-like filenames/extensions outside declared-sensitive Categories is #22's job.
+//! matching paths is hidden from Selection), sizing, and the Safety-net scan for
+//! credential-like filenames/extensions outside declared-sensitive Categories (CONTEXT.md's
+//! "Safety-net scan", story 16).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -25,12 +26,15 @@ pub fn scan_category(category: &Category, ctx: &RunContext) -> Vec<Entry> {
 
     for allowlist_root in category.allowlist {
         for (absolute_path, relative_path) in walk_allowlist_root(&ctx.home, allowlist_root) {
+            // Strict superset (CONTEXT.md's "Safety-net scan"): the scan can only *add*
+            // sensitivity on top of the Category's own tag, never remove it.
+            let sensitive = category.sensitive || is_safety_net_match(&relative_path);
             entries.push(Entry {
                 absolute_path,
                 relative_path,
                 root: EntryRoot::Home,
                 category: category.name,
-                sensitive: category.sensitive,
+                sensitive,
             });
         }
     }
@@ -97,12 +101,15 @@ pub fn scan_taxonomy(ctx: &RunContext) -> Vec<CategoryScan> {
             .iter()
             .position(|c| c.name == owner.name)
             .expect("owner came from categories");
+        // Strict superset, same as `scan_category`: Safety-net can only add sensitivity on
+        // top of the owning Category's own tag, never remove it.
+        let sensitive = owner.sensitive || is_safety_net_match(&relative_path);
         entries_by_category[owner_index].push(Entry {
             absolute_path,
             relative_path,
             root: EntryRoot::Home,
             category: owner.name,
-            sensitive: owner.sensitive,
+            sensitive,
         });
     }
 
@@ -112,6 +119,50 @@ pub fn scan_taxonomy(ctx: &RunContext) -> Vec<CategoryScan> {
         .filter(|(category, entries)| !entries.is_empty() || category.always_shown)
         .map(|(category, entries)| CategoryScan { category, entries })
         .collect()
+}
+
+/// Credential-like keyword substrings the Safety-net scan looks for in a filename,
+/// case-insensitively. Verbatim list from CONTEXT.md's "Safety-net scan" entry / issue #22.
+const SAFETY_NET_KEYWORDS: &[&str] = &["credential", "secret", "token", "password"];
+
+/// Credential-like file extensions the Safety-net scan flags outright, regardless of the
+/// rest of the filename.
+const SAFETY_NET_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx"];
+
+/// Exact-prefix credential filenames the Safety-net scan flags. An SSH private key carries
+/// no extension, so this checks the name itself rather than a suffix; `id_rsa.pub` also
+/// starts with `id_rsa` and is deliberately swept in too rather than special-cased out of
+/// the match, since the scan is a strict superset by design (never a precise ID of exactly
+/// which sibling file is the private half).
+const SAFETY_NET_NAME_PREFIXES: &[&str] = &["id_rsa", "id_ed25519"];
+
+/// Whether `path`'s filename looks credential-like enough to flag Sensitive on its own,
+/// independent of which Category (if any) it resolved to (CONTEXT.md's "Safety-net scan",
+/// story 16). Pure function over a path — no filesystem access, no Category awareness — so
+/// it composes the same way whether called from `scan_category` or `scan_taxonomy`.
+pub fn is_safety_net_match(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = file_name.to_lowercase();
+
+    // `.netrc` has no distinguishing extension or keyword substring of its own, so it's
+    // checked as an exact name rather than folded into the prefix/extension lists above.
+    if lower == ".netrc" {
+        return true;
+    }
+    if SAFETY_NET_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+    if SAFETY_NET_NAME_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        return true;
+    }
+    SAFETY_NET_EXTENSIONS
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{ext}")))
 }
 
 /// Walks one allowlist root (relative to `home`) into `(absolute_path, relative_path)`
@@ -239,6 +290,93 @@ mod tests {
         assert!(
             !shell_scan.entries[0].sensitive,
             "Shell is not a sensitive Category"
+        );
+    }
+
+    #[test]
+    fn safety_net_matches_documented_keyword_substrings_case_insensitively() {
+        for name in [
+            "my-secret.txt",
+            "SECRET.txt",
+            "credentials.json",
+            "TOKEN",
+            "password.env",
+        ] {
+            assert!(
+                is_safety_net_match(Path::new(name)),
+                "{name} should match a Safety-net keyword"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_net_matches_documented_extensions() {
+        for name in ["site.pem", "server.KEY", "bundle.p12", "bundle.pfx"] {
+            assert!(
+                is_safety_net_match(Path::new(name)),
+                "{name} should match a Safety-net extension"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_net_matches_ssh_key_name_prefixes_and_netrc() {
+        for name in ["id_rsa", "id_rsa.pub", "id_ed25519", ".netrc"] {
+            assert!(
+                is_safety_net_match(Path::new(name)),
+                "{name} should match a Safety-net name pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_net_does_not_flag_unrelated_filenames() {
+        for name in ["aliases.zsh", "report.pdf", "kwinrc", "not-included.txt"] {
+            assert!(
+                !is_safety_net_match(Path::new(name)),
+                "{name} should not match any Safety-net pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_category_flags_safety_net_match_even_in_a_non_sensitive_category() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let git_dir = home.join(".config/git");
+        fs::create_dir_all(&git_dir).expect("create .config/git dir");
+        // "credentials" contains the "credential" keyword; Program configs (the owning
+        // Category here) is not itself Sensitive, so this only flags via Safety-net.
+        fs::write(git_dir.join("credentials"), b"fake-token\n").expect("write credentials file");
+
+        let ctx = test_ctx(home);
+        let entries = scan_category(&catalog::PROGRAM_CONFIGS, &ctx);
+
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].sensitive,
+            "Safety-net match must flag the Entry Sensitive even though its Category isn't"
+        );
+    }
+
+    #[test]
+    fn scan_category_never_un_flags_a_sensitive_category_entry() {
+        // Superset property: a Category-sensitive Entry stays sensitive whether or not its
+        // filename also happens to match a Safety-net pattern.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let ssh_dir = home.join(".ssh");
+        fs::create_dir_all(&ssh_dir).expect("create .ssh dir");
+        fs::write(ssh_dir.join("config"), b"Host example.com\n").expect("write ssh config");
+
+        let ctx = test_ctx(home);
+        let entries = scan_category(&catalog::SSH, &ctx);
+
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].sensitive,
+            "SSH is a sensitive Category regardless of the filename ('config' matches no \
+             Safety-net pattern)"
         );
     }
 }
