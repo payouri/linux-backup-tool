@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 /// `core`'s single error type. Variants will keep growing as each module (scan, crypto,
-/// archive, restore, profile, ...) grows real fallible behavior.
+/// archive, restore, profile, location, ...) grows real fallible behavior.
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("not yet implemented: {0}")]
@@ -18,6 +18,15 @@ pub enum CoreError {
     /// backup run must refuse rather than silently overwrite a previous one.
     #[error("backup dir already exists: {0}")]
     BackupDirExists(PathBuf),
+
+    /// An Output location that isn't a writable directory (story 31: hard-refuse).
+    #[error("output location {0} is not writable")]
+    LocationNotWritable(PathBuf),
+
+    /// An Output location path that doesn't exist and isn't a directory (e.g. a file at
+    /// that path, or nothing at all).
+    #[error("output location {0} does not exist or is not a directory")]
+    LocationNotFound(PathBuf),
 
     /// A real read error while scanning or reading an Entry's bytes during backup
     /// (permission-denied, I/O error, device-gone). Per ADR-0002 this is fatal: the run
