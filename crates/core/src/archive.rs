@@ -139,16 +139,22 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// STUB for #19: identity pass-through — see the module doc. #23 replaces this with real
-/// `age` encryption without changing the signature or its callers.
-pub fn encrypt(plaintext: &[u8], _encryption: &Encryption) -> Vec<u8> {
-    plaintext.to_vec()
+/// STUB for #19: identity pass-through — see the module doc. #23 replaces the *body* with
+/// real `age::Encryptor::with_user_passphrase` encryption without changing the signature or
+/// its callers. The `Result` is load-bearing even though this stub never fails: real `age`
+/// encryption is fallible (e.g. an I/O error while wrapping the writer), so the signature
+/// carries `Result` from the start rather than forcing every call site to change shape
+/// (`= encrypt(..)` to `= encrypt(..)?`) the day the stub is replaced.
+pub fn encrypt(plaintext: &[u8], _encryption: &Encryption) -> Result<Vec<u8>, CoreError> {
+    Ok(plaintext.to_vec())
 }
 
 /// STUB for #19: identity pass-through, the inverse of [`encrypt`]. `encrypted` mirrors
-/// whether the source file carried the `.age` suffix.
-pub fn decrypt(ciphertext: &[u8], _encrypted: bool) -> Vec<u8> {
-    ciphertext.to_vec()
+/// whether the source file carried the `.age` suffix. See [`encrypt`]'s doc for why this
+/// returns `Result` despite never failing today — real `age` decryption fails on a wrong
+/// passphrase or corrupted ciphertext.
+pub fn decrypt(ciphertext: &[u8], _encrypted: bool) -> Result<Vec<u8>, CoreError> {
+    Ok(ciphertext.to_vec())
 }
 
 /// The Archive's filename within a Backup dir, given the run's encryption choice.

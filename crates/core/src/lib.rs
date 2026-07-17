@@ -85,7 +85,7 @@ fn run_backup(
     let built = archive::build(selection.entries())?;
 
     let archive_sha256 = archive::sha256_hex(&built.plaintext_bytes);
-    let archive_bytes_on_disk = archive::encrypt(&built.plaintext_bytes, encryption);
+    let archive_bytes_on_disk = archive::encrypt(&built.plaintext_bytes, encryption)?;
     let archive_path = backup_dir.join(archive::archive_filename(encryption));
     archive::write_bytes(&archive_path, &archive_bytes_on_disk)?;
 
@@ -108,7 +108,7 @@ fn run_backup(
     });
 
     let manifest_json = serde_json::to_vec_pretty(&manifest)?;
-    let manifest_bytes_on_disk = archive::encrypt(&manifest_json, encryption);
+    let manifest_bytes_on_disk = archive::encrypt(&manifest_json, encryption)?;
     let manifest_path = backup_dir.join(archive::manifest_filename(encryption));
     archive::write_bytes(&manifest_path, &manifest_bytes_on_disk)?;
 

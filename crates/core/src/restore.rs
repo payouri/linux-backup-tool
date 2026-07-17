@@ -47,7 +47,7 @@ pub fn restore(backup_dir: &Path, ctx: &RunContext) -> Result<RestoreOutcome, Co
         path: manifest_path.clone(),
         source,
     })?;
-    let manifest_bytes = archive::decrypt(&manifest_bytes, encrypted);
+    let manifest_bytes = archive::decrypt(&manifest_bytes, encrypted)?;
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
 
     let archive_path = backup_dir.join(archive::filename_for(archive::ARCHIVE_FILENAME, encrypted));
@@ -55,7 +55,7 @@ pub fn restore(backup_dir: &Path, ctx: &RunContext) -> Result<RestoreOutcome, Co
         path: archive_path.clone(),
         source,
     })?;
-    let archive_bytes = archive::decrypt(&archive_bytes, encrypted);
+    let archive_bytes = archive::decrypt(&archive_bytes, encrypted)?;
 
     let actual_sha256 = archive::sha256_hex(&archive_bytes);
     if actual_sha256 != manifest.archive_sha256 {

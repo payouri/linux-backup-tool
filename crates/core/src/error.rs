@@ -55,4 +55,17 @@ pub enum CoreError {
     /// The Archive could not be built (tar/zstd pipeline failure) during backup.
     #[error("failed to build archive: {0}")]
     ArchiveBuildFailed(String),
+
+    /// Encryption of the Archive or Manifest bytes failed. A no-op today (see
+    /// `archive::encrypt`'s #19 stub), but real `age` encryption (#23) is fallible, so the
+    /// signature carries `Result` from the start rather than forcing every call site to
+    /// change shape when the stub is replaced.
+    #[error("failed to encrypt: {0}")]
+    EncryptionFailed(String),
+
+    /// Decryption of the Archive or Manifest bytes failed (e.g. a wrong passphrase once
+    /// #23 lands real `age` decryption). A no-op today (see `archive::decrypt`'s #19
+    /// stub), carried as `Result` for the same reason as `EncryptionFailed`.
+    #[error("failed to decrypt: {0}")]
+    DecryptionFailed(String),
 }
