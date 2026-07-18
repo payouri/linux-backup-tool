@@ -179,7 +179,7 @@ impl SelectionModel {
     /// default was OFF and so has never been part of this model at all. Only a brand-new
     /// Entry (never seen by this model) is pushed straight into the active Selection.
     ///
-    /// Membership is checked via a `HashSet` snapshot taken once up front, not a
+    /// Membership is checked via a `BTreeSet` snapshot taken once up front, not a
     /// `Vec::iter().any(...)` per Entry: the naive per-Entry linear scan is O(current
     /// Selection size) each time, which turns loading a large Category into this model into
     /// an O(n²) scan — measured at ~88s for KDE Plasma's ~40,000-file icon theme (a real

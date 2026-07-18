@@ -208,7 +208,11 @@ fn category_row_label(scan: &CategoryScan, model: &SelectionModel) -> String {
     let size = format_size(scan.total_size());
 
     let mut label = format!("{glyph} {}{lock} — {size}", scan.category.name);
-    if total > 0 && active != total {
+    // Only the partial ([~]) case gets the "(m/n entries)" suffix — a fully off Category
+    // (active == 0) is already unambiguous from its "[ ]" glyph alone, so pairing it with
+    // "(0/n entries)" would read like a partial-selection hint for a Category that was
+    // never checked in the first place.
+    if total > 0 && active != total && active != 0 {
         label.push_str(&format!(" ({active}/{total} entries)"));
     }
     label
@@ -376,6 +380,37 @@ mod tests {
         assert!(label.starts_with("[ ] User data"));
         assert!(!label.contains('🔒'));
         assert!(label.contains("1.00 KB"));
+        // A fully off Category is already unambiguous from its "[ ]" glyph — it must not
+        // also carry a "(0/n entries)" suffix, which would misread as a partial-selection
+        // hint (reserved for the "[~]" case) on a Category that was never checked at all.
+        assert!(!label.contains("entries)"));
+    }
+
+    #[test]
+    fn category_row_label_omits_the_entry_count_for_a_category_toggled_fully_off() {
+        // Reproduces manual verification during #30's review: toggling an on-by-default,
+        // multi-Entry Category off (`deselect_category`) must not leave a stale
+        // "(0/n entries)" suffix behind — that reads as a partial-selection hint even though
+        // the Category's "[ ]" glyph already says nothing is selected.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kwinrc = entry_with_size(tmp.path(), catalog::KDE_PLASMA.name, ".config/kwinrc", 10);
+        let icon = entry_with_size(
+            tmp.path(),
+            catalog::KDE_PLASMA.name,
+            ".local/share/icons/heavy.svg",
+            200,
+        );
+        let scan = CategoryScan {
+            category: catalog::KDE_PLASMA,
+            entries: vec![kwinrc, icon],
+        };
+        let mut model = SelectionModel::from_smart_defaults(std::slice::from_ref(&scan));
+        model.deselect_category(catalog::KDE_PLASMA.name);
+
+        let label = category_row_label(&scan, &model);
+
+        assert!(label.starts_with("[ ] KDE Plasma"));
+        assert!(!label.contains("entries)"));
     }
 
     #[test]
