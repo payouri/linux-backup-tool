@@ -342,6 +342,37 @@ mod tests {
     }
 
     #[test]
+    fn encrypting_the_same_plaintext_twice_with_the_same_passphrase_yields_distinct_ciphertext() {
+        // age's scrypt recipient draws a fresh random salt (and the STREAM layer a fresh
+        // nonce) per call to `wrap_output` — encrypting identical input under an identical
+        // passphrase twice must never produce identical bytes. Equal output here would mean
+        // a fixed/reused salt or nonce, which would make the ciphertext leak equality
+        // information and weaken the scheme against precomputation.
+        let plaintext = b"the entire point of this exercise".to_vec();
+        let encryption = Encryption::Passphrase(SecretString::from("correct-horse-battery-staple"));
+
+        let first = encrypt(&plaintext, &encryption).expect("first encrypt should succeed");
+        let second = encrypt(&plaintext, &encryption).expect("second encrypt should succeed");
+
+        assert_ne!(
+            first, second,
+            "encrypting identical plaintext under an identical passphrase twice must not \
+             produce identical ciphertext bytes (would indicate a fixed salt/nonce)"
+        );
+
+        // Both must still independently decrypt back to the same plaintext.
+        let passphrase = SecretString::from("correct-horse-battery-staple");
+        assert_eq!(
+            decrypt(&first, true, Some(&passphrase)).expect("decrypt first should succeed"),
+            plaintext
+        );
+        assert_eq!(
+            decrypt(&second, true, Some(&passphrase)).expect("decrypt second should succeed"),
+            plaintext
+        );
+    }
+
+    #[test]
     fn decrypt_with_the_wrong_passphrase_fails_typed_not_panicking() {
         let plaintext = b"sensitive bytes".to_vec();
         let encryption = Encryption::Passphrase(SecretString::from("correct-horse-battery-staple"));
