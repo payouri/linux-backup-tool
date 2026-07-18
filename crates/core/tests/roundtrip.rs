@@ -29,6 +29,7 @@ use linux_backup_core::archive::Encryption;
 use linux_backup_core::context::{Privilege, RunContext};
 use linux_backup_core::model::{Entry, EntryRoot, SelectionModel};
 use linux_backup_core::packages::{CommandRunner, NoCommandRunner};
+use linux_backup_core::progress::{NoopProgress, Phase, Progress};
 use linux_backup_core::restore::RestoreOutcome;
 use linux_backup_core::{catalog, crypto, manifest, scan, BackupOutcome, CoreError};
 
@@ -99,7 +100,13 @@ fn run_backup(
     ctx: &RunContext,
     encryption: &Encryption,
 ) -> Result<BackupOutcome, CoreError> {
-    linux_backup_core::backup(selection, ctx, encryption, &NoCommandRunner)
+    linux_backup_core::backup(
+        selection,
+        ctx,
+        encryption,
+        &NoCommandRunner,
+        &mut NoopProgress,
+    )
 }
 
 /// Runs `core::restore`. `passphrase` is `None` for an unencrypted Backup and
@@ -1013,8 +1020,14 @@ fn reinstall_script_is_written_with_correct_per_manager_counts_from_captured_pac
         pacman: Some("acpi 1.8-2\nripgrep 13.0.0-1\n"),
         npm: Some(r#"{"dependencies": {"typescript": {"version": "4.8.3"}}}"#),
     };
-    let outcome = linux_backup_core::backup(&selection, &ctx, &Encryption::None, &runner)
-        .expect("backup should succeed");
+    let outcome = linux_backup_core::backup(
+        &selection,
+        &ctx,
+        &Encryption::None,
+        &runner,
+        &mut NoopProgress,
+    )
+    .expect("backup should succeed");
 
     assert_eq!(
         outcome.manifest.packages[linux_backup_core::packages::PACMAN].len(),
@@ -1092,4 +1105,66 @@ fn verify_pass_flags_a_deliberately_corrupted_restored_file() {
     assert!(report
         .matched
         .contains(&"home/.oh-my-zsh/custom/plugins/my-plugin/my-plugin.plugin.zsh".to_string()));
+}
+
+/// A [`Progress`] recorder that captures the phase sequence and the last per-Entry count
+/// `backup` reported, so #33's progress wiring can be asserted through the same public
+/// backup seam rather than by inspecting `core`'s internals.
+#[derive(Default)]
+struct RecordingProgress {
+    phases: Vec<Phase>,
+    last_entry: Option<(usize, usize)>,
+    entry_ticks: usize,
+}
+
+impl Progress for RecordingProgress {
+    fn on_phase(&mut self, phase: Phase) {
+        self.phases.push(phase);
+    }
+
+    fn on_entry(&mut self, done: usize, total: usize) {
+        self.entry_ticks += 1;
+        self.last_entry = Some((done, total));
+    }
+}
+
+/// Issue #33 / story 37: `backup` drives its injected [`Progress`] through the real phase
+/// boundaries in order — `Scanning` (the per-Entry archive-read loop, which also ticks
+/// `on_entry` once per Entry up to the total), then `WritingArchive`, then `WritingManifest`
+/// — so `crates/tui` can render live per-phase progress from a purely observational callback.
+#[test]
+fn backup_drives_progress_through_the_phases_in_order() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output);
+    let selection = shell_selection(&ctx);
+    // The Shell fixture has exactly two on-allowlist Entries.
+    assert_eq!(selection.entries().len(), 2);
+
+    let mut progress = RecordingProgress::default();
+    let outcome = linux_backup_core::backup(
+        &selection,
+        &ctx,
+        &Encryption::None,
+        &NoCommandRunner,
+        &mut progress,
+    )
+    .expect("backup should succeed");
+    assert!(outcome.backup_dir.is_dir());
+
+    assert_eq!(
+        progress.phases,
+        vec![
+            Phase::Scanning,
+            Phase::WritingArchive,
+            Phase::WritingManifest
+        ],
+        "phases must fire once each, in backup order"
+    );
+    // on_entry ticks once per Entry and reaches (total, total) on the last one.
+    assert_eq!(progress.entry_ticks, 2);
+    assert_eq!(progress.last_entry, Some((2, 2)));
 }

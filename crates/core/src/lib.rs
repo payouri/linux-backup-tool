@@ -42,6 +42,7 @@ use std::time::UNIX_EPOCH;
 use archive::Encryption;
 use manifest::Manifest;
 use packages::CommandRunner;
+use progress::{Phase, Progress};
 
 /// The result of a completed backup run: where the Backup dir landed and the Manifest
 /// that was written into it.
@@ -68,11 +69,18 @@ pub struct BackupOutcome {
 /// captures each present package manager's Package list into the Manifest (story 47).
 /// `crates/tui`'s `main` passes `&packages::SystemCommandRunner`; tests that don't want to
 /// touch the real system (e.g. the round-trip seam) pass `&packages::NoCommandRunner`.
+///
+/// `progress` is the injected callback (ADR-0004: an injected notification, not an ambient
+/// read) `crates/tui` drives its per-phase progress bars from (stories 37) — it observes
+/// each [`Phase`] boundary and the per-Entry archive-read count. It is only ever notified,
+/// never consulted; callers that don't care (the round-trip seam, most tests) pass
+/// `&mut progress::NoopProgress`.
 pub fn backup(
     selection: &SelectionModel,
     ctx: &RunContext,
     encryption: &Encryption,
     package_runner: &dyn CommandRunner,
+    progress: &mut dyn Progress,
 ) -> Result<BackupOutcome, CoreError> {
     // Story 42: refuse before any filesystem work — an empty Selection must not create a
     // Backup dir at all, so there is nothing to clean up on this path (unlike every other
@@ -87,7 +95,15 @@ pub fn backup(
     let backup_dir =
         location::ensure_backup_dir_available(&ctx.output_location, &backup_dir_name(ctx))?;
 
-    run_backup(selection, ctx, encryption, package_runner, &backup_dir).inspect_err(|_| {
+    run_backup(
+        selection,
+        ctx,
+        encryption,
+        package_runner,
+        progress,
+        &backup_dir,
+    )
+    .inspect_err(|_| {
         // Fail-fast cleanup (ADR-0002): the Backup dir was created fresh by this call, so
         // removing it on any error is always safe.
         let _ = fs::remove_dir_all(&backup_dir);
@@ -99,6 +115,7 @@ fn run_backup(
     ctx: &RunContext,
     encryption: &Encryption,
     package_runner: &dyn CommandRunner,
+    progress: &mut dyn Progress,
     backup_dir: &Path,
 ) -> Result<BackupOutcome, CoreError> {
     fs::create_dir_all(backup_dir).map_err(|source| CoreError::Io {
@@ -106,8 +123,11 @@ fn run_backup(
         source,
     })?;
 
-    let built = archive::build(selection.entries())?;
+    // `build` reports `Phase::Scanning` (the per-Entry read loop) itself; the two disk-write
+    // phases below are reported here at their real boundaries.
+    let built = archive::build(selection.entries(), progress)?;
 
+    progress.on_phase(Phase::WritingArchive);
     let archive_sha256 = archive::sha256_hex(&built.plaintext_bytes);
     let archive_bytes_on_disk = archive::encrypt(&built.plaintext_bytes, encryption)?;
     let archive_path = backup_dir.join(archive::archive_filename(encryption));
@@ -122,6 +142,7 @@ fn run_backup(
         })
         .collect();
 
+    progress.on_phase(Phase::WritingManifest);
     let captured_packages = packages::capture_all(package_runner);
 
     let manifest = manifest::build(manifest::ManifestInputs {

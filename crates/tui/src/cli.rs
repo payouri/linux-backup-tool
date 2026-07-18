@@ -1,12 +1,12 @@
 //! Hand-rolled argv parsing for `linux-backup`'s CLI surface.
 //!
-//! Not using `clap` here: the alpha's entire CLI grammar is one subcommand
-//! (`restore <dir> [--verify] [--overwrite]`) with a single positional argument and two
-//! boolean flags — well within what a short loop over `std::env::args()` handles directly.
-//! Pulling in a derive/builder-based arg-parsing crate for a two-token grammar would trade a
-//! new dependency (and its compile-time cost) for no real ergonomics win yet. Revisit this
-//! choice if/when a `backup` subcommand (or richer flag set) lands and the grammar grows
-//! past what's comfortable to hand-parse.
+//! Not using `clap` here: the alpha's entire CLI grammar is a handful of subcommands
+//! (`backup`, `restore <dir> [--verify] [--overwrite]`, plus the standalone `select`/`where`
+//! screens), the richest of which is one positional argument and two boolean flags — well
+//! within what a short loop over `std::env::args()` handles directly. Pulling in a
+//! derive/builder-based arg-parsing crate for this would trade a new dependency (and its
+//! compile-time cost) for no real ergonomics win yet. Revisit this choice if/when the grammar
+//! grows richer flag sets past what's comfortable to hand-parse.
 
 use std::path::PathBuf;
 
@@ -33,19 +33,17 @@ pub struct RestoreArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Restore(RestoreArgs),
+    /// The full forward-only backup wizard (#33): WHAT → [encryption] → WHERE → REVIEW → RUN,
+    /// chaining the three standalone screens into the real end-to-end `backup` flow.
+    Backup,
     Select,
     /// The WHERE screen (#32) standing alone as its own subcommand, the same interim
     /// landing spot as `Select`: runnable and verifiable against a real account's drives
     /// ahead of `backup` chaining it into the full wizard (#33).
     Where,
-    /// A throwaway harness (#31) that runs the encryption screen end-to-end against a
-    /// synthetic Selection and a temp Output location — the interim standalone entry point
-    /// for the "produces a real encrypted Backup dir" acceptance criterion, to be removed
-    /// when #33 wires the encryption step into the real WHAT → encryption → WHERE → RUN chain.
-    EncryptDemo,
 }
 
-const USAGE: &str = "usage: linux-backup restore <dir> [--verify] [--overwrite]\n       linux-backup select\n       linux-backup where\n       linux-backup encrypt-demo";
+const USAGE: &str = "usage: linux-backup backup\n       linux-backup restore <dir> [--verify] [--overwrite]\n       linux-backup select\n       linux-backup where";
 
 /// Parses a full argv (excluding argv[0], the program name) into a [`Command`].
 pub fn parse_args<I, S>(args: I) -> Result<Command, String>
@@ -59,10 +57,10 @@ where
         .ok_or_else(|| format!("missing command\n{USAGE}"))?;
 
     match subcommand.as_ref() {
+        "backup" => parse_no_arg_command(iter, Command::Backup),
         "restore" => parse_restore_args(iter),
         "select" => parse_select_args(iter),
         "where" => parse_no_arg_command(iter, Command::Where),
-        "encrypt-demo" => parse_no_arg_command(iter, Command::EncryptDemo),
         other => Err(format!("unknown command '{other}'\n{USAGE}")),
     }
 }
@@ -164,8 +162,20 @@ mod tests {
 
     #[test]
     fn rejects_unknown_command() {
-        let err = parse_args(["backup"]).expect_err("should reject");
-        assert!(err.contains("unknown command 'backup'"));
+        let err = parse_args(["frobnicate"]).expect_err("should reject");
+        assert!(err.contains("unknown command 'frobnicate'"));
+    }
+
+    #[test]
+    fn parses_bare_backup_with_no_arguments() {
+        let parsed = parse_args(["backup"]).expect("should parse");
+        assert_eq!(parsed, Command::Backup);
+    }
+
+    #[test]
+    fn rejects_backup_with_an_unexpected_argument() {
+        let err = parse_args(["backup", "extra"]).expect_err("should reject");
+        assert!(err.contains("unexpected argument 'extra'"));
     }
 
     #[test]
@@ -201,18 +211,6 @@ mod tests {
     #[test]
     fn rejects_where_with_an_unexpected_argument() {
         let err = parse_args(["where", "extra"]).expect_err("should reject");
-        assert!(err.contains("unexpected argument 'extra'"));
-    }
-
-    #[test]
-    fn parses_bare_encrypt_demo_with_no_arguments() {
-        let parsed = parse_args(["encrypt-demo"]).expect("should parse");
-        assert_eq!(parsed, Command::EncryptDemo);
-    }
-
-    #[test]
-    fn rejects_encrypt_demo_with_an_unexpected_argument() {
-        let err = parse_args(["encrypt-demo", "extra"]).expect_err("should reject");
         assert!(err.contains("unexpected argument 'extra'"));
     }
 }

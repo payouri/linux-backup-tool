@@ -22,6 +22,13 @@ secrecy = "0.10"
 # dev-dependency for the same probe in a test; `tui`, unlike `core`, carries no
 # `forbid(unsafe_code)`, so it can use it directly rather than shelling out to `id -u`.
 libc = "0.2"
+# The de-facto Rust progress-bar crate (console-rs, the same org behind `dialoguer`;
+# ~350M downloads, actively maintained) — drives story 37's live per-phase RUN bars from
+# `core::progress`'s `on_phase`/`on_entry` callbacks. Chosen over hand-rolling carriage-return
+# terminal control (error-prone, no width/terminal-detection handling) for the one place the
+# alpha needs a real live bar; `inquire` already pulls in `console`'s sibling `crossterm`, so
+# this adds no genuinely new terminal-handling surface.
+indicatif = "0.17"
 
 [dev-dependencies]
 tempfile = "3.15.0"

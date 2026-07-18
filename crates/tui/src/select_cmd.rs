@@ -30,11 +30,31 @@ use linux_backup_core::crypto;
 use linux_backup_core::model::{Entry, SelectionModel};
 use linux_backup_core::scan::{self, CategoryScan};
 
+use linux_backup_core::RunContext;
+
 use crate::system;
 
 pub fn run() -> Result<()> {
     let ctx = system::build_run_context()?;
-    let scanned = scan::scan_taxonomy(&ctx);
+    let model = run_screen(&ctx)?;
+
+    println!("Final selection:");
+    println!("{}", footer_text(&model));
+    for entry in model.entries() {
+        println!("  - [{}] {}", entry.category, entry.relative_path.display());
+    }
+
+    Ok(())
+}
+
+/// The WHAT screen's core loop, extracted so both the standalone `select` subcommand and the
+/// chained `backup` wizard (#33) drive the same screen logic rather than duplicating it.
+///
+/// Returns a guaranteed-non-empty [`SelectionModel`]: story 42's empty-Selection bounce is
+/// enforced here — pressing Continue with nothing selected reprints the bounce message and
+/// re-loops rather than returning an empty Selection for a caller to have to re-check.
+pub fn run_screen(ctx: &RunContext) -> Result<SelectionModel> {
+    let scanned = scan::scan_taxonomy(ctx);
     let mut model = SelectionModel::from_smart_defaults(&scanned);
 
     loop {
@@ -59,22 +79,17 @@ pub fn run() -> Result<()> {
                 }
             }
             MenuAction::Drill(index) => drill_down(&scanned[index], &mut model)?,
-            MenuAction::Continue => break,
+            MenuAction::Continue => {
+                if model.is_empty() {
+                    println!(
+                        "Selection is empty — check something, add a Custom path, or Esc to quit."
+                    );
+                    continue;
+                }
+                return Ok(model);
+            }
         }
     }
-
-    if model.is_empty() {
-        println!("Selection is empty — check something, add a Custom path, or Esc to quit.");
-        return Ok(());
-    }
-
-    println!("Final selection:");
-    println!("{}", footer_text(&model));
-    for entry in model.entries() {
-        println!("  - [{}] {}", entry.category, entry.relative_path.display());
-    }
-
-    Ok(())
 }
 
 /// Lets the user fine-tune one Category's individual Entries (CONTEXT.md's "Drill-down"):

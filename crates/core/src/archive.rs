@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::CoreError;
 use crate::model::Entry;
+use crate::progress::{Phase, Progress};
 
 /// The Archive's filename within a Backup dir, before any encryption suffix.
 pub const ARCHIVE_FILENAME: &str = "archive.tar.zst";
@@ -78,15 +79,27 @@ pub struct BuiltArchive {
 /// A Vanished entry (ENOENT at read time) is skipped-with-note; any other read error
 /// aborts immediately with [`CoreError::ReadFailed`], per ADR-0002's backup fail-fast
 /// policy. The caller is responsible for deleting the just-created Backup dir on `Err`.
-pub fn build(entries: &[Entry]) -> Result<BuiltArchive, CoreError> {
+///
+/// `progress` observes the per-Entry read loop (the [`Phase::Scanning`] phase, reported
+/// once up front here) so a caller can drive a live progress bar; it's only ever notified,
+/// never consulted — pass `&mut progress::NoopProgress` when progress isn't wanted.
+pub fn build(entries: &[Entry], progress: &mut dyn Progress) -> Result<BuiltArchive, CoreError> {
     let mut checksums = BTreeMap::new();
     let mut vanished = Vec::new();
+
+    progress.on_phase(Phase::Scanning);
+    let total = entries.len();
 
     let zstd_encoder = zstd::stream::write::Encoder::new(Vec::new(), 0)
         .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
     let mut tar_builder = tar::Builder::new(zstd_encoder);
 
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
+        // Ticked once at the top of the body so it fires exactly `total` times regardless of
+        // which path the iteration takes below (a Vanished `continue` would otherwise skip a
+        // tick placed at the bottom, stalling the bar short of 100%).
+        progress.on_entry(index + 1, total);
+
         let archive_path = entry.archive_path();
         let archive_path_str = archive_path.to_string_lossy().into_owned();
 
@@ -282,7 +295,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("does-not-exist");
 
-        let built = build(&[entry(missing, false)]).expect("a Vanished entry must not abort");
+        let built = build(&[entry(missing, false)], &mut crate::progress::NoopProgress)
+            .expect("a Vanished entry must not abort");
 
         assert_eq!(built.vanished.len(), 1);
         assert!(built.checksums.is_empty());
@@ -293,7 +307,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("gone-key");
 
-        let built = build(&[entry(missing, true)]).expect("build should succeed");
+        let built = build(&[entry(missing, true)], &mut crate::progress::NoopProgress)
+            .expect("build should succeed");
 
         assert_eq!(built.vanished.len(), 1);
         assert!(built.vanished[0].sensitive);
@@ -306,7 +321,10 @@ mod tests {
         // than `NotFound` (e.g. `IsADirectory`) — exactly the "real read error" ADR-0002
         // says is fatal. Deterministic and portable, unlike a permission-denied probe that
         // a root-run test suite would sail straight through.
-        let result = build(&[entry(tmp.path().to_path_buf(), false)]);
+        let result = build(
+            &[entry(tmp.path().to_path_buf(), false)],
+            &mut crate::progress::NoopProgress,
+        );
 
         match result {
             Err(CoreError::ReadFailed { .. }) => {}

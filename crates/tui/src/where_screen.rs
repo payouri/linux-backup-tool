@@ -42,9 +42,8 @@ use crate::system;
 /// real `backup` run will compute.
 pub fn run() -> Result<()> {
     let ctx = system::build_run_context()?;
-    let dir_name = backup_dir_name(&ctx);
 
-    match choose_location(&ctx, &dir_name, 0)? {
+    match run_screen(&ctx, 0)? {
         Some(selection) => {
             println!("Output location bound: {}", selection.location.display());
             println!("Backup dir will be: {}", selection.backup_dir.display());
@@ -60,6 +59,18 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The WHERE screen's core loop, extracted so both the standalone `where` subcommand and the
+/// chained `backup` wizard (#33) drive the same discovery/mount/validation logic.
+///
+/// `selection_size` is the running Selection's uncompressed byte size threaded in for the
+/// non-blocking free-space warning (story 32) — 0 from the standalone subcommand (no
+/// Selection exists yet), the real `SelectionModel::total_size()` from the chained flow.
+/// Returns `Ok(None)` when the user cancels with Esc/Ctrl-C.
+pub fn run_screen(ctx: &RunContext, selection_size: u64) -> Result<Option<LocationSelection>> {
+    let dir_name = backup_dir_name(ctx);
+    choose_location(ctx, &dir_name, selection_size)
 }
 
 /// Drive the pick-list loop until the user binds a location (`Ok(Some)`) or cancels with
