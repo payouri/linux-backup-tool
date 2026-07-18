@@ -45,8 +45,14 @@ pub fn run() -> Result<()> {
     // read stays out of `core`), then load it — a missing file is the first-run signal, not an
     // error. Real filesystem existence drives prune's stale-path check.
     let profile_path = system::profile_path()?;
-    let loaded = profile::load(&profile_path, |path| path.exists())
-        .with_context(|| format!("failed to load {}", profile_path.display()))?;
+    // The Profile is only a pre-fill convenience, so a load failure (corrupt TOML, an
+    // unreadable file) must degrade to "start fresh" rather than abort the backup — story 59's
+    // "degrade gracefully instead of breaking the tool" applied to the file itself, not just
+    // its stale paths. A bricked backup over a broken convenience-file would be the worse bug.
+    let loaded = load_or_degrade(
+        profile::load(&profile_path, |path| path.exists()),
+        &profile_path,
+    );
 
     // Above the Selection screen: a first-run orientation block, or a returning-run banner
     // with the "N pruned" line (stories 60/61).
@@ -121,6 +127,27 @@ fn save_profile(selection: &SelectionModel, location: &LocationSelection, profil
             "Warning: could not save {} ({err}); this run's selection wasn't remembered.",
             profile_path.display()
         );
+    }
+}
+
+/// Degrades a Profile load failure to "start fresh" (`None`) with a warning, rather than
+/// aborting the backup. The Profile is only a pre-fill convenience, so a corrupt or unreadable
+/// file must not brick the tool's primary function — story 59's graceful-degradation stance
+/// applied to the file itself. A missing file is already `Ok(None)` (the genuine first-run
+/// signal) and is passed through unchanged. Returns the loaded Profile on success.
+fn load_or_degrade(
+    loaded: Result<Option<LoadedProfile>, CoreError>,
+    profile_path: &Path,
+) -> Option<LoadedProfile> {
+    match loaded {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!(
+                "Warning: could not load {} ({err}); starting without a remembered selection.",
+                profile_path.display()
+            );
+            None
+        }
     }
 }
 
@@ -499,6 +526,29 @@ mod tests {
         assert!(returning_banner(0).contains("0 pruned"));
         assert!(returning_banner(3).contains("3 pruned"));
         assert!(returning_banner(1).contains("Restored last selection"));
+    }
+
+    #[test]
+    fn a_load_failure_degrades_to_no_profile_rather_than_bricking_the_backup() {
+        // Story 59: a corrupt/unreadable profile.toml is a broken convenience-file, not a
+        // reason to refuse the backup. It must fall back to a first-run (no prefill), never
+        // propagate an error.
+        let degraded = load_or_degrade(
+            Err(CoreError::Profile("corrupt TOML".to_string())),
+            Path::new("/tmp/whatever/profile.toml"),
+        );
+        assert!(degraded.is_none());
+    }
+
+    #[test]
+    fn a_successful_load_passes_the_profile_through_unchanged() {
+        let loaded = LoadedProfile {
+            profile: Profile::default(),
+            pruned: 2,
+        };
+        let passed = load_or_degrade(Ok(Some(loaded)), Path::new("/tmp/whatever/profile.toml"))
+            .expect("a successful load must pass through");
+        assert_eq!(passed.pruned, 2);
     }
 
     // --- category_breakdown ----------------------------------------------------------
