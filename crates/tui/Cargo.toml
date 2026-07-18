@@ -32,7 +32,7 @@ libc = "0.2"
 # terminal control (error-prone, no width/terminal-detection handling) for the one place the
 # alpha needs a real live bar; `inquire` already pulls in `console`'s sibling `crossterm`, so
 # this adds no genuinely new terminal-handling surface.
-indicatif = "0.17"
+indicatif = "0.18"
 
 [dev-dependencies]
 tempfile = "3.15.0"
