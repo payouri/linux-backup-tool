@@ -15,8 +15,10 @@
 //!
 //! #23 scope: [`passphrase_strength`] is the pure-function half of story 20's live,
 //! non-blocking strength checklist — per-criterion, not a single boolean, since the TUI
-//! (#31) renders each of the three criteria live as the user types rather than gating on
-//! them. The hard, non-advisory blank-passphrase reject (story 21) is deliberately *not*
+//! (#31) renders each of the three criteria independently rather than gating on them.
+//! ("Live" is per-entry, not per-keystroke: `inquire` 0.9's `Password` exposes no
+//! per-keystroke hook, so #31 recomputes and reshows the checklist after each entry.)
+//! The hard, non-advisory blank-passphrase reject (story 21) is deliberately *not*
 //! here: it lives in `archive::encrypt`, the point where a passphrase is actually used,
 //! not this advisory checklist.
 
@@ -119,7 +121,7 @@ pub fn evaluate(selection: &SelectionModel) -> AutoInsist {
 /// Story 20's live, non-blocking passphrase-strength checklist: which of the three
 /// advisory criteria `candidate` currently satisfies (>=12 chars, >=1 digit, >=1 special
 /// character). Per-criterion rather than a single boolean so a TUI can render each item
-/// live as the user types. None of these being unmet ever blocks encryption — only a
+/// independently in its checklist. None of these being unmet ever blocks encryption — only a
 /// literally blank passphrase does, and that hard reject lives in `archive::encrypt`, not
 /// here (see this module's doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,8 +144,9 @@ impl PassphraseStrength {
     }
 }
 
-/// Computes [`PassphraseStrength`] for `candidate`. Pure and non-blocking: called on every
-/// keystroke by a TUI passphrase prompt (#31), never itself rejecting anything — a blank
+/// Computes [`PassphraseStrength`] for `candidate`. Pure and non-blocking: called by a TUI
+/// passphrase prompt (#31) to reshow the checklist after each entry, never itself
+/// rejecting anything — a blank
 /// candidate simply reports all three criteria unmet here, and is separately hard-rejected
 /// at `archive::encrypt` time (story 21), not by this function.
 pub fn passphrase_strength(candidate: &str) -> PassphraseStrength {
