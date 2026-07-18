@@ -9,6 +9,11 @@
 //! arrives through an injected [`context::RunContext`], filled in by `crates/tui`'s `main`
 //! from the real machine, or by tests with fixed values.
 
+// Only production code is forbidden from `unsafe`: `location`'s test-only `libc::geteuid()`
+// probe (skipping a permission test under CI-as-root) is test infrastructure, not domain
+// logic, and `forbid` — unlike `deny` — can't be locally allowed back in for it.
+#![cfg_attr(not(test), forbid(unsafe_code))]
+
 pub mod archive;
 pub mod catalog;
 pub mod context;
