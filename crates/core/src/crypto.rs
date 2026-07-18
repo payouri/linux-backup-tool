@@ -1,6 +1,8 @@
-//! Whole-archive passphrase encryption via `age::Encryptor::with_user_passphrase` and
-//! `secrecy::SecretString`, plus the Auto-insist policy (does this Selection contain
-//! anything Sensitive -> is encryption required).
+//! Passphrase-related policy: the Auto-insist policy (does this Selection contain anything
+//! Sensitive -> is encryption required) and the passphrase strength checklist. The actual
+//! `age::Encryptor::with_user_passphrase` encryption pipeline lives in `archive.rs`
+//! (`Encryption::Passphrase`'s `encrypt`/`decrypt`) — this module only decides policy
+//! *around* a passphrase, never performs the encryption itself.
 //!
 //! Auto-insist policy is pure logic over a `SelectionModel` and is on-seam / unit-tested;
 //! the interactive passphrase prompt itself is off-seam (lives in `crates/tui`).
@@ -9,9 +11,14 @@
 //! (Category-level, per-entry tag, or Safety-net sensitivity — all three resolved upstream by
 //! `catalog`/`scan`, see `catalog::entry_is_individually_sensitive` and
 //! `scan::is_safety_net_match`). This module adds no new sensitivity source of its own; it
-//! only decides what a Selection's existing tags *imply* for encryption. Real `age`
-//! encryption (`Encryption::Passphrase`'s stubbed body in `archive.rs`) is #23's job, not
-//! this ticket's.
+//! only decides what a Selection's existing tags *imply* for encryption.
+//!
+//! #23 scope: [`passphrase_strength`] is the pure-function half of story 20's live,
+//! non-blocking strength checklist — per-criterion, not a single boolean, since the TUI
+//! (#31) renders each of the three criteria live as the user types rather than gating on
+//! them. The hard, non-advisory blank-passphrase reject (story 21) is deliberately *not*
+//! here: it lives in `archive::encrypt`, the point where a passphrase is actually used,
+//! not this advisory checklist.
 
 use std::path::PathBuf;
 
@@ -106,6 +113,44 @@ pub fn evaluate(selection: &SelectionModel) -> AutoInsist {
         encryption_required: !entries.is_empty(),
         sensitive_categories: categories,
         sensitive_entries: entries,
+    }
+}
+
+/// Story 20's live, non-blocking passphrase-strength checklist: which of the three
+/// advisory criteria `candidate` currently satisfies (>=12 chars, >=1 digit, >=1 special
+/// character). Per-criterion rather than a single boolean so a TUI can render each item
+/// live as the user types. None of these being unmet ever blocks encryption — only a
+/// literally blank passphrase does, and that hard reject lives in `archive::encrypt`, not
+/// here (see this module's doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PassphraseStrength {
+    /// At least 12 characters.
+    pub min_length: bool,
+    /// At least one ASCII digit.
+    pub has_digit: bool,
+    /// At least one character that's neither an ASCII letter nor an ASCII digit
+    /// (punctuation, symbols, or whitespace all count).
+    pub has_special: bool,
+}
+
+impl PassphraseStrength {
+    /// Whether every advisory criterion is met. Never consulted to gate encryption
+    /// (per this module's doc); only for a TUI that wants one combined "looks strong"
+    /// signal alongside the per-criterion checklist.
+    pub fn all_met(self) -> bool {
+        self.min_length && self.has_digit && self.has_special
+    }
+}
+
+/// Computes [`PassphraseStrength`] for `candidate`. Pure and non-blocking: called on every
+/// keystroke by a TUI passphrase prompt (#31), never itself rejecting anything — a blank
+/// candidate simply reports all three criteria unmet here, and is separately hard-rejected
+/// at `archive::encrypt` time (story 21), not by this function.
+pub fn passphrase_strength(candidate: &str) -> PassphraseStrength {
+    PassphraseStrength {
+        min_length: candidate.chars().count() >= 12,
+        has_digit: candidate.chars().any(|c| c.is_ascii_digit()),
+        has_special: candidate.chars().any(|c| !c.is_ascii_alphanumeric()),
     }
 }
 
@@ -222,5 +267,67 @@ mod tests {
         let override_ = policy.disable().expect("should disclose sensitive content");
 
         assert_eq!(override_.disclosed_categories(), &["GPG"]);
+    }
+
+    #[test]
+    fn passphrase_strength_reports_no_criteria_met_for_a_blank_candidate() {
+        let strength = passphrase_strength("");
+
+        assert!(!strength.min_length);
+        assert!(!strength.has_digit);
+        assert!(!strength.has_special);
+        assert!(!strength.all_met());
+    }
+
+    #[test]
+    fn passphrase_strength_flags_each_criterion_independently() {
+        // 11 chars: one short of the >=12 minimum, no digit, no special character.
+        assert_eq!(
+            passphrase_strength("shortphrase"),
+            PassphraseStrength {
+                min_length: false,
+                has_digit: false,
+                has_special: false,
+            }
+        );
+
+        // Exactly 12 chars, still no digit/special.
+        assert_eq!(
+            passphrase_strength("twelvecharsx"),
+            PassphraseStrength {
+                min_length: true,
+                has_digit: false,
+                has_special: false,
+            }
+        );
+
+        // Long enough and has a digit, but no special character yet.
+        assert_eq!(
+            passphrase_strength("longenoughphrase1"),
+            PassphraseStrength {
+                min_length: true,
+                has_digit: true,
+                has_special: false,
+            }
+        );
+    }
+
+    #[test]
+    fn passphrase_strength_all_met_when_every_criterion_is_satisfied() {
+        let strength = passphrase_strength("correct-horse-battery-staple9!");
+
+        assert!(strength.min_length);
+        assert!(strength.has_digit);
+        assert!(strength.has_special);
+        assert!(strength.all_met());
+    }
+
+    #[test]
+    fn passphrase_strength_is_advisory_only_and_never_appears_in_a_hard_reject() {
+        // Documents the split this module's doc promises: a weak-by-every-metric
+        // passphrase is still a valid `PassphraseStrength` value (all fields false), never
+        // a `Result::Err` — only `archive::encrypt`'s blank check is a hard reject.
+        let strength = passphrase_strength("weak");
+        assert!(!strength.all_met());
     }
 }

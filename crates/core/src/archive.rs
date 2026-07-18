@@ -3,17 +3,19 @@
 //! Per ADR-0001, this is deliberately a concrete implementation with no `ArchiveBackend`
 //! trait — that abstraction waits for v1's real second (dedup-store) implementation.
 //!
-//! #19 scope: a real tar -> zstd pipeline. [`Encryption::Passphrase`] exists so the two
-//! code paths (encrypted/unencrypted) already shape the round-trip seam, but
-//! [`encrypt`]/[`decrypt`] are today an identity pass-through stub — #23 will swap in real
-//! `age::Encryptor::with_user_passphrase` encryption there without changing this module's
-//! public shape or its callers.
+//! #19 built the real tar -> zstd pipeline with [`Encryption::Passphrase`] shaping the two
+//! code paths (encrypted/unencrypted) as an identity pass-through stub. #23 replaces
+//! [`encrypt`]/[`decrypt`]'s bodies with real `age::Encryptor::with_user_passphrase`
+//! whole-stream passphrase encryption, without changing this module's public shape (still
+//! `Result`-returning, still called the same way from `lib.rs`/`restore.rs`) — exactly
+//! what #19's review anticipated.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::Path;
 
+use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 
 use crate::error::CoreError;
@@ -28,16 +30,19 @@ pub const MANIFEST_FILENAME: &str = "manifest.json";
 pub const ENCRYPTED_SUFFIX: &str = ".age";
 
 /// Whole-archive encryption choice. All-or-nothing across the Archive + Manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Deliberately does not derive `PartialEq`/`Eq`: `secrecy::SecretString` carries none
+/// (comparing secrets by value invites timing side-channels and isn't a real use case
+/// here — nothing in this codebase needs to compare two `Encryption` values for equality).
+#[derive(Debug, Clone)]
 pub enum Encryption {
     /// No encryption: Archive and Manifest bytes are written as plaintext.
     None,
-    /// Whole-archive passphrase encryption.
-    ///
-    /// STUB for #19: `encrypt`/`decrypt` are an identity pass-through today — the
-    /// passphrase is carried but not yet used. #23 replaces the internals with real
-    /// `age` encryption; this variant's shape (and every call site) stays the same.
-    Passphrase(String),
+    /// Whole-archive passphrase encryption via `age::Encryptor::with_user_passphrase`.
+    /// Carried as a `secrecy::SecretString` rather than a plain `String` so the
+    /// passphrase is zeroized on drop and redacted from `Debug` output everywhere it
+    /// travels, not just at the `age` API boundary.
+    Passphrase(SecretString),
 }
 
 impl Encryption {
@@ -156,22 +161,76 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// STUB for #19: identity pass-through — see the module doc. #23 replaces the *body* with
-/// real `age::Encryptor::with_user_passphrase` encryption without changing the signature or
-/// its callers. The `Result` is load-bearing even though this stub never fails: real `age`
-/// encryption is fallible (e.g. an I/O error while wrapping the writer), so the signature
-/// carries `Result` from the start rather than forcing every call site to change shape
-/// (`= encrypt(..)` to `= encrypt(..)?`) the day the stub is replaced.
-pub fn encrypt(plaintext: &[u8], _encryption: &Encryption) -> Result<Vec<u8>, CoreError> {
-    Ok(plaintext.to_vec())
+/// Encrypts `plaintext` per `encryption` (a no-op for [`Encryption::None`]). Story 21: a
+/// blank passphrase is a hard reject here — the point where a passphrase is actually used
+/// to encrypt — rather than only advisorily flagged by `crypto::passphrase_strength`.
+pub fn encrypt(plaintext: &[u8], encryption: &Encryption) -> Result<Vec<u8>, CoreError> {
+    match encryption {
+        Encryption::None => Ok(plaintext.to_vec()),
+        Encryption::Passphrase(passphrase) => encrypt_with_passphrase(plaintext, passphrase),
+    }
 }
 
-/// STUB for #19: identity pass-through, the inverse of [`encrypt`]. `encrypted` mirrors
-/// whether the source file carried the `.age` suffix. See [`encrypt`]'s doc for why this
-/// returns `Result` despite never failing today — real `age` decryption fails on a wrong
-/// passphrase or corrupted ciphertext.
-pub fn decrypt(ciphertext: &[u8], _encrypted: bool) -> Result<Vec<u8>, CoreError> {
-    Ok(ciphertext.to_vec())
+fn encrypt_with_passphrase(
+    plaintext: &[u8],
+    passphrase: &SecretString,
+) -> Result<Vec<u8>, CoreError> {
+    if passphrase.expose_secret().is_empty() {
+        return Err(CoreError::BlankPassphrase);
+    }
+
+    let encryptor = age::Encryptor::with_user_passphrase(passphrase.clone());
+    let mut writer = encryptor
+        .wrap_output(Vec::new())
+        .map_err(|source| CoreError::EncryptionFailed(source.to_string()))?;
+    writer
+        .write_all(plaintext)
+        .map_err(|source| CoreError::EncryptionFailed(source.to_string()))?;
+    // `StreamWriter::finish` writes the authentication tag; skipping it (e.g. dropping the
+    // writer instead) silently produces a truncated file that will never decrypt — see
+    // docs/research/rust-crates.md's age friction call-out.
+    writer
+        .finish()
+        .map_err(|source| CoreError::EncryptionFailed(source.to_string()))
+}
+
+/// Decrypts `ciphertext`, the inverse of [`encrypt`]. `encrypted` mirrors whether the
+/// source file carried the `.age` suffix (the authoritative on-disk signal, per
+/// CONTEXT.md's Manifest entry) — when `false`, `ciphertext` is returned unchanged and
+/// `passphrase` is ignored. When `true`, `passphrase` is required: a wrong passphrase or
+/// corrupted/truncated ciphertext both surface as [`CoreError::DecryptionFailed`], never a
+/// panic.
+pub fn decrypt(
+    ciphertext: &[u8],
+    encrypted: bool,
+    passphrase: Option<&SecretString>,
+) -> Result<Vec<u8>, CoreError> {
+    match (encrypted, passphrase) {
+        (false, _) => Ok(ciphertext.to_vec()),
+        (true, Some(passphrase)) => decrypt_with_passphrase(ciphertext, passphrase),
+        (true, None) => Err(CoreError::DecryptionFailed(
+            "backup is encrypted but no passphrase was supplied".to_string(),
+        )),
+    }
+}
+
+fn decrypt_with_passphrase(
+    ciphertext: &[u8],
+    passphrase: &SecretString,
+) -> Result<Vec<u8>, CoreError> {
+    let decryptor = age::Decryptor::new_buffered(ciphertext)
+        .map_err(|source| CoreError::DecryptionFailed(source.to_string()))?;
+    let identity = age::scrypt::Identity::new(passphrase.clone());
+
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|source| CoreError::DecryptionFailed(source.to_string()))?;
+
+    let mut plaintext = Vec::new();
+    reader
+        .read_to_end(&mut plaintext)
+        .map_err(|source| CoreError::DecryptionFailed(source.to_string()))?;
+    Ok(plaintext)
 }
 
 /// The Archive's filename within a Backup dir, given the run's encryption choice.
@@ -252,6 +311,86 @@ mod tests {
         match result {
             Err(CoreError::ReadFailed { .. }) => {}
             other => panic!("expected CoreError::ReadFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unencrypted_round_trip_is_a_pure_pass_through() {
+        let plaintext = b"hello, plaintext".to_vec();
+        let ciphertext = encrypt(&plaintext, &Encryption::None).expect("encrypt should succeed");
+        assert_eq!(ciphertext, plaintext);
+
+        let decrypted =
+            decrypt(&ciphertext, false, None).expect("unencrypted decrypt should succeed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn real_age_round_trip_with_the_correct_passphrase_recovers_the_plaintext() {
+        let plaintext = b"the entire point of this exercise".to_vec();
+        let encryption = Encryption::Passphrase(SecretString::from("correct-horse-battery-staple"));
+
+        let ciphertext = encrypt(&plaintext, &encryption).expect("encrypt should succeed");
+        // Real age ciphertext must not equal the plaintext, else this test would pass even
+        // if `encrypt` regressed back to an identity stub.
+        assert_ne!(ciphertext, plaintext);
+
+        let passphrase = SecretString::from("correct-horse-battery-staple");
+        let decrypted = decrypt(&ciphertext, true, Some(&passphrase))
+            .expect("decrypt with the correct passphrase should succeed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_with_the_wrong_passphrase_fails_typed_not_panicking() {
+        let plaintext = b"sensitive bytes".to_vec();
+        let encryption = Encryption::Passphrase(SecretString::from("correct-horse-battery-staple"));
+        let ciphertext = encrypt(&plaintext, &encryption).expect("encrypt should succeed");
+
+        let wrong_passphrase = SecretString::from("a-completely-different-passphrase");
+        match decrypt(&ciphertext, true, Some(&wrong_passphrase)) {
+            Err(CoreError::DecryptionFailed(_)) => {}
+            other => panic!("expected CoreError::DecryptionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decrypt_of_corrupted_ciphertext_fails_typed_not_panicking() {
+        let plaintext = b"sensitive bytes".to_vec();
+        let encryption = Encryption::Passphrase(SecretString::from("correct-horse-battery-staple"));
+        let mut ciphertext = encrypt(&plaintext, &encryption).expect("encrypt should succeed");
+        // Flip a byte well past the age header so this exercises stream-body corruption,
+        // not just header parsing.
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 0xFF;
+
+        let passphrase = SecretString::from("correct-horse-battery-staple");
+        match decrypt(&ciphertext, true, Some(&passphrase)) {
+            Err(CoreError::DecryptionFailed(_)) => {}
+            other => panic!("expected CoreError::DecryptionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decrypting_an_encrypted_backup_without_a_passphrase_fails_typed() {
+        let plaintext = b"sensitive bytes".to_vec();
+        let encryption = Encryption::Passphrase(SecretString::from("correct-horse-battery-staple"));
+        let ciphertext = encrypt(&plaintext, &encryption).expect("encrypt should succeed");
+
+        match decrypt(&ciphertext, true, None) {
+            Err(CoreError::DecryptionFailed(_)) => {}
+            other => panic!("expected CoreError::DecryptionFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blank_passphrase_is_rejected_at_encrypt_time() {
+        let plaintext = b"anything".to_vec();
+        let encryption = Encryption::Passphrase(SecretString::from(""));
+
+        match encrypt(&plaintext, &encryption) {
+            Err(CoreError::BlankPassphrase) => {}
+            other => panic!("expected CoreError::BlankPassphrase, got {other:?}"),
         }
     }
 }

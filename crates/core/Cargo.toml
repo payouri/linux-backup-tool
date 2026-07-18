@@ -13,6 +13,18 @@ sha2 = "0.10.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sysinfo = { version = "0.39", default-features = false, features = ["disk"] }
+# Reference Rust impl of the age format (str4d, the spec author); passphrase (scrypt)
+# whole-stream encryption via `Encryptor::with_user_passphrase`, no key management needed
+# for the alpha's passphrase-only scope. Recommended in docs/research/rust-crates.md.
+age = "0.12.1"
+# `age::Encryptor::with_user_passphrase` takes a `secrecy::SecretString`; carrying the
+# passphrase in `SecretString` rather than a plain `String` keeps it zeroized on drop and
+# out of `Debug` output end-to-end, not just at the age API boundary. Same recommendation
+# as docs/research/rust-crates.md, pinned to 0.10 (not the doc's "0.8") because age-core
+# 0.12.0 itself depends on secrecy 0.10 — using 0.8 here would resolve two separate
+# `secrecy` crate instances and make our `SecretString` a different type than the one
+# `with_user_passphrase` expects.
+secrecy = "0.10"
 
 [dev-dependencies]
 tempfile = "3.15.0"

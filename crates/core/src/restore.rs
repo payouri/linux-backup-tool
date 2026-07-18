@@ -11,6 +11,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use secrecy::SecretString;
+
 use crate::archive;
 use crate::context::RunContext;
 use crate::error::CoreError;
@@ -36,18 +38,28 @@ pub struct RestoreOutcome {
 }
 
 /// Reads the Backup dir at `backup_dir`: locates the Manifest and Archive (encrypted or
-/// not, by filename suffix), decrypts (a no-op stub for #19 — see `archive`), verifies the
-/// Archive's checksum against `manifest.archive_sha256` (aborting before any file is
-/// touched on mismatch, per ADR-0002), then untars every Entry into `ctx` — Re-rooting
-/// `home`-tagged Entries under `ctx.home`, the *restoring* context's home, regardless of
-/// whatever `home` the Manifest itself recorded.
-pub fn restore(backup_dir: &Path, ctx: &RunContext) -> Result<RestoreOutcome, CoreError> {
+/// not, by filename suffix), decrypts with `passphrase` when encrypted (real `age`
+/// decryption per #23 — a wrong passphrase or corrupted ciphertext fails with a typed
+/// `CoreError::DecryptionFailed` before anything is touched, never a partial write),
+/// verifies the Archive's checksum against `manifest.archive_sha256` (aborting before any
+/// file is touched on mismatch, per ADR-0002), then untars every Entry into `ctx` —
+/// Re-rooting `home`-tagged Entries under `ctx.home`, the *restoring* context's home,
+/// regardless of whatever `home` the Manifest itself recorded.
+///
+/// `passphrase` is ignored when the Backup is unencrypted; it is required (and its absence
+/// is a typed error, not a panic) when the Backup's Manifest/Archive carry the `.age`
+/// suffix.
+pub fn restore(
+    backup_dir: &Path,
+    ctx: &RunContext,
+    passphrase: Option<&SecretString>,
+) -> Result<RestoreOutcome, CoreError> {
     let (manifest_path, encrypted) = locate_manifest(backup_dir)?;
     let manifest_bytes = fs::read(&manifest_path).map_err(|source| CoreError::Io {
         path: manifest_path.clone(),
         source,
     })?;
-    let manifest_bytes = archive::decrypt(&manifest_bytes, encrypted)?;
+    let manifest_bytes = archive::decrypt(&manifest_bytes, encrypted, passphrase)?;
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
 
     let archive_path = backup_dir.join(archive::filename_for(archive::ARCHIVE_FILENAME, encrypted));
@@ -55,7 +67,7 @@ pub fn restore(backup_dir: &Path, ctx: &RunContext) -> Result<RestoreOutcome, Co
         path: archive_path.clone(),
         source,
     })?;
-    let archive_bytes = archive::decrypt(&archive_bytes, encrypted)?;
+    let archive_bytes = archive::decrypt(&archive_bytes, encrypted, passphrase)?;
 
     let actual_sha256 = archive::sha256_hex(&archive_bytes);
     if actual_sha256 != manifest.archive_sha256 {

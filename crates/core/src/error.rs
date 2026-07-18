@@ -72,18 +72,25 @@ pub enum CoreError {
     #[error("failed to build archive: {0}")]
     ArchiveBuildFailed(String),
 
-    /// Encryption of the Archive or Manifest bytes failed. A no-op today (see
-    /// `archive::encrypt`'s #19 stub), but real `age` encryption (#23) is fallible, so the
-    /// signature carries `Result` from the start rather than forcing every call site to
-    /// change shape when the stub is replaced.
+    /// Encryption of the Archive or Manifest bytes failed (e.g. an I/O error while
+    /// wrapping the writer in `age::Encryptor::wrap_output`). Distinct from
+    /// [`CoreError::BlankPassphrase`], which is a hard reject before any `age` call is
+    /// even made.
     #[error("failed to encrypt: {0}")]
     EncryptionFailed(String),
 
-    /// Decryption of the Archive or Manifest bytes failed (e.g. a wrong passphrase once
-    /// #23 lands real `age` decryption). A no-op today (see `archive::decrypt`'s #19
-    /// stub), carried as `Result` for the same reason as `EncryptionFailed`.
+    /// Decryption of the Archive or Manifest bytes failed: a wrong passphrase, corrupted
+    /// or truncated ciphertext, or an encrypted Backup dir restored without a passphrase
+    /// at all.
     #[error("failed to decrypt: {0}")]
     DecryptionFailed(String),
+
+    /// A blank passphrase was used at the point of encryption (story 21). Checked here
+    /// rather than only advisorily in `crypto::passphrase_strength`, because that
+    /// checklist is non-blocking by design — a blank passphrase must be a hard reject so a
+    /// user can never end up with an unencrypted archive while believing it's protected.
+    #[error("passphrase must not be blank")]
+    BlankPassphrase,
 
     /// The real `lsblk` subprocess (story 34's unmounted-USB delta) exited non-zero.
     /// Distinct from `LsblkParseFailed`: this is the subprocess itself failing, not its

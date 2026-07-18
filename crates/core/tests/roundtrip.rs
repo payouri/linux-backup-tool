@@ -19,6 +19,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
+use secrecy::SecretString;
+
 use linux_backup_core::archive::Encryption;
 use linux_backup_core::context::{Privilege, RunContext};
 use linux_backup_core::model::{Entry, EntryRoot, SelectionModel};
@@ -96,8 +98,16 @@ fn run_backup(
     linux_backup_core::backup(selection, ctx, encryption, &NoCommandRunner)
 }
 
-fn run_restore(backup_dir: &Path, ctx: &RunContext) -> Result<RestoreOutcome, CoreError> {
-    linux_backup_core::restore::restore(backup_dir, ctx)
+/// Runs `core::restore`. `passphrase` is `None` for an unencrypted Backup and
+/// `Some(&passphrase)` for an encrypted one — see `restore::restore`'s doc for why the
+/// signature carries it explicitly rather than reading it from the Backup dir itself
+/// (encryption is never persisted, per CONTEXT.md's Profile entry).
+fn run_restore(
+    backup_dir: &Path,
+    ctx: &RunContext,
+    passphrase: Option<&SecretString>,
+) -> Result<RestoreOutcome, CoreError> {
+    linux_backup_core::restore::restore(backup_dir, ctx, passphrase)
 }
 
 /// Builds a synthetic `$HOME` under `root` exercising more than one Category at once
@@ -274,13 +284,18 @@ fn round_trip_unencrypted() {
     let restore_home = tmp.path().join("restored-home");
     let restore_ctx = test_ctx(restore_home.clone(), output.clone());
     let restore_outcome =
-        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
 
     assert_round_trip_landed(&outcome, &restore_outcome, &home, &restore_home);
 }
 
+/// #23: the encrypted path now runs through real `age::Encryptor::with_user_passphrase`
+/// encryption (replacing #19's identity-stub coverage of the same shape) — both the Archive
+/// and Manifest land as genuine age ciphertext, and restoring with the correct passphrase
+/// recovers the plaintext byte-for-byte via the same round-trip assertions as the
+/// unencrypted case.
 #[test]
-fn round_trip_encrypted_stub() {
+fn round_trip_encrypted_with_real_age_and_the_correct_passphrase() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = build_fixture_home(tmp.path());
     let output = tmp.path().join("output");
@@ -288,9 +303,23 @@ fn round_trip_encrypted_stub() {
 
     let ctx = test_ctx(home.clone(), output.clone());
     let selection = shell_selection(&ctx);
-    let encryption = Encryption::Passphrase("correct-horse-battery-staple".to_string());
+    let passphrase = SecretString::from("correct-horse-battery-staple");
+    let encryption = Encryption::Passphrase(passphrase.clone());
 
     let outcome = run_backup(&selection, &ctx, &encryption).expect("backup should succeed");
+
+    // Story 23: the Backup dir's own name never changes shape because of encryption — it
+    // stays readable without a passphrase, identical in format to the unencrypted case.
+    let expected_dir_name = format!(
+        "linux-backup-{}-{}",
+        ctx.host,
+        ctx.now.duration_since(UNIX_EPOCH).unwrap().as_secs()
+    );
+    assert_eq!(
+        outcome.backup_dir.file_name().and_then(|n| n.to_str()),
+        Some(expected_dir_name.as_str()),
+        "the Backup dir name must stay readable without a passphrase, unaffected by encryption"
+    );
 
     // Encrypted path: both the Archive and Manifest carry the .age suffix (CONTEXT.md:
     // encryption mirrors across both, all-or-nothing), and the unencrypted filenames must
@@ -308,15 +337,62 @@ fn round_trip_encrypted_stub() {
     assert!(!outcome.backup_dir.join("archive.tar.zst").exists());
     assert!(!outcome.backup_dir.join("manifest.json").exists());
 
-    // Restore into a DIFFERENT fresh root — same shape as the unencrypted case, exercised
-    // through the encrypted (today: identity-stub, per #19's scope; real `age` lands in
-    // #23) code path instead.
+    // The bytes on disk must be genuine age ciphertext, not plaintext, for both files —
+    // proves this test would fail if `encrypt` regressed back to an identity stub.
+    let archive_bytes_on_disk = fs::read(&archive_path).expect("read encrypted archive");
+    let manifest_bytes_on_disk = fs::read(&manifest_path).expect("read encrypted manifest");
+    // Real age ciphertext starts with the format's own "age-encryption.org/v1" header —
+    // proves this is genuine age output, not a zstd frame (0x28 0xB5 0x2F 0xFD) or plaintext
+    // JSON that slipped through unencrypted.
+    assert_eq!(
+        &archive_bytes_on_disk[..4],
+        b"age-",
+        "encrypted Archive bytes on disk should be real age ciphertext"
+    );
+    assert!(
+        serde_json::from_slice::<manifest::Manifest>(&manifest_bytes_on_disk).is_err(),
+        "the on-disk Manifest bytes must be ciphertext, not parseable plaintext JSON"
+    );
+
+    // Restore into a DIFFERENT fresh root, with the SAME correct passphrase.
     let restore_home = tmp.path().join("restored-home");
     let restore_ctx = test_ctx(restore_home.clone(), output.clone());
-    let restore_outcome =
-        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+    let restore_outcome = run_restore(&outcome.backup_dir, &restore_ctx, Some(&passphrase))
+        .expect("restore with the correct passphrase should succeed");
 
     assert_round_trip_landed(&outcome, &restore_outcome, &home, &restore_home);
+}
+
+/// Acceptance criterion: restoring an encrypted Backup with a WRONG passphrase must fail
+/// clearly (a typed `CoreError::DecryptionFailed`, never a panic) and without partially
+/// writing any files — restore reads and decrypts the Manifest before touching the
+/// filesystem at all, so a decrypt failure there means `restore_home` is never even created.
+#[test]
+fn restore_with_wrong_passphrase_fails_without_partial_write() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output.clone());
+    let selection = shell_selection(&ctx);
+    let encryption = Encryption::Passphrase(SecretString::from("correct-horse-battery-staple"));
+
+    let outcome = run_backup(&selection, &ctx, &encryption).expect("backup should succeed");
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home.clone(), output);
+    let wrong_passphrase = SecretString::from("a-completely-different-passphrase");
+
+    match run_restore(&outcome.backup_dir, &restore_ctx, Some(&wrong_passphrase)) {
+        Err(CoreError::DecryptionFailed(_)) => {}
+        other => panic!("expected CoreError::DecryptionFailed, got {other:?}"),
+    }
+
+    assert!(
+        !restore_home.exists(),
+        "a failed decrypt must leave no partially-restored files behind"
+    );
 }
 
 #[test]
@@ -418,7 +494,7 @@ fn taxonomy_round_trip_composes_multiple_categories() {
     let restore_home = tmp.path().join("restored-home");
     let restore_ctx = test_ctx(restore_home.clone(), output.clone());
     let restore_outcome =
-        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
 
     assert!(
         restore_outcome.failures.is_empty(),
@@ -671,7 +747,7 @@ fn safety_net_only_entry_flows_sensitive_through_the_round_trip() {
     let restore_home = tmp.path().join("restored-home");
     let restore_ctx = test_ctx(restore_home.clone(), output.clone());
     let restore_outcome =
-        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
     assert!(
         restore_outcome.failures.is_empty(),
         "unexpected restore failures: {:?}",
