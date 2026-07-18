@@ -9,17 +9,22 @@
 //! run to completion ahead of the one call into `restore::restore`, which is the only place
 //! in this module (or `core`) that writes anything to disk.
 //!
-//! Story 54's "confirm once" collision prompt is a CLI-scope stand-in (`--overwrite`) rather
-//! than an interactive per-collision confirmation: this binary has no interactive review
-//! step before RUN yet (that's the `inquire` wizard, still to land for `backup`), so there's
-//! no natural point to pause mid-restore and ask — the flag is read once, up front, same as
-//! `--verify`. A real "confirm once" prompt is TUI wizard territory for a future iteration.
+//! Story 54 / issue #37's "confirm once" collision handling lives here: when a restore would
+//! overwrite existing file(s) and `--overwrite` was not passed, this module shows a single
+//! `inquire::Confirm` naming every colliding target before anything is clobbered. It plugs
+//! into `core::restore`'s [`CollisionPolicy::Confirm`](restore::CollisionPolicy) callback —
+//! `core` pre-scans the collisions and hands them here as data; the `inquire` prompt itself
+//! never crosses into `core` (ADR-0001). `--overwrite` bypasses the prompt entirely
+//! ([`CollisionPolicy::Overwrite`](restore::CollisionPolicy)), preserving the unchanged
+//! non-interactive AFK behaviour.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use inquire::Password;
-use linux_backup_core::restore::{self, OwnershipOutcome, RestoreOutcome, VerifyReport};
+use inquire::{Confirm, Password};
+use linux_backup_core::restore::{
+    self, CollisionPolicy, OwnershipOutcome, RestoreOutcome, VerifyReport,
+};
 use linux_backup_core::{archive, CoreError, Privilege};
 use secrecy::SecretString;
 
@@ -49,7 +54,18 @@ pub fn run(args: &RestoreArgs) -> Result<()> {
         println!("{warning}");
     }
 
-    let outcome = restore::restore(&args.backup_dir, &ctx, passphrase.as_ref(), args.overwrite)
+    // `--overwrite` overwrites non-interactively (unchanged AFK behaviour); without it, a
+    // collision triggers the single "confirm once" prompt below (issue #37). The prompt fires
+    // only if `core`'s pre-scan actually finds a collision, and after the passphrase step
+    // above — so nothing is written before the user has confirmed.
+    let mut confirm = confirm_overwrite;
+    let policy = if args.overwrite {
+        CollisionPolicy::Overwrite
+    } else {
+        CollisionPolicy::Confirm(&mut confirm)
+    };
+
+    let outcome = restore::restore(&args.backup_dir, &ctx, passphrase.as_ref(), policy)
         .map_err(describe_restore_error)?;
 
     println!("{}", format_summary(&outcome));
@@ -102,6 +118,39 @@ fn prompt_passphrase() -> Result<SecretString> {
     Ok(SecretString::from(raw))
 }
 
+/// The single "confirm once" collision prompt (issue #37): `core` calls this at most once,
+/// with every colliding target, when a non-`--overwrite` restore would overwrite existing
+/// file(s). Returns `true` to overwrite them all, `false` to skip them all (leaving the
+/// existing files untouched and reported as skipped). A prompt that can't be answered — no
+/// TTY, or the user aborts with Esc/Ctrl-C — defaults to `false`: the safe choice never
+/// clobbers anything the user didn't actively confirm.
+fn confirm_overwrite(collisions: &[PathBuf]) -> bool {
+    println!("{}", format_collision_list(collisions));
+    Confirm::new("Overwrite the existing file(s) listed above?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false)
+}
+
+/// Renders the collision list the confirmation names — the "what would be overwritten" the
+/// acceptance criteria require shown before writing. A pure function of the colliding paths
+/// so it's unit-testable without a TTY, matching this module's other renderers.
+fn format_collision_list(collisions: &[PathBuf]) -> String {
+    let noun = if collisions.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let mut lines = vec![format!(
+        "{} existing {noun} would be overwritten by this restore:",
+        collisions.len()
+    )];
+    for path in collisions {
+        lines.push(format!("  - {}", path.display()));
+    }
+    lines.join("\n")
+}
+
 /// Wraps a restore failure with a hint for the one case a user is most likely to hit and be
 /// confused by: a wrong passphrase surfaces as `CoreError::DecryptionFailed` with no further
 /// detail (deliberately — `age` doesn't distinguish "wrong passphrase" from "corrupted
@@ -137,6 +186,20 @@ fn format_summary(outcome: &RestoreOutcome) -> String {
              running as root); original uid/gid was not restored."
             .to_string(),
     });
+
+    // Issue #37: a declined collision is a deliberate skip, reported apart from real errors so
+    // the user can tell "I chose not to overwrite this" from "this failed".
+    if outcome.skipped_collisions.is_empty() {
+        lines.push("Skipped (collision, overwrite declined): none.".to_string());
+    } else {
+        lines.push(format!(
+            "Skipped ({}, existing files left untouched — overwrite declined):",
+            outcome.skipped_collisions.len()
+        ));
+        for skipped in &outcome.skipped_collisions {
+            lines.push(format!("  - {}", skipped.path));
+        }
+    }
 
     if outcome.failures.is_empty() {
         lines.push("Failures: none.".to_string());
@@ -253,6 +316,7 @@ mod tests {
             manifest: empty_manifest(),
             restored_paths: vec![PathBuf::from("/home/user/.bashrc")],
             failures: Vec::new(),
+            skipped_collisions: Vec::new(),
             ownership: OwnershipOutcome::Restored,
             reinstall_script_path: PathBuf::from("/home/user/reinstall.sh"),
             package_counts: BTreeMap::from([("pacman".to_string(), 3)]),
@@ -274,7 +338,10 @@ mod tests {
             restored_paths: Vec::new(),
             failures: vec![restore::RestoreFailure {
                 path: "/home/user/.ssh/id_ed25519".to_string(),
-                reason: "collision: target already exists".to_string(),
+                reason: "ownership restore failed: EPERM".to_string(),
+            }],
+            skipped_collisions: vec![restore::SkippedCollision {
+                path: "/home/user/.bashrc".to_string(),
             }],
             ownership: OwnershipOutcome::SkippedNonRoot,
             reinstall_script_path: PathBuf::from("/home/user/reinstall.sh"),
@@ -283,11 +350,33 @@ mod tests {
 
         let summary = format_summary(&outcome);
 
+        // A declined collision and a real failure are reported in separate sections (issue
+        // #37), never conflated into one list.
+        assert!(summary.contains("Skipped (1"));
+        assert!(summary.contains("overwrite declined"));
+        assert!(summary.contains("  - /home/user/.bashrc"));
         assert!(summary.contains("Failures (1):"));
-        assert!(summary.contains("/home/user/.ssh/id_ed25519: collision: target already exists"));
+        assert!(summary.contains("/home/user/.ssh/id_ed25519: ownership restore failed: EPERM"));
         assert!(summary.contains("Ownership: left under the current user"));
         assert!(summary.contains("original uid/gid was not restored"));
         assert!(summary.contains("no package managers were captured"));
+    }
+
+    #[test]
+    fn format_collision_list_names_every_would_be_overwritten_path() {
+        let rendered = format_collision_list(&[
+            PathBuf::from("/home/user/.bashrc"),
+            PathBuf::from("/home/user/.ssh/id_ed25519"),
+        ]);
+        assert!(rendered.contains("2 existing files would be overwritten"));
+        assert!(rendered.contains("  - /home/user/.bashrc"));
+        assert!(rendered.contains("  - /home/user/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn format_collision_list_uses_singular_noun_for_one_collision() {
+        let rendered = format_collision_list(&[PathBuf::from("/home/user/.bashrc")]);
+        assert!(rendered.contains("1 existing file would be overwritten"));
     }
 
     #[test]

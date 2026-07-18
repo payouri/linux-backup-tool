@@ -35,6 +35,39 @@ pub struct RestoreFailure {
     pub reason: String,
 }
 
+/// A restore target that already existed and was deliberately left untouched because the
+/// [`CollisionPolicy`] declined to overwrite it (a `--overwrite`-less run whose confirmation
+/// was declined). Kept structurally separate from [`RestoreFailure`] per issue #37: a
+/// user-declined collision is a deliberate skip, not an error, and a caller (and the run
+/// summary it prints) must be able to tell the two apart without parsing reason strings.
+#[derive(Debug, Clone)]
+pub struct SkippedCollision {
+    pub path: String,
+}
+
+/// How `restore` resolves a target-path collision — an existing file where an Entry would
+/// otherwise land. Story 54 / issue #37.
+///
+/// Because the confirmation must be a *single* "confirm once" decision covering every
+/// collision at once (never one prompt per file), `core` pre-scans the whole Archive for
+/// collisions up front and, only if there is at least one, hands the full list to the
+/// decision. `core` never prompts: per ADR-0001 the `inquire` confirmation lives in `tui`,
+/// which plugs into the [`Confirm`](CollisionPolicy::Confirm) callback. The decision crosses
+/// the core/tui boundary as data (a list of colliding paths in, a yes/no out), so `core`
+/// stays UI-free.
+pub enum CollisionPolicy<'a> {
+    /// `--overwrite`: every colliding target is overwritten without asking — unchanged
+    /// non-interactive AFK behaviour. `core` does not even pre-scan for collisions in this
+    /// case (there is nothing to ask about).
+    Overwrite,
+    /// Ask once. `core` collects every colliding target and, if the list is non-empty, calls
+    /// this callback exactly once with the full list; returning `true` overwrites them all,
+    /// `false` skips them all (each recorded in [`RestoreOutcome::skipped_collisions`], not
+    /// [`RestoreOutcome::failures`]). This is the seam `tui`'s single `inquire` confirmation
+    /// prompt plugs into.
+    Confirm(&'a mut dyn FnMut(&[PathBuf]) -> bool),
+}
+
 /// Whether uid/gid restoration was attempted for this run (story 53). A whole-run decision,
 /// not a per-file one: `core` reads it from `RunContext.privilege` rather than trying and
 /// silently failing on every file when non-root. The actual up-front warning to the user is
@@ -60,6 +93,9 @@ pub struct RestoreOutcome {
     pub restored_paths: Vec<PathBuf>,
     /// Per-file failures that didn't abort the run (ADR-0002).
     pub failures: Vec<RestoreFailure>,
+    /// Targets left untouched because the [`CollisionPolicy`] declined to overwrite them —
+    /// deliberate skips, distinct from [`failures`](RestoreOutcome::failures) (issue #37).
+    pub skipped_collisions: Vec<SkippedCollision>,
     /// Whether uid/gid restoration was attempted this run (story 53).
     pub ownership: OwnershipOutcome,
     /// Where `reinstall.sh` (story 56) was written this run.
@@ -81,11 +117,14 @@ pub struct RestoreOutcome {
 /// is a typed error, not a panic) when the Backup's Manifest/Archive carry the `.age`
 /// suffix.
 ///
-/// `overwrite_existing` is story 54's on/off switch: when a target path already exists and
-/// this is `false`, that file is left untouched and lands in the returned failures as a
-/// collision rather than being silently clobbered; when `true`, it's overwritten. `core`
-/// doesn't build a per-file confirmation loop — that one flag is the whole seam; the actual
-/// "confirm once" prompt is `tui` territory (#29).
+/// `policy` (story 54 / issue #37) decides what happens at a collision — a target path that
+/// already exists where an Entry would land. [`CollisionPolicy::Overwrite`] clobbers every
+/// collision without asking (the `--overwrite` AFK path); [`CollisionPolicy::Confirm`] makes
+/// `core` pre-scan every collision and, only if there is at least one, hand the full list to
+/// the injected callback for a single yes/no. A declined collision leaves the target
+/// untouched and lands in [`RestoreOutcome::skipped_collisions`] — distinct from a real error
+/// in [`RestoreOutcome::failures`]. `core` never prompts: the `inquire` confirmation lives in
+/// `tui` (ADR-0001), behind that callback.
 ///
 /// Ownership (story 53) and `reinstall.sh` (story 56) both follow from `ctx`/`manifest`
 /// alone, so this is also where both happen: `ctx.privilege` decides whether `chown` is
@@ -97,7 +136,7 @@ pub fn restore(
     backup_dir: &Path,
     ctx: &RunContext,
     passphrase: Option<&SecretString>,
-    overwrite_existing: bool,
+    mut policy: CollisionPolicy<'_>,
 ) -> Result<RestoreOutcome, CoreError> {
     let (manifest_path, encrypted) = locate_manifest(backup_dir)?;
     let manifest_bytes = fs::read(&manifest_path).map_err(|source| CoreError::Io {
@@ -122,7 +161,16 @@ pub fn restore(
         });
     }
 
-    let (restored_paths, mut failures) = unpack_all(&archive_bytes, ctx, overwrite_existing)?;
+    // Pre-scan every collision and resolve the whole-run overwrite decision *before* any
+    // write, so the confirmation (when interactive) can name every colliding target in one
+    // "confirm once" prompt (issue #37) rather than pausing per file.
+    let overwrite = resolve_overwrite(&archive_bytes, ctx, &mut policy)?;
+
+    let UnpackReport {
+        restored_paths,
+        mut failures,
+        skipped_collisions,
+    } = unpack_all(&archive_bytes, ctx, overwrite)?;
 
     let ownership = match ctx.privilege {
         Privilege::Root => OwnershipOutcome::Restored,
@@ -142,6 +190,7 @@ pub fn restore(
         manifest,
         restored_paths,
         failures,
+        skipped_collisions,
         ownership,
         reinstall_script_path,
         package_counts: reinstall.counts,
@@ -173,16 +222,80 @@ fn locate_manifest(backup_dir: &Path) -> Result<(PathBuf, bool), CoreError> {
     Err(CoreError::ManifestMissing(backup_dir.to_path_buf()))
 }
 
+/// What [`unpack_all`] observed: files that landed, failures that didn't abort the run
+/// (ADR-0002), and collisions deliberately skipped because the [`CollisionPolicy`] declined
+/// to overwrite them (issue #37 keeps these last two apart).
+struct UnpackReport {
+    restored_paths: Vec<PathBuf>,
+    failures: Vec<RestoreFailure>,
+    skipped_collisions: Vec<SkippedCollision>,
+}
+
+/// Resolves the whole-run overwrite decision (issue #37's "confirm once") before any file is
+/// written. [`CollisionPolicy::Overwrite`] is an unconditional yes with no pre-scan;
+/// [`CollisionPolicy::Confirm`] pre-scans every collision and, only when the list is
+/// non-empty, calls the injected callback exactly once with the full list — so an interactive
+/// prompt can name everything at stake in a single confirmation.
+fn resolve_overwrite(
+    archive_bytes: &[u8],
+    ctx: &RunContext,
+    policy: &mut CollisionPolicy<'_>,
+) -> Result<bool, CoreError> {
+    match policy {
+        CollisionPolicy::Overwrite => Ok(true),
+        CollisionPolicy::Confirm(confirm) => {
+            let colliding = scan_collisions(archive_bytes, ctx)?;
+            if colliding.is_empty() {
+                Ok(false)
+            } else {
+                Ok(confirm(&colliding))
+            }
+        }
+    }
+}
+
+/// Resolves every Archive entry's restore target and returns those that already exist — the
+/// collision set the "confirm once" prompt names. A read-only dry pass: it resolves the same
+/// targets [`unpack_all`] will, but writes nothing. Per-entry resolution errors are ignored
+/// here (they surface as real failures in the actual unpack pass, so reporting them twice
+/// would double-count); only an Archive-level decode error, which would fail the real pass
+/// too, propagates.
+fn scan_collisions(archive_bytes: &[u8], ctx: &RunContext) -> Result<Vec<PathBuf>, CoreError> {
+    let zstd_decoder = zstd::stream::read::Decoder::new(archive_bytes)
+        .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
+    let mut tar_archive = tar::Archive::new(zstd_decoder);
+    let tar_entries = tar_archive
+        .entries()
+        .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
+
+    let mut colliding = Vec::new();
+    for tar_entry in tar_entries {
+        let Ok(tar_entry) = tar_entry else { continue };
+        let Ok(entry_path_in_tar) = tar_entry.path().map(std::borrow::Cow::into_owned) else {
+            continue;
+        };
+        let Ok(target) = resolve_target(&entry_path_in_tar, ctx) else {
+            continue;
+        };
+        if target.exists() {
+            colliding.push(target);
+        }
+    }
+    Ok(colliding)
+}
+
 /// Untars every entry in the decrypted, decompressed-on-the-fly Archive bytes, Re-rooting
 /// as it goes. Per ADR-0002, a per-file failure is collected and iteration continues.
 ///
-/// `overwrite_existing` gates story 54's collision check: a target that already exists is
-/// skipped (recorded as a collision failure, not overwritten) unless this is `true`.
+/// `overwrite` is the whole-run decision already resolved by [`resolve_overwrite`]: when
+/// `false`, a target that already exists is left untouched and recorded as a
+/// [`SkippedCollision`] (issue #37 — a deliberate skip, not a failure); when `true`, it's
+/// overwritten.
 fn unpack_all(
     archive_bytes: &[u8],
     ctx: &RunContext,
-    overwrite_existing: bool,
-) -> Result<(Vec<PathBuf>, Vec<RestoreFailure>), CoreError> {
+    overwrite: bool,
+) -> Result<UnpackReport, CoreError> {
     let zstd_decoder = zstd::stream::read::Decoder::new(archive_bytes)
         .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
     let mut tar_archive = tar::Archive::new(zstd_decoder);
@@ -192,6 +305,7 @@ fn unpack_all(
 
     let mut restored_paths = Vec::new();
     let mut failures = Vec::new();
+    let mut skipped_collisions = Vec::new();
 
     for tar_entry in tar_entries {
         let mut tar_entry = match tar_entry {
@@ -227,14 +341,13 @@ fn unpack_all(
             }
         };
 
-        // Story 54: the collision unit is the restore target path itself — distinct from
-        // the Backup-dir-name collision (#19/#27), which guards the *output* side of a
-        // backup run, not a restore target.
-        if target.exists() && !overwrite_existing {
-            failures.push(RestoreFailure {
+        // Story 54 / issue #37: the collision unit is the restore target path itself —
+        // distinct from the Backup-dir-name collision (#19/#27), which guards the *output*
+        // side of a backup run, not a restore target. A collision the overwrite decision
+        // declined is a deliberate skip (recorded apart from real failures), never clobbered.
+        if target.exists() && !overwrite {
+            skipped_collisions.push(SkippedCollision {
                 path: target.display().to_string(),
-                reason: "collision: target already exists and overwrite_existing was not set"
-                    .to_string(),
             });
             continue;
         }
@@ -261,7 +374,11 @@ fn unpack_all(
         }
     }
 
-    Ok((restored_paths, failures))
+    Ok(UnpackReport {
+        restored_paths,
+        failures,
+        skipped_collisions,
+    })
 }
 
 /// Attempts to set `target`'s ownership to the uid/gid recorded in `tar_entry`'s header — the
@@ -591,8 +708,11 @@ mod tests {
         let mut ctx = test_ctx(restore_home.clone());
         ctx.privilege = Privilege::Root;
 
-        let (restored_paths, failures) =
-            unpack_all(&archive_bytes, &ctx, false).expect("unpack_all must not abort the run");
+        let UnpackReport {
+            restored_paths,
+            failures,
+            ..
+        } = unpack_all(&archive_bytes, &ctx, false).expect("unpack_all must not abort the run");
 
         let target = restore_home.join("greeting.txt");
         assert_eq!(
@@ -615,6 +735,95 @@ mod tests {
                 .contains("ownership restore failed"),
             "failure reason should name it as an ownership failure: {}",
             ownership_failure.reason
+        );
+    }
+
+    /// Builds a minimal in-memory Archive (tar -> zstd) with one file entry per `(tar_path,
+    /// bytes)` pair, matching the on-disk shape `restore` consumes.
+    fn build_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for (path, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, &data[..])
+                    .expect("append tar entry");
+            }
+            builder.finish().expect("finish tar archive");
+        }
+        zstd::stream::encode_all(&tar_bytes[..], 0).expect("zstd-compress tar bytes")
+    }
+
+    /// Issue #37: the interactive collision decision must be a *single* "confirm once" — the
+    /// callback is invoked exactly once, with every colliding target at once, never per file.
+    #[test]
+    fn confirm_collision_callback_is_called_once_with_every_colliding_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).expect("create home");
+        // Two targets that already exist (collisions) plus one that doesn't.
+        fs::write(home.join("a.txt"), b"old a").expect("write a");
+        fs::write(home.join("b.txt"), b"old b").expect("write b");
+
+        let archive_bytes = build_archive(&[
+            ("home/a.txt", b"new a"),
+            ("home/b.txt", b"new b"),
+            ("home/c.txt", b"new c"),
+        ]);
+        let ctx = test_ctx(home.clone());
+
+        let mut calls: Vec<Vec<PathBuf>> = Vec::new();
+        let mut confirm = |collisions: &[PathBuf]| {
+            calls.push(collisions.to_vec());
+            false
+        };
+        let mut policy = CollisionPolicy::Confirm(&mut confirm);
+        let overwrite =
+            resolve_overwrite(&archive_bytes, &ctx, &mut policy).expect("resolve must not error");
+
+        assert!(!overwrite, "declining must resolve to no-overwrite");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the confirmation must be asked exactly once"
+        );
+        let mut seen = calls[0].clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![home.join("a.txt"), home.join("b.txt")],
+            "the single prompt must name every colliding target and only those"
+        );
+    }
+
+    /// Issue #37: with no collisions, the confirmation is never shown (nothing to ask about)
+    /// and the run proceeds — the interactive path must not nag on a clean restore root.
+    #[test]
+    fn confirm_collision_callback_is_not_called_when_there_are_no_collisions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).expect("create home");
+
+        let archive_bytes = build_archive(&[("home/fresh.txt", b"content")]);
+        let ctx = test_ctx(home);
+
+        let mut called = false;
+        let mut confirm = |_: &[PathBuf]| {
+            called = true;
+            true
+        };
+        let mut policy = CollisionPolicy::Confirm(&mut confirm);
+        let overwrite =
+            resolve_overwrite(&archive_bytes, &ctx, &mut policy).expect("resolve must not error");
+
+        assert!(!called, "no collisions means the prompt must never fire");
+        assert!(
+            !overwrite,
+            "with nothing to overwrite, the resolved decision is a harmless no-overwrite"
         );
     }
 

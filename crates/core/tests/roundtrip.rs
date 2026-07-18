@@ -30,7 +30,7 @@ use linux_backup_core::context::{Privilege, RunContext};
 use linux_backup_core::model::{Entry, EntryRoot, EntryType, SelectionModel};
 use linux_backup_core::packages::{CommandRunner, NoCommandRunner};
 use linux_backup_core::progress::{NoopProgress, Phase, Progress};
-use linux_backup_core::restore::RestoreOutcome;
+use linux_backup_core::restore::{CollisionPolicy, RestoreOutcome};
 use linux_backup_core::{catalog, crypto, manifest, scan, BackupOutcome, CoreError};
 
 /// Builds a synthetic `$HOME` under `root` containing:
@@ -112,15 +112,23 @@ fn run_backup(
 /// Runs `core::restore`. `passphrase` is `None` for an unencrypted Backup and
 /// `Some(&passphrase)` for an encrypted one — see `restore::restore`'s doc for why the
 /// signature carries it explicitly rather than reading it from the Backup dir itself
-/// (encryption is never persisted, per CONTEXT.md's Profile entry). `overwrite_existing` is
-/// story 54's collision switch — `false` here reflects every pre-#26 test's assumption of a
-/// clean restore root; `overwrite_collision_*` tests below exercise both values directly.
+/// (encryption is never persisted, per CONTEXT.md's Profile entry). Uses a
+/// [`CollisionPolicy::Confirm`] that declines any collision — every test on this helper
+/// assumes a clean restore root, so a surfaced collision (skipped, never clobbered) would
+/// show up as an unexpected `skipped_collisions` entry; the `restore_collision_*` tests
+/// exercise the overwrite and confirm/decline paths directly.
 fn run_restore(
     backup_dir: &Path,
     ctx: &RunContext,
     passphrase: Option<&SecretString>,
 ) -> Result<RestoreOutcome, CoreError> {
-    linux_backup_core::restore::restore(backup_dir, ctx, passphrase, false)
+    let mut decline = |_: &[PathBuf]| false;
+    linux_backup_core::restore::restore(
+        backup_dir,
+        ctx,
+        passphrase,
+        CollisionPolicy::Confirm(&mut decline),
+    )
 }
 
 /// Builds a synthetic `$HOME` under `root` exercising more than one Category at once
@@ -927,13 +935,14 @@ impl CommandRunner for FakeCommandRunner {
     }
 }
 
-/// Issue #26 / story 54: an existing file at a restore target must require the explicit
-/// `overwrite_existing` switch before being overwritten — this is `core`'s mechanism behind
-/// the single confirmation prompt (`tui`'s job, #29), distinct from the Backup-dir-name
-/// collision (#19/#27) which guards where the *Backup itself* is written, not a restore
-/// target.
+/// Issue #26/#37 / story 54: an existing file at a restore target must never be silently
+/// clobbered. `core` routes the decision through [`CollisionPolicy`] — declining a
+/// `Confirm` (or the equivalent, the user saying "no" to `tui`'s single prompt) leaves the
+/// file untouched and records it in `skipped_collisions` (a deliberate skip, *not* a
+/// failure), while `Confirm` accepting or `Overwrite` replaces it. Distinct from the
+/// Backup-dir-name collision (#19/#27), which guards where the *Backup itself* is written.
 #[test]
-fn restore_collision_requires_explicit_overwrite_flag() {
+fn restore_collision_is_skipped_on_decline_and_overwritten_on_confirm_or_flag() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = build_fixture_home(tmp.path());
     let output = tmp.path().join("output");
@@ -952,28 +961,50 @@ fn restore_collision_requires_explicit_overwrite_flag() {
 
     let restore_ctx = test_ctx(restore_home.clone(), output);
 
-    // Without the flag: the collision is reported, not silently clobbered, and the
-    // pre-existing content is left exactly as it was.
-    let outcome_no_overwrite =
-        linux_backup_core::restore::restore(&outcome.backup_dir, &restore_ctx, None, false)
-            .expect("restore should still complete despite one collision (ADR-0002)");
+    // Declining the confirmation: the collision is recorded as a skip (not a failure), the
+    // pre-existing content is left exactly as it was, and the prompt is asked once naming the
+    // colliding target.
+    let mut prompted_with: Vec<PathBuf> = Vec::new();
+    let mut decline = |collisions: &[PathBuf]| {
+        prompted_with.extend_from_slice(collisions);
+        false
+    };
+    let outcome_declined = linux_backup_core::restore::restore(
+        &outcome.backup_dir,
+        &restore_ctx,
+        None,
+        CollisionPolicy::Confirm(&mut decline),
+    )
+    .expect("restore should still complete despite one declined collision (ADR-0002)");
 
+    assert_eq!(
+        prompted_with,
+        vec![conflicting_path.clone()],
+        "the single confirmation must name exactly the colliding target"
+    );
     assert_eq!(
         fs::read(&conflicting_path).expect("conflicting file should still exist"),
         b"pre-existing content that must survive"
     );
-    let collision_failure = outcome_no_overwrite
-        .failures
-        .iter()
-        .find(|f| f.path == conflicting_path.display().to_string())
-        .expect("the collision must be reported as a failure");
     assert!(
-        collision_failure.reason.contains("collision"),
-        "failure reason should name the collision: {}",
-        collision_failure.reason
+        outcome_declined
+            .failures
+            .iter()
+            .all(|f| f.path != conflicting_path.display().to_string()),
+        "a declined collision must NOT be reported as a failure: {:?}",
+        outcome_declined.failures
     );
-    // The other fixture file, with no collision, must still land normally — one collision
-    // must not abort the rest of the run (ADR-0002).
+    assert_eq!(
+        outcome_declined
+            .skipped_collisions
+            .iter()
+            .map(|s| s.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![conflicting_path.display().to_string().as_str()],
+        "a declined collision must be reported as a skip"
+    );
+    // The other fixture file, with no collision, must still land normally — one declined
+    // collision must not abort the rest of the run (ADR-0002).
     assert_eq!(
         fs::read(restore_home.join(".oh-my-zsh/custom/plugins/my-plugin/my-plugin.plugin.zsh"))
             .expect("non-colliding file should still be restored"),
@@ -985,25 +1016,49 @@ fn restore_collision_requires_explicit_overwrite_flag() {
         .expect("original plugin file should exist")
     );
 
-    // With the flag: the same restore now overwrites the conflicting file with the
-    // Backup's content.
-    let outcome_with_overwrite =
-        linux_backup_core::restore::restore(&outcome.backup_dir, &restore_ctx, None, true)
-            .expect("restore with overwrite_existing should succeed");
-
+    // Confirming the overwrite: the same restore now replaces the conflicting file with the
+    // Backup's content, and nothing is left skipped.
+    let mut accept = |_: &[PathBuf]| true;
+    let outcome_confirmed = linux_backup_core::restore::restore(
+        &outcome.backup_dir,
+        &restore_ctx,
+        None,
+        CollisionPolicy::Confirm(&mut accept),
+    )
+    .expect("restore should succeed once the overwrite is confirmed");
     assert!(
-        outcome_with_overwrite
-            .failures
-            .iter()
-            .all(|f| !f.reason.contains("collision")),
-        "no collision should be reported once overwrite_existing is set: {:?}",
-        outcome_with_overwrite.failures
+        outcome_confirmed.skipped_collisions.is_empty(),
+        "confirming the overwrite must leave nothing skipped: {:?}",
+        outcome_confirmed.skipped_collisions
     );
     assert_eq!(
         fs::read(&conflicting_path).expect("file should exist after overwrite"),
         fs::read(tmp.path().join("home/.oh-my-zsh/custom/aliases.zsh"))
             .expect("original aliases.zsh should exist"),
-        "overwrite_existing=true must let the Backup's content replace the pre-existing file"
+        "a confirmed overwrite must let the Backup's content replace the pre-existing file"
+    );
+
+    // Restore the collision, then prove `--overwrite` (CollisionPolicy::Overwrite) clobbers
+    // non-interactively with no prompt callback at all — the unchanged AFK path.
+    fs::write(&conflicting_path, b"pre-existing content that must survive")
+        .expect("re-create the collision");
+    let outcome_flag = linux_backup_core::restore::restore(
+        &outcome.backup_dir,
+        &restore_ctx,
+        None,
+        CollisionPolicy::Overwrite,
+    )
+    .expect("restore with --overwrite should succeed");
+    assert!(
+        outcome_flag.skipped_collisions.is_empty(),
+        "--overwrite must leave nothing skipped: {:?}",
+        outcome_flag.skipped_collisions
+    );
+    assert_eq!(
+        fs::read(&conflicting_path).expect("file should exist after overwrite"),
+        fs::read(tmp.path().join("home/.oh-my-zsh/custom/aliases.zsh"))
+            .expect("original aliases.zsh should exist"),
+        "--overwrite must let the Backup's content replace the pre-existing file"
     );
 }
 

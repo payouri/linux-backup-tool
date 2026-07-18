@@ -16,11 +16,11 @@ pub struct RestoreArgs {
     pub backup_dir: PathBuf,
     /// Story 57: opt-in checksum re-verification pass after restore.
     pub verify: bool,
-    /// Story 54's CLI-scope stand-in for the interactive "confirm once" collision prompt
-    /// (that prompt itself is TUI wizard territory — see `restore_cmd`'s doc comment for
-    /// the full reasoning). Defaults to `false`: a collision is refused and reported as a
-    /// failure rather than silently overwritten, matching `core::restore`'s own safe
-    /// default when `overwrite_existing` is unset.
+    /// `--overwrite`: overwrite colliding restore targets non-interactively, for scripted/AFK
+    /// runs (issue #37). Defaults to `false`, in which case a collision instead triggers the
+    /// single interactive "confirm once" prompt in `restore_cmd` before anything is clobbered
+    /// — declining leaves the existing file untouched. Either way `core::restore` never
+    /// silently overwrites.
     pub overwrite: bool,
 }
 
