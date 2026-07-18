@@ -43,7 +43,9 @@ use crate::system;
 pub fn run() -> Result<()> {
     let ctx = system::build_run_context()?;
 
-    match run_screen(&ctx, 0)? {
+    // Standalone, there is no Profile to pre-fill a default Output location from — `None`
+    // leaves the cursor on `core`'s own preselection exactly as before.
+    match run_screen(&ctx, 0, None)? {
         Some(selection) => {
             println!("Output location bound: {}", selection.location.display());
             println!("Backup dir will be: {}", selection.backup_dir.display());
@@ -67,10 +69,18 @@ pub fn run() -> Result<()> {
 /// `selection_size` is the running Selection's uncompressed byte size threaded in for the
 /// non-blocking free-space warning (story 32) — 0 from the standalone subcommand (no
 /// Selection exists yet), the real `SelectionModel::total_size()` from the chained flow.
-/// Returns `Ok(None)` when the user cancels with Esc/Ctrl-C.
-pub fn run_screen(ctx: &RunContext, selection_size: u64) -> Result<Option<LocationSelection>> {
+///
+/// `default_location` pre-selects the returning run's last Output location (story 58): when it
+/// matches a bindable row (an attached drive or `$HOME`), the cursor opens parked on it;
+/// otherwise the screen falls back to `core`'s own preselection, so the no-Profile path is
+/// unchanged. Returns `Ok(None)` when the user cancels with Esc/Ctrl-C.
+pub fn run_screen(
+    ctx: &RunContext,
+    selection_size: u64,
+    default_location: Option<&Path>,
+) -> Result<Option<LocationSelection>> {
     let dir_name = backup_dir_name(ctx);
-    choose_location(ctx, &dir_name, selection_size)
+    choose_location(ctx, &dir_name, selection_size, default_location)
 }
 
 /// Drive the pick-list loop until the user binds a location (`Ok(Some)`) or cancels with
@@ -83,6 +93,7 @@ fn choose_location(
     ctx: &RunContext,
     dir_name: &str,
     selection_size: u64,
+    default_location: Option<&Path>,
 ) -> Result<Option<LocationSelection>> {
     // After a successful mount, the freshly-discovered drive should start selected on the
     // next redraw (criterion 3). We remember *where it mounted* rather than a row index,
@@ -98,9 +109,13 @@ fn choose_location(
         let pick = location::build_pick_list(&disks, &unmounted, &ctx.home, &ctx.user);
         let rows = location_menu_rows(&pick);
 
+        // Precedence: a just-mounted drive (a user action *this* screen) wins; else the
+        // Profile's remembered Output location (story 58) if it's still an attached bindable
+        // row; else `core`'s own preselection.
         let starting_cursor = park_on_mount_point
             .as_deref()
-            .and_then(|mp| cursor_for_mount_point(&rows, mp))
+            .and_then(|mp| cursor_for_bind_path(&rows, mp))
+            .or_else(|| default_location.and_then(|loc| cursor_for_bind_path(&rows, loc)))
             .or(pick.preselected)
             .unwrap_or(0);
         park_on_mount_point = None;
@@ -290,13 +305,14 @@ fn row_label(row: &LocationRow) -> String {
     }
 }
 
-/// Index of the rebuilt row that binds `mount_point` — used to park the cursor on a
-/// just-mounted drive after re-discovery (criterion 3). `None` if no row binds it (e.g. the
-/// drive vanished between mounting and re-discovery), leaving the caller to fall back to the
-/// pick-list's own preselection.
-fn cursor_for_mount_point(rows: &[LocationMenuRow], mount_point: &Path) -> Option<usize> {
+/// Index of the rebuilt row that binds `path` — used both to park the cursor on a just-mounted
+/// drive after re-discovery (criterion 3) and to pre-select the Profile's remembered Output
+/// location on a returning run (story 58). `None` if no row binds `path` (e.g. the drive
+/// vanished, or a remembered location that isn't attached), leaving the caller to fall back to
+/// the pick-list's own preselection.
+fn cursor_for_bind_path(rows: &[LocationMenuRow], path: &Path) -> Option<usize> {
     rows.iter()
-        .position(|row| matches!(&row.action, RowAction::Bind { path, .. } if path == mount_point))
+        .position(|row| matches!(&row.action, RowAction::Bind { path: bound, .. } if bound == path))
 }
 
 /// A user-facing one-liner for a failed mount (story 36), classified by `core` into an
@@ -513,7 +529,7 @@ mod tests {
             "youri",
         ));
 
-        let idx = cursor_for_mount_point(&rows, Path::new("/run/media/youri/USBSTICK"))
+        let idx = cursor_for_bind_path(&rows, Path::new("/run/media/youri/USBSTICK"))
             .expect("the freshly-mounted drive should have a bind row");
         assert!(matches!(
             &rows[idx].action,
@@ -522,11 +538,46 @@ mod tests {
     }
 
     #[test]
+    fn a_remembered_output_location_pre_selects_its_bind_row() {
+        // Story 58: a returning run whose saved Output location is still attached opens with
+        // the cursor parked on it — the same bind-row lookup mount-parking uses.
+        let home = PathBuf::from("/home/youri");
+        let rows = location_menu_rows(&location::build_pick_list(
+            &[
+                disk("/run/media/youri/USBSTICK", true),
+                disk("/mnt/data", false),
+            ],
+            &[],
+            &home,
+            "youri",
+        ));
+
+        let idx = cursor_for_bind_path(&rows, Path::new("/mnt/data"))
+            .expect("the remembered location should have a bind row");
+        assert!(matches!(
+            &rows[idx].action,
+            RowAction::Bind { path, .. } if path == Path::new("/mnt/data")
+        ));
+    }
+
+    #[test]
+    fn a_remembered_location_that_is_not_attached_has_no_bind_row() {
+        // The drive named last run isn't plugged in — the lookup returns None so the caller
+        // falls back to core's own preselection rather than a bogus cursor.
+        let home = PathBuf::from("/home/youri");
+        let rows = location_menu_rows(&location::build_pick_list(&[], &[], &home, "youri"));
+        assert_eq!(
+            cursor_for_bind_path(&rows, Path::new("/run/media/youri/GONE")),
+            None
+        );
+    }
+
+    #[test]
     fn cursor_lookup_returns_none_when_no_row_matches_the_mount_point() {
         let home = PathBuf::from("/home/youri");
         let rows = location_menu_rows(&location::build_pick_list(&[], &[], &home, "youri"));
         assert_eq!(
-            cursor_for_mount_point(&rows, Path::new("/run/media/youri/GONE")),
+            cursor_for_bind_path(&rows, Path::new("/run/media/youri/GONE")),
             None
         );
     }
@@ -542,7 +593,7 @@ mod tests {
             &home,
             "youri",
         ));
-        assert_eq!(cursor_for_mount_point(&rows, Path::new("/dev/sdb1")), None);
+        assert_eq!(cursor_for_bind_path(&rows, Path::new("/dev/sdb1")), None);
     }
 
     // --- mount-failure message formatting (story 36) ---------------------------------

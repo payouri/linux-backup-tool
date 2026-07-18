@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use inquire::{MultiSelect, Select};
 use linux_backup_core::crypto;
 use linux_backup_core::model::{Entry, SelectionModel};
+use linux_backup_core::profile::Profile;
 use linux_backup_core::scan::{self, CategoryScan};
 
 use linux_backup_core::RunContext;
@@ -36,7 +37,10 @@ use crate::system;
 
 pub fn run() -> Result<()> {
     let ctx = system::build_run_context()?;
-    let model = run_screen(&ctx)?;
+    // The standalone `select` subcommand has no Profile to pre-fill from — it always opens on
+    // Smart defaults, which is exactly the `None` path the chained wizard also takes on a first
+    // run.
+    let model = run_screen(&ctx, None)?;
 
     println!("Final selection:");
     println!("{}", footer_text(&model));
@@ -53,9 +57,17 @@ pub fn run() -> Result<()> {
 /// Returns a guaranteed-non-empty [`SelectionModel`]: story 42's empty-Selection bounce is
 /// enforced here — pressing Continue with nothing selected reprints the bounce message and
 /// re-loops rather than returning an empty Selection for a caller to have to re-check.
-pub fn run_screen(ctx: &RunContext) -> Result<SelectionModel> {
+///
+/// `profile` seeds the initial Selection on a returning run (story 58): `Some` reconstructs it
+/// from the saved Profile against this run's fresh scan; `None` opens on Smart defaults exactly
+/// as before. Either way the menu itself is always driven by the fresh `scan_taxonomy` result,
+/// so a Category that appeared or vanished since last run is reflected correctly.
+pub fn run_screen(ctx: &RunContext, profile: Option<&Profile>) -> Result<SelectionModel> {
     let scanned = scan::scan_taxonomy(ctx);
-    let mut model = SelectionModel::from_smart_defaults(&scanned);
+    let mut model = match profile {
+        Some(profile) => profile.to_selection_model(&scanned, &ctx.home),
+        None => SelectionModel::from_smart_defaults(&scanned),
+    };
 
     loop {
         println!();
@@ -81,15 +93,20 @@ pub fn run_screen(ctx: &RunContext) -> Result<SelectionModel> {
             MenuAction::Drill(index) => drill_down(&scanned[index], &mut model)?,
             MenuAction::Continue => {
                 if model.is_empty() {
-                    println!(
-                        "Selection is empty — check something, add a Custom path, or Esc to quit."
-                    );
+                    println!("{}", empty_selection_message());
                     continue;
                 }
                 return Ok(model);
             }
         }
     }
+}
+
+/// Story 42's empty-Selection bounce message — the exact wording issue #34 pins down ("check
+/// something / add a custom path / Esc to quit"). Extracted from the loop so the wording is
+/// unit-testable without driving the interactive screen.
+fn empty_selection_message() -> &'static str {
+    "Selection is empty — check something, add a Custom path, or Esc to quit."
 }
 
 /// Lets the user fine-tune one Category's individual Entries (CONTEXT.md's "Drill-down"):
@@ -321,6 +338,14 @@ mod tests {
             category,
             sensitive: false,
         }
+    }
+
+    #[test]
+    fn empty_selection_message_matches_the_specified_bounce_wording() {
+        let message = empty_selection_message();
+        assert!(message.contains("check something"));
+        assert!(message.contains("Custom path"));
+        assert!(message.contains("Esc to quit"));
     }
 
     #[test]

@@ -32,6 +32,7 @@ use linux_backup_core::crypto;
 use linux_backup_core::location::LocationSelection;
 use linux_backup_core::model::SelectionModel;
 use linux_backup_core::packages::SystemCommandRunner;
+use linux_backup_core::profile::{self, LoadedProfile, Profile};
 use linux_backup_core::progress::{Phase, Progress};
 use linux_backup_core::{backup, BackupOutcome, CoreError, RunContext};
 
@@ -40,17 +41,33 @@ use crate::{encryption_cmd, select_cmd, system, where_screen};
 pub fn run() -> Result<()> {
     let mut ctx = system::build_run_context()?;
 
+    // Profile (story 58-61): resolve its path in `tui` (ADR-0004: the `$XDG_CONFIG_HOME`/`$HOME`
+    // read stays out of `core`), then load it — a missing file is the first-run signal, not an
+    // error. Real filesystem existence drives prune's stale-path check.
+    let profile_path = system::profile_path()?;
+    let loaded = profile::load(&profile_path, |path| path.exists())
+        .with_context(|| format!("failed to load {}", profile_path.display()))?;
+
+    // Above the Selection screen: a first-run orientation block, or a returning-run banner
+    // with the "N pruned" line (stories 60/61).
+    println!("{}", intro_block(loaded.as_ref()));
+
     // WHAT: a guaranteed-non-empty Selection (the empty-Selection bounce lives inside the
-    // screen loop — story 42).
-    let selection = select_cmd::run_screen(&ctx)?;
+    // screen loop — story 42), pre-filled from the Profile on a returning run.
+    let selection = select_cmd::run_screen(&ctx, loaded.as_ref().map(|l| &l.profile))?;
 
     // Encryption: a no-op returning `Encryption::None` unless a Sensitive Selection triggers
-    // Auto-insist (story 17/18/19).
+    // Auto-insist (story 17/18/19). Re-decided fresh every run — never read from the Profile
+    // (story 24).
     let outcome = encryption_cmd::run(&selection)?;
 
     // WHERE: now that a Selection exists, thread its real size in for the free-space warning
-    // (#32 left this a documented `0` placeholder standalone).
-    let location = match where_screen::run_screen(&ctx, selection.total_size())? {
+    // (#32 left this a documented `0` placeholder standalone), plus the Profile's remembered
+    // Output location as the pre-selected default (story 58).
+    let default_location = loaded
+        .as_ref()
+        .and_then(|l| l.profile.output_location.as_deref());
+    let location = match where_screen::run_screen(&ctx, selection.total_size(), default_location)? {
         Some(location) => location,
         None => {
             println!("No Output location chosen — backup aborted. Nothing was written.");
@@ -85,7 +102,58 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    run_backup(&selection, &ctx, &outcome.encryption)
+    run_backup(&selection, &ctx, &outcome.encryption)?;
+
+    // Story 58: only a completed run writes the Profile. A save failure must not fail the
+    // backup — the Backup dir is already written and trustworthy — so it's reported and
+    // swallowed rather than propagated.
+    save_profile(&selection, &location, &profile_path);
+    Ok(())
+}
+
+/// Persists the final Selection + Output location so the next run pre-fills from it (story
+/// 58). Encryption state is deliberately not part of [`Profile`] (story 24). A write failure
+/// is warned about, never fatal — the backup itself already succeeded.
+fn save_profile(selection: &SelectionModel, location: &LocationSelection, profile_path: &Path) {
+    let profile = Profile::from_selection(selection, Some(location.location.clone()));
+    if let Err(err) = profile::save(&profile, profile_path) {
+        eprintln!(
+            "Warning: could not save {} ({err}); this run's selection wasn't remembered.",
+            profile_path.display()
+        );
+    }
+}
+
+/// The block shown above the WHAT screen: a first-run orientation (no Profile yet, story 61)
+/// or a returning-run banner carrying the "N pruned" line (stories 59/60). Pure so both the
+/// branch choice and the pruned-count wording are unit-testable without driving the wizard.
+fn intro_block(loaded: Option<&LoadedProfile>) -> String {
+    match loaded {
+        None => first_run_orientation(),
+        Some(loaded) => returning_banner(loaded.pruned),
+    }
+}
+
+/// The first-run orientation block (story 61): a short primer so a brand-new user understands
+/// what the WHAT screen is asking, without external docs.
+fn first_run_orientation() -> String {
+    [
+        "Welcome to linux-backup — this looks like your first run (no Profile yet).",
+        "",
+        "You'll pick WHAT to back up from named Categories (SSH, KDE Plasma, Shell, …), each",
+        "opening on a Smart default. Toggle a Category on/off, or drill into it to drop",
+        "individual heavy Entries. Sensitive Categories force encryption automatically.",
+        "Then you'll pick WHERE to write the backup and review before anything is written.",
+        "Your choices are remembered in a Profile and pre-filled next time.",
+    ]
+    .join("\n")
+}
+
+/// The returning-run banner (story 60): the "↺ Restored last selection · N pruned" line. The
+/// count is always shown (including 0) so the line reads the same shape every returning run,
+/// matching the issue's literal wording.
+fn returning_banner(pruned: usize) -> String {
+    format!("↺ Restored last selection · {pruned} pruned")
 }
 
 /// The forward-only REVIEW confirmation. Esc/Ctrl-C aborts (returns `false`) rather than
@@ -400,6 +468,37 @@ mod tests {
             vanished,
             packages,
         }
+    }
+
+    // --- intro_block / first-run vs returning ----------------------------------------
+
+    #[test]
+    fn intro_block_shows_the_orientation_when_there_is_no_profile() {
+        // First run (story 61): no LoadedProfile at all — orientation, never the returning
+        // banner.
+        let block = intro_block(None);
+        assert!(block.contains("first run"));
+        assert!(block.contains("WHAT"));
+        assert!(block.contains("WHERE"));
+        assert!(!block.contains("Restored last selection"));
+    }
+
+    #[test]
+    fn intro_block_shows_the_returning_banner_when_a_profile_loaded() {
+        let loaded = LoadedProfile {
+            profile: Profile::default(),
+            pruned: 0,
+        };
+        let block = intro_block(Some(&loaded));
+        assert!(block.contains("Restored last selection"));
+        assert!(!block.contains("first run"));
+    }
+
+    #[test]
+    fn returning_banner_reports_the_pruned_count() {
+        assert!(returning_banner(0).contains("0 pruned"));
+        assert!(returning_banner(3).contains("3 pruned"));
+        assert!(returning_banner(1).contains("Restored last selection"));
     }
 
     // --- category_breakdown ----------------------------------------------------------

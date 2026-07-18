@@ -59,6 +59,13 @@ pub enum CoreError {
     #[error("manifest (de)serialization failed: {0}")]
     Manifest(#[from] serde_json::Error),
 
+    /// Profile (de)serialization failed. Carried as a message rather than
+    /// `#[from]`-converted because `toml`'s serialize and deserialize errors are two distinct
+    /// types (and `Manifest` above already claims the one `From<serde_json::Error>` slot) —
+    /// one String-backed variant sidesteps both frictions.
+    #[error("profile (de)serialization failed: {0}")]
+    Profile(String),
+
     /// The Backup dir's Manifest could not be found or read during restore.
     #[error("manifest not found or unreadable in backup dir {0}")]
     ManifestMissing(PathBuf),

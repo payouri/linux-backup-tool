@@ -47,6 +47,19 @@ pub fn build_run_context() -> Result<RunContext> {
     })
 }
 
+/// Resolves the Profile file path: `$XDG_CONFIG_HOME/linux-backup/profile.toml`, falling back
+/// to `$HOME/.config/linux-backup/profile.toml` when `$XDG_CONFIG_HOME` is unset or empty.
+///
+/// Per ADR-0004 the `$XDG_CONFIG_HOME`/`$HOME` reads happen here in `tui`, never in `core` —
+/// `core::profile::{load,save}` take the already-resolved path.
+pub fn profile_path() -> Result<PathBuf> {
+    let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => real_home()?.join(".config"),
+    };
+    Ok(config_home.join("linux-backup").join("profile.toml"))
+}
+
 fn real_home() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
