@@ -522,6 +522,98 @@ mod tests {
         }
     }
 
+    /// Whether the real test process can actually `chown` to an arbitrary foreign uid —
+    /// true only when genuinely running as root (or with `CAP_CHOWN`). Guards
+    /// `ownership_restore_failure_is_reported_without_aborting_the_restore` against running
+    /// under a root CI container, where the real syscall this test depends on failing
+    /// (EPERM) would instead succeed.
+    fn process_can_chown_to_arbitrary_uid(probe_path: &Path) -> bool {
+        std::os::unix::fs::chown(probe_path, Some(65_534), Some(65_534)).is_ok()
+    }
+
+    /// Story 53 / issue #26: `ctx.privilege` is `core`'s own logical flag — per
+    /// `context.rs`'s doc comment, it "does not change what the real OS lets the real
+    /// process do". So a test process that isn't actually root, given a `RunContext` that
+    /// *claims* `Privilege::Root`, will hit a genuine `EPERM` from the real `chown(2)`
+    /// syscall when the tar header names a uid/gid foreign to it. This proves, against a
+    /// real failing syscall rather than a mocked one, that an ownership-restore failure
+    /// lands in `failures` (with the file's content still restored, per ADR-0002) instead
+    /// of aborting the run — the exact behavior `RestoreOutcome::ownership` /
+    /// `OwnershipOutcome::Restored` promise to a caller.
+    #[test]
+    fn ownership_restore_failure_is_reported_without_aborting_the_restore() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let restore_home = tmp.path().join("restored-home");
+        fs::create_dir_all(&restore_home).expect("create restore home");
+
+        if !process_can_chown_to_arbitrary_uid(&restore_home) {
+            // Expected path for a normal (non-root) dev/CI process: chown-to-foreign-uid
+            // genuinely fails, so the test below exercises the real EPERM branch.
+        } else {
+            // Running with real chown-anything privilege (e.g. a root CI container) would
+            // make the foreign-uid chown below succeed instead of failing, which isn't
+            // this test's scenario (story 53 is specifically about non-root's inability to
+            // chown) — skip rather than assert a false failure.
+            eprintln!(
+                "skipping ownership_restore_failure_is_reported_without_aborting_the_restore: \
+                 process can chown arbitrary uids (running as root?)"
+            );
+            return;
+        }
+
+        // Build a minimal in-memory Archive (tar -> zstd) with one entry whose header
+        // claims a uid/gid foreign to this process — `tar::Header::set_metadata` in
+        // `archive::build` normally captures the *real* file owner, but a Backup restored
+        // on a different machine/user (the whole point of Re-rooting) can easily carry a
+        // uid that doesn't exist locally, which is exactly the scenario this reproduces.
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let data = b"hello from a foreign owner";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_uid(65_534);
+            header.set_gid(65_534);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "home/greeting.txt", &data[..])
+                .expect("append tar entry");
+            builder.finish().expect("finish tar archive");
+        }
+        let archive_bytes =
+            zstd::stream::encode_all(&tar_bytes[..], 0).expect("zstd-compress tar bytes");
+
+        let mut ctx = test_ctx(restore_home.clone());
+        ctx.privilege = Privilege::Root;
+
+        let (restored_paths, failures) =
+            unpack_all(&archive_bytes, &ctx, false).expect("unpack_all must not abort the run");
+
+        let target = restore_home.join("greeting.txt");
+        assert_eq!(
+            restored_paths,
+            vec![target.clone()],
+            "content must still land even though ownership restore fails"
+        );
+        assert_eq!(
+            fs::read(&target).expect("restored file should be readable"),
+            b"hello from a foreign owner"
+        );
+
+        let ownership_failure = failures
+            .iter()
+            .find(|f| f.path == target.display().to_string())
+            .expect("the chown failure must be reported in the per-file failure report");
+        assert!(
+            ownership_failure
+                .reason
+                .contains("ownership restore failed"),
+            "failure reason should name it as an ownership failure: {}",
+            ownership_failure.reason
+        );
+    }
+
     #[test]
     fn build_reinstall_script_is_unpinned_and_never_emits_captured_versions() {
         let mut manifest = empty_manifest();
