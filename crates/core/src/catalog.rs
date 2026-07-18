@@ -265,9 +265,8 @@ pub fn resolve_category<'a>(
 
 /// Collapses `.` and `..` components purely lexically, without touching the filesystem —
 /// no ambient reads (ADR-0004), no requirement that the path exist, and no CWD dependency.
-/// A `..` pops the preceding normal component; at (or above) a filesystem root it is dropped,
-/// since there is nothing above the root; in a relative path with no component left to pop it
-/// is retained (leading `..` is a genuine "up" the caller can't discard).
+/// A `..` at (or above) a filesystem root is dropped, since there is nothing above the root; a
+/// leading `..` with nothing left to pop is retained, since it is a genuine "up" we can't discard.
 ///
 /// This is deliberately *not* `std::fs::canonicalize`: symlinks are left unresolved, so a path
 /// that lexically stays under `home` is treated as under `home` even if one of its parents is a
@@ -531,5 +530,23 @@ mod tests {
         let home = PathBuf::from("/home/alice");
         let escape = PathBuf::from("/home/alice/../../etc/x");
         assert!(validate_custom_path(&escape, &home, Privilege::Root).is_ok());
+    }
+
+    #[test]
+    fn non_root_sibling_prefix_is_rejected() {
+        let home = PathBuf::from("/home/alice");
+
+        // A sibling whose name merely shares a string prefix with $HOME must not be mistaken
+        // for a path under it — `starts_with` is component-wise, and this locks that in.
+        for sibling in ["/home/alicia", "/home/alice-evil", "/home/alice2/secret"] {
+            let candidate = PathBuf::from(sibling);
+            assert!(
+                matches!(
+                    validate_custom_path(&candidate, &home, Privilege::NonRoot),
+                    Err(CoreError::CustomPathOutsideHome { .. })
+                ),
+                "expected {sibling} to be rejected as a $HOME sibling, not under it"
+            );
+        }
     }
 }
