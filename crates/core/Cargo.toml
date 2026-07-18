@@ -20,7 +20,7 @@ serde_json = "1.0.145"
 # the exact crate issue #17's Crate choices ("`toml` for the Profile") and docs/research/
 # rust-crates.md's serde-first pattern call for. `serde` (already a dep) provides the derive;
 # this adds only the TOML format layer.
-toml = "0.8"
+toml = "1.1"
 sysinfo = { version = "0.39", default-features = false, features = ["disk"] }
 # Reference Rust impl of the age format (str4d, the spec author); passphrase (scrypt)
 # whole-stream encryption via `Encryptor::with_user_passphrase`, no key management needed
