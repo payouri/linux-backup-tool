@@ -264,12 +264,18 @@ fn unpack_all(
     Ok((restored_paths, failures))
 }
 
-/// Attempts to `chown` `target` to the uid/gid recorded in `tar_entry`'s header — the
+/// Attempts to set `target`'s ownership to the uid/gid recorded in `tar_entry`'s header — the
 /// Archive's own tar stream, not the Manifest (CONTEXT.md: "No POSIX metadata table — tar
 /// owns mode/uid/gid/symlink", so the tar header is the one source of truth for this,
 /// deliberately not duplicated in the Manifest). A failure here (e.g. `EPERM` if the real
 /// process privilege doesn't actually match `ctx.privilege`) is the caller's to fold into
 /// the per-file failure report — it must never abort the run (ADR-0002).
+///
+/// Uses `lchown`, not `chown`: for a restored symlink Entry (issue #36) the ownership must
+/// land on the link itself, never be followed to its target — `chown` would dereference the
+/// link and either re-own an unrelated file or spuriously fail ENOENT on a dangling link.
+/// `lchown` is identical to `chown` for a non-symlink target, so regular files/directories
+/// are unaffected.
 fn chown_to_tar_owner<R: std::io::Read>(
     tar_entry: &tar::Entry<'_, R>,
     target: &Path,
@@ -279,7 +285,7 @@ fn chown_to_tar_owner<R: std::io::Read>(
     // Linux uid/gid are 32-bit; tar's accessor widens them to u64, so the domain can't exceed u32.
     #[allow(clippy::cast_possible_truncation)]
     let (uid, gid) = (uid as u32, gid as u32);
-    std::os::unix::fs::chown(target, Some(uid), Some(gid)).map_err(|e| e.to_string())
+    std::os::unix::fs::lchown(target, Some(uid), Some(gid)).map_err(|e| e.to_string())
 }
 
 /// Resolves a tar-internal path (`home/...` or `absolute/...`) to a real target path.

@@ -57,7 +57,7 @@ impl EntryType {
     /// [`EntryType::File`]: `archive::build`'s per-Entry read is the single authoritative
     /// place a genuine read failure or a benign Vanish is decided (ADR-0002), never this
     /// classifier.
-    pub fn classify(path: &Path) -> Self {
+    pub(crate) fn classify(path: &Path) -> Self {
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => Self::Symlink,
             Ok(meta) if meta.is_dir() => Self::Directory,
