@@ -870,7 +870,7 @@ fn kde_plasma_drill_down_deselection_excludes_exactly_those_entries_from_the_rou
     let restore_home = tmp.path().join("restored-home");
     let restore_ctx = test_ctx(restore_home.clone(), output.clone());
     let restore_outcome =
-        run_restore(&outcome.backup_dir, &restore_ctx).expect("restore should succeed");
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
 
     assert!(
         restore_outcome.failures.is_empty(),
