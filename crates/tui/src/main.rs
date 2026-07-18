@@ -18,6 +18,8 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))]
 
 mod cli;
+mod encrypt_demo;
+mod encryption_cmd;
 mod restore_cmd;
 mod select_cmd;
 mod system;
@@ -42,5 +44,6 @@ fn run() -> anyhow::Result<()> {
         cli::Command::Restore(restore_args) => restore_cmd::run(&restore_args),
         cli::Command::Select => select_cmd::run(),
         cli::Command::Where => where_screen::run(),
+        cli::Command::EncryptDemo => encrypt_demo::run(),
     }
 }

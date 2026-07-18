@@ -38,9 +38,14 @@ pub enum Command {
     /// landing spot as `Select`: runnable and verifiable against a real account's drives
     /// ahead of `backup` chaining it into the full wizard (#33).
     Where,
+    /// A throwaway harness (#31) that runs the encryption screen end-to-end against a
+    /// synthetic Selection and a temp Output location — the interim standalone entry point
+    /// for the "produces a real encrypted Backup dir" acceptance criterion, to be removed
+    /// when #33 wires the encryption step into the real WHAT → encryption → WHERE → RUN chain.
+    EncryptDemo,
 }
 
-const USAGE: &str = "usage: linux-backup restore <dir> [--verify] [--overwrite]\n       linux-backup select\n       linux-backup where";
+const USAGE: &str = "usage: linux-backup restore <dir> [--verify] [--overwrite]\n       linux-backup select\n       linux-backup where\n       linux-backup encrypt-demo";
 
 /// Parses a full argv (excluding argv[0], the program name) into a [`Command`].
 pub fn parse_args<I, S>(args: I) -> Result<Command, String>
@@ -57,6 +62,7 @@ where
         "restore" => parse_restore_args(iter),
         "select" => parse_select_args(iter),
         "where" => parse_no_arg_command(iter, Command::Where),
+        "encrypt-demo" => parse_no_arg_command(iter, Command::EncryptDemo),
         other => Err(format!("unknown command '{other}'\n{USAGE}")),
     }
 }
@@ -195,6 +201,18 @@ mod tests {
     #[test]
     fn rejects_where_with_an_unexpected_argument() {
         let err = parse_args(["where", "extra"]).expect_err("should reject");
+        assert!(err.contains("unexpected argument 'extra'"));
+    }
+
+    #[test]
+    fn parses_bare_encrypt_demo_with_no_arguments() {
+        let parsed = parse_args(["encrypt-demo"]).expect("should parse");
+        assert_eq!(parsed, Command::EncryptDemo);
+    }
+
+    #[test]
+    fn rejects_encrypt_demo_with_an_unexpected_argument() {
+        let err = parse_args(["encrypt-demo", "extra"]).expect_err("should reject");
         assert!(err.contains("unexpected argument 'extra'"));
     }
 }
