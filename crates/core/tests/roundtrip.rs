@@ -15,6 +15,10 @@
 //! it — see that test's doc), proving the full ten-Category taxonomy's precedence + Smart
 //! defaults + Hide-empty compose correctly through the same backup/restore seam.
 
+// This crate is only ever built as a test binary (`--test`), so this allow is unconditional
+// — AGENTS.md exempts test code from the no-unwrap/expect/panic rule.
+#![allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};

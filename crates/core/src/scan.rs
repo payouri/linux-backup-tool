@@ -54,6 +54,30 @@ pub struct CategoryScan {
     pub entries: Vec<Entry>,
 }
 
+impl CategoryScan {
+    /// The sum of every one of this Category's discovered Entries' current on-disk size in
+    /// bytes — independent of whether any of them are actually part of the active Selection
+    /// yet (contrast `SelectionModel::total_size`, which only sums what's actually
+    /// selected). This is the per-Category size the WHAT screen (#30) shows next to a
+    /// Category's checkbox, so a user can weigh a Category before deciding to turn it on.
+    pub fn total_size(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter_map(|e| std::fs::metadata(&e.absolute_path).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// Whether this Category should carry the WHAT screen's 🔒 annotation (#30): true if
+    /// the Category itself is blanket-Sensitive, or if any of its discovered Entries
+    /// individually is (a per-entry tag or Safety-net match, both already resolved into
+    /// `Entry::sensitive` by `scan_category`/`scan_taxonomy`) — so a Category that isn't
+    /// itself Sensitive but happens to contain a flagged Entry still gets called out.
+    pub fn is_sensitive(&self) -> bool {
+        self.category.sensitive || self.entries.iter().any(|e| e.sensitive)
+    }
+}
+
 /// Scans the full ten-Category taxonomy under `ctx.home`, resolving precedence across any
 /// overlapping allowlists and applying Hide-empty.
 ///
@@ -101,6 +125,9 @@ pub fn scan_taxonomy(ctx: &RunContext) -> Vec<CategoryScan> {
             // silently attributed to one of the ten here.
             continue;
         };
+        // ADR-0002: backup fails fast on bugs rather than silently dropping data; `owner`
+        // came from `categories` above, so this can only panic on a real invariant break.
+        #[allow(clippy::disallowed_methods)]
         let owner_index = categories
             .iter()
             .position(|c| c.name == owner.name)
@@ -410,5 +437,69 @@ mod tests {
             "the per-entry tag on .mcp-auth must flag this Entry Sensitive even though \
              neither the Category nor the Safety-net scan would"
         );
+    }
+
+    #[test]
+    fn category_scan_total_size_sums_every_discovered_entry_regardless_of_selection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ssh_dir = tmp.path().join(".ssh");
+        fs::create_dir_all(&ssh_dir).expect("create .ssh dir");
+        fs::write(ssh_dir.join("id_ed25519"), vec![0u8; 100]).expect("write key");
+        fs::write(ssh_dir.join("config"), vec![0u8; 50]).expect("write config");
+
+        let ctx = test_ctx(tmp.path().to_path_buf());
+        let entries = scan_category(&catalog::SSH, &ctx);
+        let scan = CategoryScan {
+            category: catalog::SSH,
+            entries,
+        };
+
+        assert_eq!(scan.total_size(), 150);
+    }
+
+    #[test]
+    fn category_scan_is_sensitive_when_the_category_itself_is_sensitive() {
+        let scan = CategoryScan {
+            category: catalog::SSH,
+            entries: Vec::new(),
+        };
+        assert!(scan.is_sensitive());
+    }
+
+    #[test]
+    fn category_scan_is_sensitive_when_a_non_sensitive_category_has_a_flagged_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mcp_auth_dir = tmp.path().join(".mcp-auth");
+        fs::create_dir_all(&mcp_auth_dir).expect("create .mcp-auth dir");
+        fs::write(mcp_auth_dir.join("session.json"), b"{}\n").expect("write session.json");
+
+        let ctx = test_ctx(tmp.path().to_path_buf());
+        let entries = scan_category(&catalog::AGENTS, &ctx);
+        let scan = CategoryScan {
+            category: catalog::AGENTS,
+            entries,
+        };
+
+        assert!(
+            scan.is_sensitive(),
+            "AGENTS itself isn't Sensitive, but its .mcp-auth Entry is"
+        );
+    }
+
+    #[test]
+    fn category_scan_is_not_sensitive_with_a_plain_category_and_no_flagged_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let custom_dir = tmp.path().join(".oh-my-zsh/custom");
+        fs::create_dir_all(&custom_dir).expect("create custom dir");
+        fs::write(custom_dir.join("aliases.zsh"), b"alias ll='ls -la'\n").expect("write aliases");
+
+        let ctx = test_ctx(tmp.path().to_path_buf());
+        let entries = scan_category(&catalog::SHELL, &ctx);
+        let scan = CategoryScan {
+            category: catalog::SHELL,
+            entries,
+        };
+
+        assert!(!scan.is_sensitive());
     }
 }

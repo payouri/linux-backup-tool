@@ -170,6 +170,74 @@ impl SelectionModel {
         self.deselected.contains(relative_path)
     }
 
+    /// Category-level toggle ON (the WHAT screen's Category checkbox, #30): adds every
+    /// Entry from `scan` into the Selection. An Entry already active is left untouched; one
+    /// already `withheld` (a previous Drill-down deselection) is moved back to active via
+    /// `reselect_entry` rather than duplicated — this is also what lets a Drill-down UI call
+    /// this unconditionally before listing a Category's Entries, so `reselect_entry`/
+    /// `deselect_entry` always have something to act on even for a Category whose Smart
+    /// default was OFF and so has never been part of this model at all. Only a brand-new
+    /// Entry (never seen by this model) is pushed straight into the active Selection.
+    ///
+    /// Membership is checked via a `HashSet` snapshot taken once up front, not a
+    /// `Vec::iter().any(...)` per Entry: the naive per-Entry linear scan is O(current
+    /// Selection size) each time, which turns loading a large Category into this model into
+    /// an O(n²) scan — measured at ~88s for KDE Plasma's ~40,000-file icon theme (a real
+    /// Category size, story 13) during #30's manual verification against a real account.
+    pub fn select_category(&mut self, scan: &CategoryScan) {
+        let active: BTreeSet<&Path> = self
+            .entries
+            .iter()
+            .map(|e| e.relative_path.as_path())
+            .collect();
+        let withheld: BTreeSet<&Path> = self
+            .withheld
+            .iter()
+            .map(|e| e.relative_path.as_path())
+            .collect();
+
+        let mut to_reselect = Vec::new();
+        let mut to_push = Vec::new();
+        for entry in &scan.entries {
+            let path = entry.relative_path.as_path();
+            if active.contains(path) {
+                continue;
+            }
+            if withheld.contains(path) {
+                to_reselect.push(entry.relative_path.clone());
+            } else {
+                to_push.push(entry.clone());
+            }
+        }
+
+        for path in to_reselect {
+            self.reselect_entry(&path);
+        }
+        self.entries.extend(to_push);
+    }
+
+    /// Category-level toggle OFF: removes every Entry belonging to `category_name` from the
+    /// Selection entirely — both active and `withheld` — rather than only clearing active
+    /// ones. Toggling back on (`select_category`) then re-adds the Category's full scanned
+    /// Entry set fresh: the simplest checkbox semantics to reason about (an unchecked box
+    /// carries no partial memory), even though it means a Drill-down deselection doesn't
+    /// survive a full off/on cycle within the same run — an accepted simplification for the
+    /// alpha's first Selection screen (#30); re-drilling after re-checking is cheap.
+    pub fn deselect_category(&mut self, category_name: &str) {
+        self.entries.retain(|e| e.category != category_name);
+
+        let removed_withheld: Vec<PathBuf> = self
+            .withheld
+            .iter()
+            .filter(|e| e.category == category_name)
+            .map(|e| e.relative_path.clone())
+            .collect();
+        self.withheld.retain(|e| e.category != category_name);
+        for path in removed_withheld {
+            self.deselected.remove(&path);
+        }
+    }
+
     /// The relative paths of every currently-deselected Entry — the plain, storable shape
     /// #34 (Profile persistence) needs to remember Drill-down deselections across runs
     /// (CONTEXT.md's "Drill-down": "Deselections persist in the Profile").
@@ -510,5 +578,140 @@ mod tests {
         selection.deselect_entry(Path::new("Documents/huge.bin"));
 
         assert!(selection.warnings().is_empty());
+    }
+
+    #[test]
+    fn select_category_activates_every_entry_of_a_category_never_seen_before() {
+        // Simulates the WHAT screen (#30) toggling ON a Category whose Smart default was
+        // OFF (e.g. User data): the model starts with zero knowledge of its Entries at all.
+        let mut selection =
+            SelectionModel::new(vec![entry(catalog::SHELL.name, false, "aliases.zsh")]);
+        let scan = CategoryScan {
+            category: catalog::USER_DATA,
+            entries: vec![
+                entry(catalog::USER_DATA.name, false, "Documents/report.pdf"),
+                entry(catalog::USER_DATA.name, false, "Downloads/file.zip"),
+            ],
+        };
+
+        selection.select_category(&scan);
+
+        assert_eq!(selection.entries().len(), 3);
+        assert!(selection
+            .entries()
+            .iter()
+            .any(|e| e.relative_path == Path::new("Documents/report.pdf")));
+        assert!(selection
+            .entries()
+            .iter()
+            .any(|e| e.relative_path == Path::new("Downloads/file.zip")));
+    }
+
+    #[test]
+    fn select_category_is_idempotent_and_does_not_duplicate_already_active_entries() {
+        let entries = vec![entry(catalog::SHELL.name, false, "aliases.zsh")];
+        let scan = CategoryScan {
+            category: catalog::SHELL,
+            entries: entries.clone(),
+        };
+        let mut selection = SelectionModel::new(entries);
+
+        selection.select_category(&scan);
+
+        assert_eq!(selection.entries().len(), 1);
+    }
+
+    #[test]
+    fn select_category_reselects_a_previously_withheld_entry_rather_than_duplicating_it() {
+        let scan = CategoryScan {
+            category: catalog::KDE_PLASMA,
+            entries: vec![
+                entry(catalog::KDE_PLASMA.name, false, ".config/kwinrc"),
+                entry(
+                    catalog::KDE_PLASMA.name,
+                    false,
+                    ".local/share/icons/heavy.svg",
+                ),
+            ],
+        };
+        let mut selection = SelectionModel::new(scan.entries.clone());
+        selection.deselect_entry(Path::new(".local/share/icons/heavy.svg"));
+        assert_eq!(selection.entries().len(), 1);
+
+        // A Drill-down UI calls `select_category` unconditionally before listing Entries
+        // (module doc) — it must restore the withheld one to active, not push a duplicate.
+        selection.select_category(&scan);
+
+        assert_eq!(selection.entries().len(), 2);
+        assert!(!selection.is_deselected(Path::new(".local/share/icons/heavy.svg")));
+    }
+
+    #[test]
+    fn deselect_category_removes_both_active_and_withheld_entries_for_that_category_only() {
+        let mut selection = SelectionModel::new(vec![
+            entry(catalog::KDE_PLASMA.name, false, ".config/kwinrc"),
+            entry(
+                catalog::KDE_PLASMA.name,
+                false,
+                ".local/share/icons/heavy.svg",
+            ),
+            entry(catalog::SHELL.name, false, "aliases.zsh"),
+        ]);
+        selection.deselect_entry(Path::new(".local/share/icons/heavy.svg"));
+
+        selection.deselect_category(catalog::KDE_PLASMA.name);
+
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(selection.entries()[0].category, catalog::SHELL.name);
+        // The Category's own Drill-down deselection bookkeeping must be cleared too, not
+        // left lingering as a stale withheld path with no way back to active.
+        assert!(selection.deselected_paths().is_empty());
+        assert!(selection
+            .entries_in_category(catalog::KDE_PLASMA.name)
+            .is_empty());
+    }
+
+    #[test]
+    fn toggling_a_category_off_then_on_restores_its_full_scanned_entry_set() {
+        let scan = CategoryScan {
+            category: catalog::SHELL,
+            entries: vec![entry(catalog::SHELL.name, false, "aliases.zsh")],
+        };
+        let mut selection = SelectionModel::new(scan.entries.clone());
+
+        selection.deselect_category(catalog::SHELL.name);
+        assert!(selection.is_empty());
+
+        selection.select_category(&scan);
+        assert_eq!(selection.entries().len(), 1);
+    }
+
+    #[test]
+    fn select_category_stays_fast_for_a_realistically_large_category() {
+        // Regression test for a real bug found during #30's manual verification: KDE
+        // Plasma's icon theme alone produced ~40,000 real Entries on the author's account,
+        // and the original `Vec::iter().any(...)`-per-Entry membership check made loading
+        // that many Entries an O(n^2) scan — measured at ~88s in practice. This pins the fix
+        // (a `BTreeSet` snapshot for O(log n) membership) down with a generous, non-flaky
+        // time budget: comfortably above what the fixed version needs (single-digit
+        // milliseconds), but far below what the O(n^2) version would take at this size.
+        let entries: Vec<Entry> = (0..20_000)
+            .map(|i| entry(catalog::KDE_PLASMA.name, false, &format!("icon{i}.svg")))
+            .collect();
+        let scan = CategoryScan {
+            category: catalog::KDE_PLASMA,
+            entries,
+        };
+        let mut selection = SelectionModel::new(Vec::new());
+
+        let started = std::time::Instant::now();
+        selection.select_category(&scan);
+        let elapsed = started.elapsed();
+
+        assert_eq!(selection.entries().len(), 20_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "select_category took {elapsed:?} for 20,000 Entries — the O(n^2) regression is back"
+        );
     }
 }

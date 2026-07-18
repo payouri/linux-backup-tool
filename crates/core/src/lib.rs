@@ -13,6 +13,9 @@
 // probe (skipping a permission test under CI-as-root) is test infrastructure, not domain
 // logic, and `forbid` — unlike `deny` — can't be locally allowed back in for it.
 #![cfg_attr(not(test), forbid(unsafe_code))]
+// AGENTS.md exempts test code from the no-unwrap/expect/panic rule; `#[cfg(test)]` modules
+// compile under `--cfg test`, so this allow only ever applies to them.
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))]
 
 pub mod archive;
 pub mod catalog;

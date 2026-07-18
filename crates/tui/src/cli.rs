@@ -24,15 +24,20 @@ pub struct RestoreArgs {
     pub overwrite: bool,
 }
 
-/// The one supported top-level command shape today. An enum (rather than returning
+/// The supported top-level command shapes today. An enum (rather than returning
 /// `RestoreArgs` directly from `parse_args`) so a future `backup` subcommand has somewhere
-/// to land without reshaping this function's return type.
+/// to land without reshaping this function's return type. `Select` (#30) is exactly that
+/// kind of interim landing spot: it's the WHAT screen standing alone as its own subcommand
+/// so it can be run and verified against a real account ahead of `backup` wiring it into
+/// the full WHAT -> encryption -> WHERE -> REVIEW -> RUN wizard (#31/#32/…).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Restore(RestoreArgs),
+    Select,
 }
 
-const USAGE: &str = "usage: linux-backup restore <dir> [--verify] [--overwrite]";
+const USAGE: &str =
+    "usage: linux-backup restore <dir> [--verify] [--overwrite]\n       linux-backup select";
 
 /// Parses a full argv (excluding argv[0], the program name) into a [`Command`].
 pub fn parse_args<I, S>(args: I) -> Result<Command, String>
@@ -47,8 +52,22 @@ where
 
     match subcommand.as_ref() {
         "restore" => parse_restore_args(iter),
+        "select" => parse_select_args(iter),
         other => Err(format!("unknown command '{other}'\n{USAGE}")),
     }
+}
+
+/// `select` takes no arguments — any extra token is rejected the same way an unexpected
+/// second positional argument is for `restore`, rather than silently ignored.
+fn parse_select_args<I, S>(rest: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    if let Some(extra) = rest.into_iter().next() {
+        return Err(format!("unexpected argument '{}'\n{USAGE}", extra.as_ref()));
+    }
+    Ok(Command::Select)
 }
 
 fn parse_restore_args<I, S>(rest: I) -> Result<Command, String>
@@ -136,5 +155,17 @@ mod tests {
     fn rejects_restore_with_a_second_positional_argument() {
         let err = parse_args(["restore", "/tmp/a", "/tmp/b"]).expect_err("should reject");
         assert!(err.contains("unexpected argument '/tmp/b'"));
+    }
+
+    #[test]
+    fn parses_bare_select_with_no_arguments() {
+        let parsed = parse_args(["select"]).expect("should parse");
+        assert_eq!(parsed, Command::Select);
+    }
+
+    #[test]
+    fn rejects_select_with_an_unexpected_argument() {
+        let err = parse_args(["select", "extra"]).expect_err("should reject");
+        assert!(err.contains("unexpected argument 'extra'"));
     }
 }

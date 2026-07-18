@@ -20,12 +20,12 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use linux_backup_core::{Privilege, RunContext};
 
-/// Builds a [`RunContext`] from the real machine for a restore run.
+/// Builds a [`RunContext`] from the real machine for a `restore` or `select` run.
 ///
-/// `output_location` is set to `home`: restore never creates a new Backup dir (that's
-/// `backup`'s concern), so nothing in `core::restore` reads this field — it's populated
-/// with a harmless, always-available value rather than left to construct a `RunContext`
-/// with a dummy/placeholder path.
+/// `output_location` is set to `home`: neither command creates a new Backup dir yet (that's
+/// `backup`'s WHERE step, #32), so nothing either reads this field for today's call sites —
+/// it's populated with a harmless, always-available value rather than left to construct a
+/// `RunContext` with a dummy/placeholder path.
 pub fn build_run_context() -> Result<RunContext> {
     let home = real_home()?;
     let uid = real_uid();
