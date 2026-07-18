@@ -9,7 +9,7 @@
 //! so "earliest match wins" in [`resolve_category`] *is* the precedence rule — there's no
 //! separate ranking table to keep in sync.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use crate::context::Privilege;
 use crate::error::CoreError;
@@ -263,9 +263,41 @@ pub fn resolve_category<'a>(
         .find(|(_, category)| category_matches(category, relative_path))
 }
 
+/// Collapses `.` and `..` components purely lexically, without touching the filesystem —
+/// no ambient reads (ADR-0004), no requirement that the path exist, and no CWD dependency.
+/// A `..` pops the preceding normal component; at (or above) a filesystem root it is dropped,
+/// since there is nothing above the root; in a relative path with no component left to pop it
+/// is retained (leading `..` is a genuine "up" the caller can't discard).
+///
+/// This is deliberately *not* `std::fs::canonicalize`: symlinks are left unresolved, so a path
+/// that lexically stays under `home` is treated as under `home` even if one of its parents is a
+/// symlink pointing elsewhere. Resolving that would require reading the real filesystem, which
+/// `core` must not do; the residual symlink-escape is out of scope here (see #44).
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normalized.push(component),
+            },
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
 /// Validates a Custom path against the root/non-root constraint (stories 10/11): root may
 /// add any filesystem path; non-root is constrained to under `home`. `privilege` is always
 /// the injected [`Privilege`] (ADR-0004) — this function never reads the real euid itself.
+///
+/// The non-root check normalizes `candidate` lexically first (#44): without it a traversal
+/// such as `~/../etc/passwd` lexically "starts with" `home` and slips through before its `..`
+/// components walk back out.
 pub fn validate_custom_path(
     candidate: &Path,
     home: &Path,
@@ -274,7 +306,7 @@ pub fn validate_custom_path(
     match privilege {
         Privilege::Root => Ok(()),
         Privilege::NonRoot => {
-            if candidate.starts_with(home) {
+            if lexically_normalize(candidate).starts_with(lexically_normalize(home)) {
                 Ok(())
             } else {
                 Err(CoreError::CustomPathOutsideHome {
@@ -448,5 +480,56 @@ mod tests {
             validate_custom_path(&outside, &home, Privilege::NonRoot),
             Err(CoreError::CustomPathOutsideHome { .. })
         ));
+    }
+
+    #[test]
+    fn non_root_traversal_escape_is_rejected() {
+        let home = PathBuf::from("/home/alice");
+
+        // Each of these lexically "starts with" $HOME before its `..` components walk back
+        // out — the escape #44 closes. All must resolve outside $HOME and be rejected.
+        for escape in [
+            "/home/alice/../etc/passwd",
+            "/home/alice/../../etc/x",
+            "/home/alice/./../x",
+            "/home/alice/subdir/../../secret",
+            "/home/alice/..",
+        ] {
+            let candidate = PathBuf::from(escape);
+            assert!(
+                matches!(
+                    validate_custom_path(&candidate, &home, Privilege::NonRoot),
+                    Err(CoreError::CustomPathOutsideHome { .. })
+                ),
+                "expected {escape} to be rejected as a $HOME escape"
+            );
+        }
+    }
+
+    #[test]
+    fn non_root_dot_components_that_stay_under_home_are_accepted() {
+        let home = PathBuf::from("/home/alice");
+
+        // `.`/`..` are fine as long as the normalized path stays under $HOME.
+        for legit in [
+            "/home/alice/notes/./todo.txt",
+            "/home/alice/a/b/c",
+            "/home/alice/a/../b",
+            "/home/alice/./config",
+            "/home/alice",
+        ] {
+            let candidate = PathBuf::from(legit);
+            assert!(
+                validate_custom_path(&candidate, &home, Privilege::NonRoot).is_ok(),
+                "expected {legit} to be accepted as under $HOME"
+            );
+        }
+    }
+
+    #[test]
+    fn root_traversal_escape_is_still_allowed() {
+        let home = PathBuf::from("/home/alice");
+        let escape = PathBuf::from("/home/alice/../../etc/x");
+        assert!(validate_custom_path(&escape, &home, Privilege::Root).is_ok());
     }
 }
