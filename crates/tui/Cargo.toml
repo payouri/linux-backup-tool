@@ -12,3 +12,16 @@ path = "src/main.rs"
 anyhow = "1.0.103"
 linux_backup_core = { path = "../core", package = "linux-backup-core" }
 inquire = "0.9.4"
+# `age::Encryptor::with_user_passphrase` (in `core`) takes a `secrecy::SecretString`; this
+# crate needs the same type to carry the passphrase from `inquire::Password` into
+# `core::restore::restore` without ever touching it as a plain `String`. Same version core
+# pins, so the two crates share one `secrecy` instance rather than resolving two.
+secrecy = "0.10"
+# The only way to reach `getuid()`/`geteuid()` (real uid + effective-root check for building
+# a real `RunContext`, issue #29) from Rust without a heavier crate. Already a `core`
+# dev-dependency for the same probe in a test; `tui`, unlike `core`, carries no
+# `forbid(unsafe_code)`, so it can use it directly rather than shelling out to `id -u`.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.15.0"
