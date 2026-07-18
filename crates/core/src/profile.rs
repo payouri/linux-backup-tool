@@ -260,7 +260,7 @@ mod tests {
         let live = PathBuf::from("/home/test/keep");
         let gone = PathBuf::from("/home/test/deleted");
         let profile = Profile {
-            custom_paths: vec![live.clone(), gone.clone()],
+            custom_paths: vec![live.clone(), gone],
             ..Profile::default()
         };
 

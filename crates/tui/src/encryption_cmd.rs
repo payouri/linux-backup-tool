@@ -103,8 +103,8 @@ enum Choice {
 impl fmt::Display for Choice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
-            Choice::SetPassphrase => "Set an encryption passphrase (recommended)",
-            Choice::DisableAutoInsist => {
+            Self::SetPassphrase => "Set an encryption passphrase (recommended)",
+            Self::DisableAutoInsist => {
                 "Disable Auto-insist — write the Sensitive content in PLAINTEXT"
             }
         };
@@ -144,7 +144,7 @@ fn prompt_passphrase() -> Result<Encryption> {
             .context("passphrase prompt failed")?;
 
         let strength = crypto::passphrase_strength(&raw);
-        println!("{}", strength_checklist(&strength));
+        println!("{}", strength_checklist(strength));
 
         if strength.all_met() || accept_weak_passphrase()? {
             return Ok(Encryption::Passphrase(SecretString::from(raw)));
@@ -206,7 +206,7 @@ fn summary_text(policy: &AutoInsist) -> String {
 
 /// Story 20's advisory strength checklist: one line per criterion with a checked/unchecked
 /// glyph (mirroring `select_cmd`'s `[x]`/`[ ]` Category glyphs for visual consistency).
-fn strength_checklist(strength: &PassphraseStrength) -> String {
+fn strength_checklist(strength: PassphraseStrength) -> String {
     let mut out = String::from("Passphrase strength (advisory, non-blocking):\n");
     out.push_str(&format!(
         "{} at least 12 characters\n",
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn strength_checklist_marks_each_criterion_independently() {
-        let checklist = strength_checklist(&PassphraseStrength {
+        let checklist = strength_checklist(PassphraseStrength {
             min_length: true,
             has_digit: false,
             has_special: true,
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn strength_checklist_marks_all_unmet_for_a_blank_candidate() {
-        let checklist = strength_checklist(&crypto::passphrase_strength(""));
+        let checklist = strength_checklist(crypto::passphrase_strength(""));
 
         assert!(checklist.contains("[ ] at least 12 characters"));
         assert!(checklist.contains("[ ] at least one digit"));

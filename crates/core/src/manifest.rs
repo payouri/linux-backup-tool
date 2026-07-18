@@ -62,8 +62,8 @@ pub enum ManifestRoot {
 impl From<EntryRoot> for ManifestRoot {
     fn from(root: EntryRoot) -> Self {
         match root {
-            EntryRoot::Home => ManifestRoot::Home,
-            EntryRoot::Absolute => ManifestRoot::Absolute,
+            EntryRoot::Home => Self::Home,
+            EntryRoot::Absolute => Self::Absolute,
         }
     }
 }
@@ -100,7 +100,7 @@ pub struct VanishedEntry {
 /// One package record within a Package list.
 ///
 /// `version` is informational only, per story 48 — nothing in this crate reads it back to
-/// pin a reinstall (there is deliberately no "pin_version" field or similar); reinstalling
+/// pin a reinstall (there is deliberately no `pin_version` field or similar); reinstalling
 /// on a rolling-release distro must not chase an unavailable exact version. `origin` (e.g.
 /// flatpak's remote) and `channel` (e.g. snap's tracking channel) are per-manager extras;
 /// most managers leave both `None`.
@@ -169,7 +169,7 @@ pub fn format_rfc3339(time: SystemTime) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let days = (secs / 86_400) as i64;
+    let days = (secs / 86_400).cast_signed();
     let time_of_day = secs % 86_400;
     let (hour, minute, second) = (
         time_of_day / 3600,
@@ -186,13 +186,15 @@ pub fn format_rfc3339(time: SystemTime) -> String {
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let doe = (z - era * 146_097).cast_unsigned(); // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
+    let y = yoe.cast_signed() + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    #[allow(clippy::cast_possible_truncation)]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // day-of-month [1, 31], fits u32
+    #[allow(clippy::cast_possible_truncation)]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // month [1, 12], fits u32
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
 }

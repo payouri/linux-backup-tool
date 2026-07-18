@@ -292,8 +292,7 @@ fn entry_row(entry: &Entry) -> EntryRow {
 fn entry_row_label(entry: &Entry) -> String {
     let lock = if entry.sensitive { " 🔒" } else { "" };
     let size = std::fs::metadata(&entry.absolute_path)
-        .map(|m| format_size(m.len()))
-        .unwrap_or_else(|_| "unknown size".to_string());
+        .map_or_else(|_| "unknown size".to_string(), |m| format_size(m.len()));
     format!("{}{lock} — {size}", entry.relative_path.display())
 }
 
@@ -304,6 +303,8 @@ fn format_size(bytes: u64) -> String {
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
 
+    // Byte counts stay well under 2^52, so the f64 mantissa loses nothing for this display.
+    #[allow(clippy::cast_precision_loss)]
     let bytes_f = bytes as f64;
     if bytes_f >= GB {
         format!("{:.2} GB", bytes_f / GB)

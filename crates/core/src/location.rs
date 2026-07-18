@@ -204,14 +204,13 @@ fn expand_env_vars(input: &str, getenv: &dyn Fn(&str) -> Option<String>) -> Stri
                 }
                 name.push(c2);
             }
-            match getenv(&name) {
-                Some(val) => out.push_str(&val),
-                None => {
-                    out.push_str("${");
-                    out.push_str(&name);
-                    if closed {
-                        out.push('}');
-                    }
+            if let Some(val) = getenv(&name) {
+                out.push_str(&val);
+            } else {
+                out.push_str("${");
+                out.push_str(&name);
+                if closed {
+                    out.push('}');
                 }
             }
         } else {
@@ -226,14 +225,11 @@ fn expand_env_vars(input: &str, getenv: &dyn Fn(&str) -> Option<String>) -> Stri
             }
             if name.is_empty() {
                 out.push('$');
+            } else if let Some(val) = getenv(&name) {
+                out.push_str(&val);
             } else {
-                match getenv(&name) {
-                    Some(val) => out.push_str(&val),
-                    None => {
-                        out.push('$');
-                        out.push_str(&name);
-                    }
-                }
+                out.push('$');
+                out.push_str(&name);
             }
         }
     }
@@ -321,6 +317,8 @@ const FREE_SPACE_WARNING_RATIO: f64 = 0.9;
 /// block. `available_space == 0` always warns (division by zero would otherwise hide the
 /// worst case).
 pub fn free_space_warning(selection_size: u64, available_space: u64) -> Option<FreeSpaceWarning> {
+    // Disk byte counts stay under 2^52, so f64 loss is negligible for this human-facing ratio.
+    #[allow(clippy::cast_precision_loss)]
     let approaching = if available_space == 0 {
         true
     } else {
@@ -398,7 +396,7 @@ struct LsblkDevice {
     size: Option<u64>,
     fstype: Option<String>,
     #[serde(default)]
-    children: Vec<LsblkDevice>,
+    children: Vec<Self>,
 }
 
 /// fstype signatures that mean the partition is a LUKS container or an LVM physical
@@ -410,10 +408,7 @@ fn is_unmounted_usb_partition(dev: &LsblkDevice) -> bool {
     dev.device_type.as_deref() == Some("part")
         && dev.tran.as_deref() == Some("usb")
         && dev.mountpoint.is_none()
-        && !matches!(
-            dev.fstype.as_deref(),
-            Some("crypto_LUKS") | Some("LVM2_member")
-        )
+        && !matches!(dev.fstype.as_deref(), Some("crypto_LUKS" | "LVM2_member"))
 }
 
 /// Walk `lsblk`'s nested `children` arrays collecting matches, since a USB stick's
@@ -779,6 +774,7 @@ mod tests {
 
     #[test]
     fn unwritable_directory_is_hard_refused() {
+        use std::os::unix::fs::PermissionsExt;
         // Root bypasses permission bits entirely, which would make this test flaky
         // under CI-as-root; skip in that case (same pattern ADR-0004 documents for the
         // permission-denied backup test). This reads the *test process's* real euid to
@@ -787,7 +783,6 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let locked = tmp.path().join("locked");
         fs::create_dir(&locked).unwrap();
@@ -1002,7 +997,7 @@ mod tests {
     // --- parse_lsblk_unmounted_usb_partitions (pure, fixture-driven) -----------------
 
     /// Realistic `lsblk --json -b -o NAME,TYPE,TRAN,MOUNTPOINT,SIZE,FSTYPE,PATH` output:
-    /// an internal NVMe disk (tran propagates to its partitions, none of them `usb`), a
+    /// an internal `NVMe` disk (tran propagates to its partitions, none of them `usb`), a
     /// mounted USB stick, an unmounted USB stick, a USB-attached LUKS container (excluded
     /// per story 28's "excluding ... LUKS"), and a USB-attached LVM physical volume
     /// (excluded per "excluding ... LVM").

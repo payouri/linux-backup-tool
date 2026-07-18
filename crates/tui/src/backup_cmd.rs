@@ -50,7 +50,7 @@ pub fn run() -> Result<()> {
     // "degrade gracefully instead of breaking the tool" applied to the file itself, not just
     // its stale paths. A bricked backup over a broken convenience-file would be the worse bug.
     let loaded = load_or_degrade(
-        profile::load(&profile_path, |path| path.exists()),
+        profile::load(&profile_path, std::path::Path::exists),
         &profile_path,
     );
 
@@ -73,17 +73,15 @@ pub fn run() -> Result<()> {
     let default_location = loaded
         .as_ref()
         .and_then(|l| l.profile.output_location.as_deref());
-    let location = match where_screen::run_screen(&ctx, selection.total_size(), default_location)? {
-        Some(location) => location,
-        None => {
-            println!("No Output location chosen — backup aborted. Nothing was written.");
-            return Ok(());
-        }
+    let Some(location) = where_screen::run_screen(&ctx, selection.total_size(), default_location)?
+    else {
+        println!("No Output location chosen — backup aborted. Nothing was written.");
+        return Ok(());
     };
 
     // `core::backup` computes the Backup dir under `ctx.output_location`; `build_run_context`
     // defaults that to `$HOME`, so point it at the location the WHERE screen actually bound.
-    ctx.output_location = location.location.clone();
+    ctx.output_location.clone_from(&location.location);
 
     // REVIEW: everything chosen, summarized before anything is written.
     println!();

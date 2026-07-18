@@ -306,9 +306,11 @@ impl SelectionModel {
 
         let mut warnings = Vec::new();
         if user_data_size > USER_DATA_WARNING_THRESHOLD_BYTES {
+            // Byte counts stay well under 2^52, so u64→f64 loses no precision here.
+            #[allow(clippy::cast_precision_loss)]
+            let gigabytes = user_data_size as f64 / USER_DATA_WARNING_THRESHOLD_BYTES as f64;
             warnings.push(format!(
-                "User data selection is {:.2} GB — this Category is large and default-OFF for a reason",
-                user_data_size as f64 / USER_DATA_WARNING_THRESHOLD_BYTES as f64
+                "User data selection is {gigabytes:.2} GB — this Category is large and default-OFF for a reason"
             ));
         }
         warnings

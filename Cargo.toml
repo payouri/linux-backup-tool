@@ -8,5 +8,37 @@ edition = "2021"
 rust-version = "1.95"
 
 [workspace.lints.clippy]
+# Enforce AGENTS.md's no-unwrap/expect/panic rule (disallowed lists live in clippy.toml).
 disallowed_methods = "warn"
 disallowed_macros = "warn"
+
+# Lint groups per rust-skills `lint-deny-correctness` / `lint-workspace-lints`. `correctness`
+# is deny-by-default and the rest are warn-by-default; pinned explicitly so the policy is
+# documented and survives a toolchain default change. `priority = -1` lets the specific
+# overrides below win.
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+
+# Pedantic as a warn baseline minus the lints rust-skills `lint-pedantic-selective` flags as
+# noise (doc-policy lints, arbitrary thresholds, naming heuristics).
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+# Its only fix (`write!` into the String) returns an infallible-but-`#[must_use]` `Result`,
+# which would force an `unwrap()`/`expect()` that AGENTS.md bans outside tests and main.
+format_push_string = "allow"
+
+# High-value nursery lints only, per rust-skills `lint-clippy-nursery-selected`.
+significant_drop_tightening = "warn"
+redundant_clone = "warn"
+use_self = "warn"
+redundant_else = "warn"
+or_fun_call = "warn"

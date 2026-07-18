@@ -49,7 +49,7 @@ pub enum Encryption {
 impl Encryption {
     /// Whether this choice puts the `.age` suffix on the Archive/Manifest filenames.
     pub fn is_encrypted(&self) -> bool {
-        matches!(self, Encryption::Passphrase(_))
+        matches!(self, Self::Passphrase(_))
     }
 }
 

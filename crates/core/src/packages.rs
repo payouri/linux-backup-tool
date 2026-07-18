@@ -16,7 +16,7 @@
 //! manager is skipped without failing the run").
 //!
 //! Versions are informational only (story 48): nothing here or downstream treats a captured
-//! version as a pin. There is deliberately no "pin_version" field or similar — reinstalling
+//! version as a pin. There is deliberately no `pin_version` field or similar — reinstalling
 //! on a rolling-release distro must not chase an unavailable exact version.
 
 use std::collections::BTreeMap;
@@ -429,7 +429,7 @@ mod tests {
             self.responses.borrow_mut().insert(
                 (
                     program.to_string(),
-                    args.iter().map(|s| s.to_string()).collect(),
+                    args.iter().map(ToString::to_string).collect(),
                 ),
                 output.to_string(),
             );
@@ -441,7 +441,7 @@ mod tests {
         fn run(&self, program: &str, args: &[&str]) -> Option<String> {
             let key = (
                 program.to_string(),
-                args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                args.iter().map(ToString::to_string).collect::<Vec<_>>(),
             );
             self.responses.borrow().get(&key).cloned()
         }

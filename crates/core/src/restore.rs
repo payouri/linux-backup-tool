@@ -117,7 +117,7 @@ pub fn restore(
     let actual_sha256 = archive::sha256_hex(&archive_bytes);
     if actual_sha256 != manifest.archive_sha256 {
         return Err(CoreError::ArchiveChecksumMismatch {
-            expected: manifest.archive_sha256.clone(),
+            expected: manifest.archive_sha256,
             actual: actual_sha256,
         });
     }
@@ -276,7 +276,10 @@ fn chown_to_tar_owner<R: std::io::Read>(
 ) -> Result<(), String> {
     let uid = tar_entry.header().uid().map_err(|e| e.to_string())?;
     let gid = tar_entry.header().gid().map_err(|e| e.to_string())?;
-    std::os::unix::fs::chown(target, Some(uid as u32), Some(gid as u32)).map_err(|e| e.to_string())
+    // Linux uid/gid are 32-bit; tar's accessor widens them to u64, so the domain can't exceed u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let (uid, gid) = (uid as u32, gid as u32);
+    std::os::unix::fs::chown(target, Some(uid), Some(gid)).map_err(|e| e.to_string())
 }
 
 /// Resolves a tar-internal path (`home/...` or `absolute/...`) to a real target path.
@@ -449,12 +452,9 @@ pub fn verify(ctx: &RunContext, manifest: &Manifest) -> VerifyReport {
     let mut report = VerifyReport::default();
 
     for (archive_path, expected_sha256) in &manifest.checksums {
-        let target = match resolve_target(Path::new(archive_path), ctx) {
-            Ok(target) => target,
-            Err(_) => {
-                report.missing.push(archive_path.clone());
-                continue;
-            }
+        let Ok(target) = resolve_target(Path::new(archive_path), ctx) else {
+            report.missing.push(archive_path.clone());
+            continue;
         };
 
         match fs::read(&target) {
@@ -546,14 +546,12 @@ mod tests {
         let restore_home = tmp.path().join("restored-home");
         fs::create_dir_all(&restore_home).expect("create restore home");
 
-        if !process_can_chown_to_arbitrary_uid(&restore_home) {
-            // Expected path for a normal (non-root) dev/CI process: chown-to-foreign-uid
-            // genuinely fails, so the test below exercises the real EPERM branch.
-        } else {
-            // Running with real chown-anything privilege (e.g. a root CI container) would
-            // make the foreign-uid chown below succeed instead of failing, which isn't
-            // this test's scenario (story 53 is specifically about non-root's inability to
-            // chown) — skip rather than assert a false failure.
+        // Running with real chown-anything privilege (e.g. a root CI container) would make the
+        // foreign-uid chown below succeed instead of failing, which isn't this test's scenario
+        // (story 53 is specifically about non-root's inability to chown) — skip rather than
+        // assert a false failure. The normal (non-root) dev/CI process falls through and
+        // exercises the real EPERM branch.
+        if process_can_chown_to_arbitrary_uid(&restore_home) {
             eprintln!(
                 "skipping ownership_restore_failure_is_reported_without_aborting_the_restore: \
                  process can chown arbitrary uids (running as root?)"

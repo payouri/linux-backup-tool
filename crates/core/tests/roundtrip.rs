@@ -295,7 +295,7 @@ fn round_trip_unencrypted() {
 
     // Restore into a DIFFERENT fresh root.
     let restore_home = tmp.path().join("restored-home");
-    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_ctx = test_ctx(restore_home.clone(), output);
     let restore_outcome =
         run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
 
@@ -369,7 +369,7 @@ fn round_trip_encrypted_with_real_age_and_the_correct_passphrase() {
 
     // Restore into a DIFFERENT fresh root, with the SAME correct passphrase.
     let restore_home = tmp.path().join("restored-home");
-    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_ctx = test_ctx(restore_home.clone(), output);
     let restore_outcome = run_restore(&outcome.backup_dir, &restore_ctx, Some(&passphrase))
         .expect("restore with the correct passphrase should succeed");
 
@@ -505,7 +505,7 @@ fn taxonomy_round_trip_composes_multiple_categories() {
     );
 
     let restore_home = tmp.path().join("restored-home");
-    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_ctx = test_ctx(restore_home.clone(), output);
     let restore_outcome =
         run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
 
@@ -612,7 +612,7 @@ fn vanished_benign_file_is_skipped_and_recorded_without_aborting() {
     let output = tmp.path().join("output");
     fs::create_dir_all(&output).expect("create output dir");
 
-    let ctx = test_ctx(home.clone(), output.clone());
+    let ctx = test_ctx(home, output);
     let selection = shell_selection(&ctx);
     let vanishing_entry = selection
         .entries()
@@ -658,7 +658,7 @@ fn vanished_sensitive_entry_is_named_by_vanished_sensitive_names() {
     let output = tmp.path().join("output");
     fs::create_dir_all(&output).expect("create output dir");
 
-    let ctx = test_ctx(home.clone(), output.clone());
+    let ctx = test_ctx(home, output);
     let scanned = scan::scan_taxonomy(&ctx);
     let selection = SelectionModel::from_smart_defaults(&scanned);
 
@@ -758,7 +758,7 @@ fn safety_net_only_entry_flows_sensitive_through_the_round_trip() {
     );
 
     let restore_home = tmp.path().join("restored-home");
-    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_ctx = test_ctx(restore_home.clone(), output);
     let restore_outcome =
         run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
     assert!(
@@ -881,7 +881,7 @@ fn kde_plasma_drill_down_deselection_excludes_exactly_those_entries_from_the_rou
     ));
 
     let restore_home = tmp.path().join("restored-home");
-    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_ctx = test_ctx(restore_home.clone(), output);
     let restore_outcome =
         run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
 
@@ -946,7 +946,7 @@ fn restore_collision_requires_explicit_overwrite_flag() {
     fs::write(&conflicting_path, b"pre-existing content that must survive")
         .expect("write pre-existing conflicting file");
 
-    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_ctx = test_ctx(restore_home.clone(), output);
 
     // Without the flag: the collision is reported, not silently clobbered, and the
     // pre-existing content is left exactly as it was.
@@ -1039,7 +1039,7 @@ fn reinstall_script_is_written_with_correct_per_manager_counts_from_captured_pac
     );
 
     let restore_home = tmp.path().join("restored-home");
-    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_ctx = test_ctx(restore_home.clone(), output);
     let restore_outcome =
         run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
 
@@ -1079,7 +1079,7 @@ fn verify_pass_flags_a_deliberately_corrupted_restored_file() {
     let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
 
     let restore_home = tmp.path().join("restored-home");
-    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_ctx = test_ctx(restore_home.clone(), output);
     let restore_outcome =
         run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
     assert!(restore_outcome.failures.is_empty());
