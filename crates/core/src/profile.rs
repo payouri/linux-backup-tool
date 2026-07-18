@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog;
 use crate::error::CoreError;
-use crate::model::{Entry, EntryRoot, EntryType, SelectionModel};
-use crate::scan::{self, CategoryScan};
+use crate::model::{Entry, SelectionModel};
+use crate::scan::CategoryScan;
 
 /// The persistable shape of a Selection plus its Output location — everything a returning run
 /// pre-fills from (story 58). Deliberately holds no encryption state (story 24).
@@ -108,48 +108,25 @@ impl Profile {
             .map(String::as_str)
             .collect();
 
-        let mut entries: Vec<Entry> = scanned
+        let entries: Vec<Entry> = scanned
             .iter()
             .filter(|scan| selected.contains(scan.category.name))
             .flat_map(|scan| scan.entries.iter().cloned())
             .collect();
-        entries.extend(
-            self.custom_paths
-                .iter()
-                .map(|path| custom_entry(path, home)),
-        );
 
         let mut model = SelectionModel::new(entries);
+        // Custom paths are the one part of a Selection a fresh scan can't re-discover (their
+        // Category's allowlist is empty by design), so they're re-added by absolute path —
+        // through the same `SelectionModel::add_custom_path` the WHAT screen uses, so a
+        // persisted Custom path re-roots and re-derives sensitivity exactly like a freshly
+        // added one.
+        for path in &self.custom_paths {
+            model.add_custom_path(path, home);
+        }
         for deselected in &self.deselected_paths {
             model.deselect_entry(deselected);
         }
         model
-    }
-}
-
-/// Builds an [`Entry`] for a remembered Custom path, since Custom paths are the one part of a
-/// Selection `scan::scan_taxonomy` never re-discovers (their Category's allowlist is empty by
-/// design). Re-rooting mirrors `scan`'s: a path under `home` is `EntryRoot::Home` with a
-/// home-relative path; anything else is `EntryRoot::Absolute`. Sensitivity is re-derived from
-/// the Safety-net scan so a Custom path pointing at a key file still forces encryption.
-fn custom_entry(path: &Path, home: &Path) -> Entry {
-    let (root, relative_path) = match path.strip_prefix(home) {
-        Ok(relative) => (EntryRoot::Home, relative.to_path_buf()),
-        Err(_) => (
-            EntryRoot::Absolute,
-            path.strip_prefix("/").unwrap_or(path).to_path_buf(),
-        ),
-    };
-    Entry {
-        absolute_path: path.to_path_buf(),
-        relative_path,
-        root,
-        // A Custom path can point at a symlink (common with dotfile managers) — classify it
-        // by lstat so `archive::build` preserves the link rather than storing its target's
-        // bytes (issue #36), rather than assuming a regular file.
-        entry_type: EntryType::classify(path),
-        category: catalog::CUSTOM_PATHS.name,
-        sensitive: scan::is_safety_net_match(path),
     }
 }
 
@@ -219,6 +196,7 @@ fn prune(mut profile: Profile, exists: impl Fn(&Path) -> bool) -> (Profile, usiz
 mod tests {
     use super::*;
     use crate::catalog;
+    use crate::model::{EntryRoot, EntryType};
     use std::collections::BTreeSet;
 
     fn entry(category: &'static str, sensitive: bool, relative: &str) -> Entry {

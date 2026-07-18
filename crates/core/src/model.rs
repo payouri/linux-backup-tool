@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use crate::catalog;
 use crate::crypto;
-use crate::scan::CategoryScan;
+use crate::scan::{self, CategoryScan};
 
 /// The size threshold (story 4: ">1GB") above which a User-data Selection earns a warning.
 const USER_DATA_WARNING_THRESHOLD_BYTES: u64 = 1_000_000_000;
@@ -159,6 +159,28 @@ impl SelectionModel {
             .flat_map(|scan| scan.entries.iter().cloned())
             .collect();
         Self::new(entries)
+    }
+
+    /// Adds a Custom path (CONTEXT.md's "Custom path", stories 6/8) to the active Selection.
+    /// Builds its [`Entry`] with the same re-rooting and Safety-net sensitivity derivation a
+    /// remembered Custom path gets when a Profile is restored ([`custom_entry`]) — so an
+    /// interactively-added path and a persisted one are indistinguishable once in the model,
+    /// and both feed `total_size`/`encryption_required`/the Manifest the same way.
+    ///
+    /// `absolute_path` is expected already expanded and already validated against the
+    /// root/non-root rule (`catalog::validate_custom_path`) by the caller: this owns only the
+    /// Entry construction and insertion, not the privilege policy (which needs the injected
+    /// `RunContext.privilege` the caller holds). Re-adding a path already actively selected is
+    /// a no-op rather than a duplicate, so the running total can't double-count one Custom path.
+    pub fn add_custom_path(&mut self, absolute_path: &Path, home: &Path) {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.absolute_path == absolute_path)
+        {
+            return;
+        }
+        self.entries.push(custom_entry(absolute_path, home));
     }
 
     /// The active (non-deselected) Entries, in scan order — what `archive::build` and the
@@ -351,6 +373,36 @@ impl SelectionModel {
             ));
         }
         warnings
+    }
+}
+
+/// Builds an [`Entry`] for a Custom path — the one part of a Selection `scan::scan_taxonomy`
+/// never re-discovers (the Custom-paths Category's allowlist is empty by design). Re-rooting
+/// mirrors `scan`'s: a path under `home` is [`EntryRoot::Home`] with a home-relative path;
+/// anything else is [`EntryRoot::Absolute`] with the leading `/` stripped for its
+/// Archive-internal path. Sensitivity is re-derived from the Safety-net scan so a Custom path
+/// pointing at a key file still forces encryption.
+fn custom_entry(absolute_path: &Path, home: &Path) -> Entry {
+    let (root, relative_path) = match absolute_path.strip_prefix(home) {
+        Ok(relative) => (EntryRoot::Home, relative.to_path_buf()),
+        Err(_) => (
+            EntryRoot::Absolute,
+            absolute_path
+                .strip_prefix("/")
+                .unwrap_or(absolute_path)
+                .to_path_buf(),
+        ),
+    };
+    Entry {
+        absolute_path: absolute_path.to_path_buf(),
+        relative_path,
+        root,
+        // A Custom path can point at a symlink (common with dotfile managers) — classify it
+        // by lstat so `archive::build` preserves the link rather than storing its target's
+        // bytes (issue #36), rather than assuming a regular file.
+        entry_type: EntryType::classify(absolute_path),
+        category: catalog::CUSTOM_PATHS.name,
+        sensitive: scan::is_safety_net_match(absolute_path),
     }
 }
 
@@ -754,6 +806,56 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "select_category took {elapsed:?} for 20,000 Entries — the O(n^2) regression is back"
+        );
+    }
+
+    #[test]
+    fn add_custom_path_under_home_is_home_rooted() {
+        let home = Path::new("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+
+        selection.add_custom_path(Path::new("/home/test/projects/notes.md"), home);
+
+        assert_eq!(selection.entries().len(), 1);
+        let custom = &selection.entries()[0];
+        assert_eq!(custom.category, catalog::CUSTOM_PATHS.name);
+        assert_eq!(custom.root, EntryRoot::Home);
+        assert_eq!(custom.relative_path, Path::new("projects/notes.md"));
+        assert!(!custom.sensitive);
+    }
+
+    #[test]
+    fn add_custom_path_outside_home_is_absolute_and_safety_net_stays_sensitive() {
+        let home = Path::new("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+
+        // A root-added path outside $HOME at a key file: absolute-rooted, and the Safety-net
+        // scan re-derives its sensitivity so it still Auto-insists on encryption.
+        selection.add_custom_path(Path::new("/etc/ssl/private/server.key"), home);
+
+        let custom = &selection.entries()[0];
+        assert_eq!(custom.root, EntryRoot::Absolute);
+        assert_eq!(
+            custom.relative_path,
+            Path::new("etc/ssl/private/server.key")
+        );
+        assert!(custom.sensitive);
+        assert!(selection.encryption_required());
+    }
+
+    #[test]
+    fn add_custom_path_ignores_a_re_added_duplicate() {
+        let home = Path::new("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+        let path = Path::new("/home/test/projects/notes.md");
+
+        selection.add_custom_path(path, home);
+        selection.add_custom_path(path, home);
+
+        assert_eq!(
+            selection.entries().len(),
+            1,
+            "re-adding the same Custom path must not double-count it"
         );
     }
 }

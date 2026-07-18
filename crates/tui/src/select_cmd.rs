@@ -25,8 +25,11 @@ use std::fmt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use inquire::{MultiSelect, Select};
+use inquire::error::InquireError;
+use inquire::{MultiSelect, Select, Text};
+use linux_backup_core::catalog;
 use linux_backup_core::crypto;
+use linux_backup_core::location;
 use linux_backup_core::model::{Entry, SelectionModel};
 use linux_backup_core::profile::Profile;
 use linux_backup_core::scan::{self, CategoryScan};
@@ -91,6 +94,7 @@ pub fn run_screen(ctx: &RunContext, profile: Option<&Profile>) -> Result<Selecti
                 }
             }
             MenuAction::Drill(index) => drill_down(&scanned[index], &mut model)?,
+            MenuAction::AddCustomPath => add_custom_path(ctx, &mut model)?,
             MenuAction::Continue => {
                 if model.is_empty() {
                     println!("{}", empty_selection_message());
@@ -177,6 +181,10 @@ enum MenuAction {
     Toggle(usize),
     /// Drill into the Category at this index in `scanned`.
     Drill(usize),
+    /// Prompt for a Custom path to add to the Selection (stories 6/8) — the interactive entry
+    /// point for the Custom-paths escape hatch, which `scan_taxonomy` can never populate on its
+    /// own (its allowlist is empty by design).
+    AddCustomPath,
     /// Finish the WHAT screen with whatever is currently selected.
     Continue,
 }
@@ -201,12 +209,64 @@ fn menu_rows(scanned: &[CategoryScan], model: &SelectionModel) -> Vec<MenuRow> {
                 ),
             });
         }
+        // The Custom-paths Category is the escape hatch (always shown, story 6) but has no
+        // scanned Entries to Drill into — its affordance is instead an "add a path" action
+        // sitting directly under its row.
+        if scan.category.name == catalog::CUSTOM_PATHS.name {
+            rows.push(MenuRow {
+                action: MenuAction::AddCustomPath,
+                label: "    ➕ Add a Custom path".to_string(),
+            });
+        }
     }
     rows.push(MenuRow {
         action: MenuAction::Continue,
         label: "✔ Continue with the current Selection".to_string(),
     });
     rows
+}
+
+/// The "add a Custom path" action (stories 6/8/10/11): prompts for a path, expands `~` and
+/// `$VAR`/`${VAR}`, validates it against the root/non-root rule (`catalog::validate_custom_path`),
+/// then adds it to the Selection or prints an inline rejection — never a silent failure. A
+/// blank entry or an Esc/Ctrl-C cancel is a no-op; the caller re-loops the WHAT screen either
+/// way, so an added path shows up in the live footer's running total and Auto-insist state on
+/// the next iteration like any other Entry.
+fn add_custom_path(ctx: &RunContext, model: &mut SelectionModel) -> Result<()> {
+    let entered = match Text::new("Add a Custom path (~ and $VARs are expanded):").prompt() {
+        Ok(text) => text,
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+            return Ok(());
+        }
+        Err(other) => return Err(other).context("Custom-path prompt failed"),
+    };
+
+    let trimmed = entered.trim();
+    if trimmed.is_empty() {
+        println!("No path entered — nothing added.");
+        return Ok(());
+    }
+
+    // Reuse the exact `~`/`$VAR`/`${VAR}` expansion the WHERE screen's Custom output location
+    // uses (`location::expand_path`, story 30) so both Custom-path entry points behave
+    // identically: env-var lookup happens here in `tui` via the injected closure (ADR-0004
+    // keeps the read out of `core`), and an unresolved variable is left literal — so a typo
+    // fails validation or the backup read visibly rather than silently vanishing into a wrong
+    // path (this is the "handled per the same rules already used elsewhere" the issue names).
+    let expanded = location::expand_path(trimmed, &ctx.home, |name| std::env::var(name).ok());
+
+    // Root may add any path; a non-root run is constrained to under $HOME. The rejection
+    // message is `CoreError::CustomPathOutsideHome`'s own Display, so it names both the path
+    // and $HOME (stories 10/11).
+    match catalog::validate_custom_path(&expanded, &ctx.home, ctx.privilege) {
+        Ok(()) => {
+            model.add_custom_path(&expanded, &ctx.home);
+            println!("Added Custom path: {}", expanded.display());
+        }
+        Err(err) => println!("Rejected: {err}"),
+    }
+
+    Ok(())
 }
 
 /// How many of `scan`'s discovered Entries are currently active in `model` — the numerator
@@ -559,13 +619,34 @@ mod tests {
 
         let rows = menu_rows(&scanned, &model);
 
-        // Shell: Toggle + Drill (has entries). Custom paths: Toggle only (always_shown but
-        // empty, story 6 — nothing to Drill into yet). Plus the trailing Continue row.
-        assert_eq!(rows.len(), 4);
+        // Shell: Toggle + Drill (has entries). Custom paths: Toggle (always_shown but empty,
+        // story 6 — nothing to Drill into) followed by its "Add a Custom path" action. Plus
+        // the trailing Continue row.
+        assert_eq!(rows.len(), 5);
         assert!(matches!(rows[0].action, MenuAction::Toggle(0)));
         assert!(matches!(rows[1].action, MenuAction::Drill(0)));
         assert!(matches!(rows[2].action, MenuAction::Toggle(1)));
-        assert!(matches!(rows[3].action, MenuAction::Continue));
-        assert!(rows[3].label.contains("Continue"));
+        assert!(matches!(rows[3].action, MenuAction::AddCustomPath));
+        assert!(rows[3].label.contains("Add a Custom path"));
+        assert!(matches!(rows[4].action, MenuAction::Continue));
+        assert!(rows[4].label.contains("Continue"));
+    }
+
+    #[test]
+    fn menu_rows_offers_add_custom_path_even_on_an_empty_account() {
+        // Story 62: an account with no discoverable Categories still scans Custom paths (it's
+        // exempt from Hide-empty), so the "add a Custom path" action is reachable — the only
+        // way such an account can build a non-empty Selection and complete a backup.
+        let scanned = vec![CategoryScan {
+            category: catalog::CUSTOM_PATHS,
+            entries: Vec::new(),
+        }];
+        let model = SelectionModel::from_smart_defaults(&scanned);
+
+        let rows = menu_rows(&scanned, &model);
+
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row.action, MenuAction::AddCustomPath)));
     }
 }

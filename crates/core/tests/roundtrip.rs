@@ -561,6 +561,71 @@ fn empty_selection_is_refused_before_any_filesystem_work() {
     );
 }
 
+/// Issue #35 / stories 6/8/62: a completely empty account (no discoverable Categories) adds a
+/// Custom path and completes a backup end-to-end. Smart defaults leave the Selection empty —
+/// which would bounce (story 42) — until `SelectionModel::add_custom_path` (the exact seam the
+/// WHAT screen drives once `catalog::validate_custom_path` accepts a path) adds one. The
+/// home-rooted Custom path must land in the Manifest under the Custom-paths Category and Re-root
+/// under the *restoring* home, proving a Custom-path Entry round-trips like any other.
+#[test]
+fn empty_account_adds_a_custom_path_and_round_trips_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    // A file on no Category's Curated allowlist — reachable only as a Custom path (story 8).
+    let notes = home.join("projects/notes.md");
+    fs::create_dir_all(notes.parent().unwrap()).expect("create custom-path parent dir");
+    fs::write(&notes, b"custom-path notes\n").expect("write custom-path file");
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home.clone(), output.clone());
+
+    // An empty account: only the always-shown Custom-paths Category scans (exempt from
+    // Hide-empty), so Smart defaults produce an empty Selection.
+    let scanned = scan::scan_taxonomy(&ctx);
+    let mut selection = SelectionModel::from_smart_defaults(&scanned);
+    assert!(
+        selection.is_empty(),
+        "an empty account has nothing selected by Smart defaults"
+    );
+
+    // The path is under $HOME, so a non-root run accepts it; then it enters the Selection
+    // through the same public API the WHAT screen calls (story 62).
+    catalog::validate_custom_path(&notes, &ctx.home, ctx.privilege)
+        .expect("a Custom path under $HOME is accepted for a non-root run");
+    selection.add_custom_path(&notes, &ctx.home);
+    assert!(
+        !selection.is_empty(),
+        "the added Custom path fills the Selection"
+    );
+
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    assert_eq!(outcome.manifest.entries.len(), 1);
+    let manifest_entry = &outcome.manifest.entries[0];
+    assert_eq!(manifest_entry.category, catalog::CUSTOM_PATHS.name);
+    assert_eq!(manifest_entry.path, "projects/notes.md");
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home.clone(), output);
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
+
+    assert!(
+        restore_outcome.failures.is_empty(),
+        "unexpected restore failures: {:?}",
+        restore_outcome.failures
+    );
+    assert_eq!(restore_outcome.restored_paths.len(), 1);
+    // Re-rooting: the home-tagged Custom path lands under the *restoring* home, byte-for-byte.
+    assert_ne!(restore_home, home);
+    assert_eq!(
+        fs::read(restore_home.join("projects/notes.md"))
+            .expect("restored custom file should exist"),
+        fs::read(&notes).expect("original custom file should exist"),
+    );
+}
+
 /// Issue #24 / ADR-0002: a genuine read error (permission-denied, I/O error, device-gone) is
 /// fatal and distinct from a Vanished entry — the whole run aborts and the freshly-created
 /// Backup dir is deleted, so nothing (including no `manifest.json`) is left behind.
