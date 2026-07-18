@@ -472,4 +472,43 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn deselecting_the_only_sensitive_entry_lifts_encryption_required() {
+        let mut selection = SelectionModel::new(vec![
+            entry(catalog::SHELL.name, false, "aliases.zsh"),
+            entry(catalog::SSH.name, true, "id_ed25519"),
+        ]);
+        assert!(selection.encryption_required());
+
+        // Auto-insist (#22) must recompute from whatever is still actively selected — a
+        // withheld sensitive Entry can no longer be what lands in the Archive, so it must
+        // stop being what justifies forcing encryption on.
+        selection.deselect_entry(Path::new("id_ed25519"));
+
+        assert!(!selection.encryption_required());
+    }
+
+    #[test]
+    fn deselecting_the_heavy_user_data_entry_clears_the_size_warning() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let huge = entry_with_size(
+            tmp.path(),
+            "Documents/huge.bin",
+            USER_DATA_WARNING_THRESHOLD_BYTES + 1,
+        );
+        let huge = Entry {
+            category: catalog::USER_DATA.name,
+            ..huge
+        };
+        let mut selection = SelectionModel::new(vec![huge]);
+        assert!(!selection.warnings().is_empty());
+
+        // `warnings()` sums size over `entries` only (module doc's #21 section), so
+        // withholding the one oversized Entry must make the warning disappear rather than
+        // linger on a Selection that no longer actually contains it.
+        selection.deselect_entry(Path::new("Documents/huge.bin"));
+
+        assert!(selection.warnings().is_empty());
+    }
 }
