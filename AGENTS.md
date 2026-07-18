@@ -31,6 +31,8 @@ Read before writing or changing tests:
 - **`trunk` only moves by fast-forward.** No merge commits onto `trunk`, ever.
 - Before merging a branch, **rebase it onto `trunk`** (`git rebase trunk`), resolving any conflicts on the branch — not by merging `trunk` into it.
 - Only merge/push once the rebased branch fast-forwards cleanly (`git merge --ff-only`).
+- **Before closing an issue, comment on it first** with the commit link (`gh issue comment <n> --body "..."`) and a short summary of what changed, then close it. The comment is the record of what actually landed — don't rely on the commit message alone once the issue is closed.
+- **Remove a git worktree once you're done with it** (`git worktree remove <path>`), rather than leaving it checked out. Confirm the branch has been merged/pushed first if the work should be kept.
 
 ## Coding conventions
 

@@ -9,7 +9,7 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 - **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
 - **Comment on an issue**: `gh issue comment <number> --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
-- **Close**: `gh issue close <number> --comment "..."`
+- **Close**: comment first, then close — `gh issue comment <number> --body "..."` with the commit link and a short summary of what changed, then `gh issue close <number>`. Don't rely on `gh issue close --comment` alone; the comment should read as a standalone record, not a closing footnote.
 
 Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
 
