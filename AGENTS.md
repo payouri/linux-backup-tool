@@ -12,6 +12,8 @@ Read before working on any feature:
   - [`0002`](docs/adr/0002-backup-restore-failure-asymmetry.md) — backup fails fast and cleans up; restore is best-effort and reports per-file failures.
   - [`0003`](docs/adr/0003-plasma-raw-config-copy-not-konsave.md) — Plasma capture copies raw config via a curated allowlist; no `konsave` dependency.
   - [`0004`](docs/adr/0004-core-runcontext-injection.md) — `core` takes a full injected `RunContext`, reads nothing ambient (see Testing gates below).
+  - [`0005`](docs/adr/0005-ratatui-app-architecture-core-tui-boundary.md) — the ratatui TUI is one `App` reducer in `tui`; core stays synchronous and owns all filesystem content I/O.
+  - [`0006`](docs/adr/0006-recursive-drill-down-exclusion-model.md) — recursive drill-down reuses the flat two-set exclusion model; no Manifest change, no Profile migration.
 - **`docs/research/`** — dated research notes backing early tickets (package inventory, Plasma capture, Rust crate choices). Check for an existing note before re-researching a settled question.
 
 ## Gates

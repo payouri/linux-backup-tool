@@ -1,5 +1,7 @@
 # Cargo workspace: `core` library + `tui` binary, with no archive-backend trait yet
 
+**Status:** Accepted · **Date:** 2026-07-17
+
 The alpha is a Cargo workspace: `crates/core` is a UI-free library that owns the Selection model and all backup/restore logic, and `crates/tui` is a thin `inquire`-based binary over it. The core/UI boundary is compiler-enforced (core has zero UI dependencies) so a future `gui` or `dedup` crate can slot in beside `tui` without touching core.
 
 Deliberately, `core::archive` is a **concrete** tar → zstd → age implementation with no backend trait — even though v1 will add a borg/restic-style dedup store. We are not abstracting the archive backend until that second implementation actually exists.

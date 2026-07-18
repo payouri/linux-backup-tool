@@ -1,5 +1,7 @@
 # The ratatui TUI is a single `App` reducer in `tui`; core stays synchronous and owns all filesystem content I/O
 
+**Status:** Accepted · **Date:** 2026-07-18
+
 The interactive surface migrates off `inquire` (linear, forward-only, print-then-prompt) to a
 full-screen `ratatui` app. This ADR fixes that app's architecture and confirms where the
 core/tui boundary lands. It resolves [#47](https://github.com/payouri/linux-backup-tool/issues/47)
@@ -68,13 +70,9 @@ restore — which has no progress surface today — routes through the same chan
 
 ### 5. ADR-0001 is reaffirmed, not amended
 
-The migration touches **only** `crates/tui`: `App`, the runtime, the worker thread, and the
-channel adapter are all tui-internal, and every core entry point stays UI-agnostic and unchanged.
-The core/tui split of [ADR-0001](0001-core-tui-split-no-dedup-trait.md) holds as-is, so this is a
-*new* ADR rather than an amendment to it. (The recursive drill-down work in
-[#48](https://github.com/payouri/linux-backup-tool/issues/48) may change core's `Selection`/
-`Manifest` domain model, but that is a core-internal change, not a boundary change, and likewise
-does not amend ADR-0001.)
+The migration touches **only** `crates/tui`, so the core/tui split of
+[ADR-0001](0001-core-tui-split-no-dedup-trait.md) holds as-is — this is a *new* ADR, not an
+amendment.
 
 ### 6. Core is the bridge for all filesystem *content* I/O
 

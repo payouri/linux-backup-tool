@@ -1,5 +1,7 @@
 # Core receives a full `RunContext`; it reads nothing from the ambient system
 
+**Status:** Accepted · **Date:** 2026-07-17
+
 Every `core` backup/restore/scan entry point takes a single injected `RunContext { home, output_location, privilege, host, user, uid, os, now }` and reads **nothing** from the ambient system on its own — no `std::env::var("HOME")`, no `dirs::home_dir()`, no `hostname`, no `getuid()`, no clock. `main` (in `crates/tui`) fills the context from the real machine; tests pass fixed values. Anything core would otherwise learn by asking the OS enters through this one struct.
 
 This extends spec [#17](https://github.com/payouri/linux-backup-tool/issues/17), which injects only roots (`$HOME`, output location) and privilege. We inject the whole run context — including `host`, `user`, `uid`, `os`, and `now` — because those same fields land in the Manifest (`created_at`, `host`, `user`, `uid`, `os`) and in the Backup dir name (`linux-backup-<host>-<timestamp>`). If core read them from the environment, the round-trip test could neither assert the Manifest exactly nor be deterministic across machines and runs.

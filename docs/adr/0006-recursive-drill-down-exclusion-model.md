@@ -1,5 +1,7 @@
 # Recursive drill-down reuses the flat two-set exclusion model; no Manifest change, no Profile migration, no carve-outs
 
+**Status:** Accepted · **Date:** 2026-07-18
+
 Drill-down is being extended from its alpha shape (descend from a Category into its Entries,
 two levels) to **recursive** drill-down: descend into subdirectories to any depth and deselect
 what you find. This ADR fixes how the domain model represents a deep deselection so it is honored
