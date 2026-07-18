@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # SHA-pinned actions in .github/workflows are immutable by design; Dependabot is what
+  # keeps them current, re-pinning to the new commit and updating the trailing version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
