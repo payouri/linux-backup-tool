@@ -21,6 +21,7 @@ mod cli;
 mod restore_cmd;
 mod select_cmd;
 mod system;
+mod where_screen;
 
 use std::process::ExitCode;
 
@@ -40,5 +41,6 @@ fn run() -> anyhow::Result<()> {
     match cli::parse_args(args).map_err(anyhow::Error::msg)? {
         cli::Command::Restore(restore_args) => restore_cmd::run(&restore_args),
         cli::Command::Select => select_cmd::run(),
+        cli::Command::Where => where_screen::run(),
     }
 }

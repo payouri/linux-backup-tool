@@ -34,10 +34,13 @@ pub struct RestoreArgs {
 pub enum Command {
     Restore(RestoreArgs),
     Select,
+    /// The WHERE screen (#32) standing alone as its own subcommand, the same interim
+    /// landing spot as `Select`: runnable and verifiable against a real account's drives
+    /// ahead of `backup` chaining it into the full wizard (#33).
+    Where,
 }
 
-const USAGE: &str =
-    "usage: linux-backup restore <dir> [--verify] [--overwrite]\n       linux-backup select";
+const USAGE: &str = "usage: linux-backup restore <dir> [--verify] [--overwrite]\n       linux-backup select\n       linux-backup where";
 
 /// Parses a full argv (excluding argv[0], the program name) into a [`Command`].
 pub fn parse_args<I, S>(args: I) -> Result<Command, String>
@@ -53,6 +56,7 @@ where
     match subcommand.as_ref() {
         "restore" => parse_restore_args(iter),
         "select" => parse_select_args(iter),
+        "where" => parse_no_arg_command(iter, Command::Where),
         other => Err(format!("unknown command '{other}'\n{USAGE}")),
     }
 }
@@ -68,6 +72,19 @@ where
         return Err(format!("unexpected argument '{}'\n{USAGE}", extra.as_ref()));
     }
     Ok(Command::Select)
+}
+
+/// Accept a subcommand that takes no arguments, rejecting any extra token the same way
+/// `parse_select_args` does. Returns `command` when `rest` is empty.
+fn parse_no_arg_command<I, S>(rest: I, command: Command) -> Result<Command, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    if let Some(extra) = rest.into_iter().next() {
+        return Err(format!("unexpected argument '{}'\n{USAGE}", extra.as_ref()));
+    }
+    Ok(command)
 }
 
 fn parse_restore_args<I, S>(rest: I) -> Result<Command, String>
@@ -166,6 +183,18 @@ mod tests {
     #[test]
     fn rejects_select_with_an_unexpected_argument() {
         let err = parse_args(["select", "extra"]).expect_err("should reject");
+        assert!(err.contains("unexpected argument 'extra'"));
+    }
+
+    #[test]
+    fn parses_bare_where_with_no_arguments() {
+        let parsed = parse_args(["where"]).expect("should parse");
+        assert_eq!(parsed, Command::Where);
+    }
+
+    #[test]
+    fn rejects_where_with_an_unexpected_argument() {
+        let err = parse_args(["where", "extra"]).expect_err("should reject");
         assert!(err.contains("unexpected argument 'extra'"));
     }
 }

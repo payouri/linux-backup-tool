@@ -147,7 +147,12 @@ fn run_backup(
 
 /// `linux-backup-<host>-<timestamp>`, built entirely from `ctx` (ADR-0004) so it's
 /// deterministic under a fixed `RunContext` in tests.
-fn backup_dir_name(ctx: &RunContext) -> String {
+///
+/// `pub` so the WHERE screen (`crates/tui`, #32) can pre-check the Backup-dir collision
+/// (story 33) against the *same* name [`backup`] will later compute, rather than
+/// duplicating the format string and risking drift between the pre-flight check and the
+/// real run.
+pub fn backup_dir_name(ctx: &RunContext) -> String {
     let timestamp = ctx
         .now
         .duration_since(UNIX_EPOCH)
