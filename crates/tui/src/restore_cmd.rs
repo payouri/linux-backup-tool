@@ -8,13 +8,19 @@
 //! [`run`] enforces this structurally — `is_encrypted_backup` and `prompt_passphrase` both
 //! run to completion ahead of the one call into `restore::restore`, which is the only place
 //! in this module (or `core`) that writes anything to disk.
+//!
+//! Story 54's "confirm once" collision prompt is a CLI-scope stand-in (`--overwrite`) rather
+//! than an interactive per-collision confirmation: this binary has no interactive review
+//! step before RUN yet (that's the `inquire` wizard, still to land for `backup`), so there's
+//! no natural point to pause mid-restore and ask — the flag is read once, up front, same as
+//! `--verify`. A real "confirm once" prompt is TUI wizard territory for a future iteration.
 
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use inquire::Password;
 use linux_backup_core::restore::{self, OwnershipOutcome, RestoreOutcome, VerifyReport};
-use linux_backup_core::{archive, CoreError};
+use linux_backup_core::{archive, CoreError, Privilege};
 use secrecy::SecretString;
 
 use crate::cli::RestoreArgs;
@@ -35,6 +41,13 @@ pub fn run(args: &RestoreArgs) -> Result<()> {
     };
 
     let ctx = system::build_run_context()?;
+
+    // Story 53: the user must learn the ownership outcome *before* Restore proceeds, not
+    // just read it back afterward in the summary — `restore.rs`'s own doc comment (#26)
+    // calls this "up front" warning out as this command's (#29's) job to deliver.
+    if let Some(warning) = ownership_up_front_warning(ctx.privilege) {
+        println!("{warning}");
+    }
 
     let outcome = restore::restore(&args.backup_dir, &ctx, passphrase.as_ref(), args.overwrite)
         .map_err(describe_restore_error)?;
@@ -59,6 +72,21 @@ fn is_encrypted_backup(backup_dir: &Path) -> bool {
     backup_dir
         .join(archive::filename_for(archive::MANIFEST_FILENAME, true))
         .is_file()
+}
+
+/// Story 53's up-front ownership warning: `None` when running as root (nothing to warn
+/// about — ownership *will* be restored), `Some(message)` otherwise. A pure function of
+/// [`Privilege`] alone, so it's unit-testable without touching disk, matching this module's
+/// other renderers ([`format_summary`], [`format_verify_report`]).
+fn ownership_up_front_warning(privilege: Privilege) -> Option<String> {
+    match privilege {
+        Privilege::Root => None,
+        Privilege::NonRoot => Some(
+            "Note: not running as root — restored files will land under your current user; \
+             original file ownership (uid/gid) will not be restored."
+                .to_string(),
+        ),
+    }
 }
 
 /// Prompts for the passphrase via `inquire::Password`, holding it in a `secrecy::SecretString`
@@ -185,6 +213,18 @@ mod tests {
             vanished: Vec::new(),
             packages: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn ownership_up_front_warning_is_none_when_running_as_root() {
+        assert_eq!(ownership_up_front_warning(Privilege::Root), None);
+    }
+
+    #[test]
+    fn ownership_up_front_warning_names_the_ownership_outcome_when_not_root() {
+        let warning = ownership_up_front_warning(Privilege::NonRoot).expect("non-root must warn");
+        assert!(warning.contains("not running as root"));
+        assert!(warning.contains("uid/gid"));
     }
 
     #[test]
