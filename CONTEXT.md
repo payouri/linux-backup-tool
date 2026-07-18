@@ -42,8 +42,16 @@ A pre-computed starting state the user can override — which Categories start c
 _Avoid_: preset, recommendation
 
 **Drill-down**:
-Descending from a checked Category into its Entries to deselect individual ones (the heavy Plasma `icons/`/`wallpapers/` case). Deselections persist in the Profile.
+Descending from a checked Category through its Entries — and recursively into subdirectories to any depth — to deselect individual Entries or whole subtrees (the heavy Plasma `icons/`/`wallpapers/` case). Deselections persist in the Profile.
 _Avoid_: expand, detail view
+
+**Subtree deselection**:
+A Drill-down deselection applied to a directory at any depth, excluding every Entry beneath it (prefix-based — it prunes the whole subtree). The coarser of the two deselection granularities; the other is a single-Entry deselection. Exclusion is prefix-wins: re-inclusion cancels a deselection only at the exact node it was applied — there is no per-child carve-out of an excluded parent. Persisted (for historical reasons) in the Profile's `deselected_roots`, whose "root" now means any subtree, not only an allowlist root.
+_Avoid_: exclude rule, ignore pattern, negation
+
+**Partial selection**:
+A directory node whose descendants are a mix of selected and withheld Entries — the middle of the three-valued All / Partial / None state a Drill-down view shows for a node. Derived from the Selection, never stored.
+_Avoid_: indeterminate, mixed, half-checked
 
 **Hide-empty**:
 The scan-first rule: a discoverable Category with no matching paths on this machine is hidden from Selection. Custom paths is exempt (always shown, as the add affordance).
