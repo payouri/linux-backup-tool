@@ -24,7 +24,7 @@ use secrecy::SecretString;
 use linux_backup_core::archive::Encryption;
 use linux_backup_core::context::{Privilege, RunContext};
 use linux_backup_core::model::{Entry, EntryRoot, SelectionModel};
-use linux_backup_core::packages::NoCommandRunner;
+use linux_backup_core::packages::{CommandRunner, NoCommandRunner};
 use linux_backup_core::restore::RestoreOutcome;
 use linux_backup_core::{catalog, crypto, manifest, scan, BackupOutcome, CoreError};
 
@@ -101,13 +101,15 @@ fn run_backup(
 /// Runs `core::restore`. `passphrase` is `None` for an unencrypted Backup and
 /// `Some(&passphrase)` for an encrypted one — see `restore::restore`'s doc for why the
 /// signature carries it explicitly rather than reading it from the Backup dir itself
-/// (encryption is never persisted, per CONTEXT.md's Profile entry).
+/// (encryption is never persisted, per CONTEXT.md's Profile entry). `overwrite_existing` is
+/// story 54's collision switch — `false` here reflects every pre-#26 test's assumption of a
+/// clean restore root; `overwrite_collision_*` tests below exercise both values directly.
 fn run_restore(
     backup_dir: &Path,
     ctx: &RunContext,
     passphrase: Option<&SecretString>,
 ) -> Result<RestoreOutcome, CoreError> {
-    linux_backup_core::restore::restore(backup_dir, ctx, passphrase)
+    linux_backup_core::restore::restore(backup_dir, ctx, passphrase, false)
 }
 
 /// Builds a synthetic `$HOME` under `root` exercising more than one Category at once
@@ -889,4 +891,201 @@ fn kde_plasma_drill_down_deselection_excludes_exactly_those_entries_from_the_rou
         !restore_home.join(".local/share/wallpapers").exists(),
         "deselected wallpapers/ Entry must never land on restore"
     );
+}
+
+/// A [`CommandRunner`] returning fixed, canned stdout per program — unlike
+/// `packages::NoCommandRunner` (every manager absent, used by every other test on this
+/// seam), this lets a test exercise `reinstall.sh` generation against Manifest Package
+/// lists that were actually captured (#25), without touching real package managers.
+struct FakeCommandRunner {
+    pacman: Option<&'static str>,
+    npm: Option<&'static str>,
+}
+
+impl CommandRunner for FakeCommandRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Option<String> {
+        match (program, args) {
+            ("pacman", ["-Qen"]) => self.pacman.map(str::to_string),
+            ("npm", ["list", "-g", "--depth=0", "--json"]) => self.npm.map(str::to_string),
+            _ => None,
+        }
+    }
+}
+
+/// Issue #26 / story 54: an existing file at a restore target must require the explicit
+/// `overwrite_existing` switch before being overwritten — this is `core`'s mechanism behind
+/// the single confirmation prompt (`tui`'s job, #29), distinct from the Backup-dir-name
+/// collision (#19/#27) which guards where the *Backup itself* is written, not a restore
+/// target.
+#[test]
+fn restore_collision_requires_explicit_overwrite_flag() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output.clone());
+    let selection = shell_selection(&ctx);
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    let restore_home = tmp.path().join("restored-home");
+    let conflicting_path = restore_home.join(".oh-my-zsh/custom/aliases.zsh");
+    fs::create_dir_all(conflicting_path.parent().unwrap())
+        .expect("create pre-existing conflicting dir");
+    fs::write(&conflicting_path, b"pre-existing content that must survive")
+        .expect("write pre-existing conflicting file");
+
+    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+
+    // Without the flag: the collision is reported, not silently clobbered, and the
+    // pre-existing content is left exactly as it was.
+    let outcome_no_overwrite =
+        linux_backup_core::restore::restore(&outcome.backup_dir, &restore_ctx, None, false)
+            .expect("restore should still complete despite one collision (ADR-0002)");
+
+    assert_eq!(
+        fs::read(&conflicting_path).expect("conflicting file should still exist"),
+        b"pre-existing content that must survive"
+    );
+    let collision_failure = outcome_no_overwrite
+        .failures
+        .iter()
+        .find(|f| f.path == conflicting_path.display().to_string())
+        .expect("the collision must be reported as a failure");
+    assert!(
+        collision_failure.reason.contains("collision"),
+        "failure reason should name the collision: {}",
+        collision_failure.reason
+    );
+    // The other fixture file, with no collision, must still land normally — one collision
+    // must not abort the rest of the run (ADR-0002).
+    assert_eq!(
+        fs::read(restore_home.join(".oh-my-zsh/custom/plugins/my-plugin/my-plugin.plugin.zsh"))
+            .expect("non-colliding file should still be restored"),
+        fs::read(
+            tmp.path()
+                .join("home")
+                .join(".oh-my-zsh/custom/plugins/my-plugin/my-plugin.plugin.zsh")
+        )
+        .expect("original plugin file should exist")
+    );
+
+    // With the flag: the same restore now overwrites the conflicting file with the
+    // Backup's content.
+    let outcome_with_overwrite =
+        linux_backup_core::restore::restore(&outcome.backup_dir, &restore_ctx, None, true)
+            .expect("restore with overwrite_existing should succeed");
+
+    assert!(
+        outcome_with_overwrite
+            .failures
+            .iter()
+            .all(|f| !f.reason.contains("collision")),
+        "no collision should be reported once overwrite_existing is set: {:?}",
+        outcome_with_overwrite.failures
+    );
+    assert_eq!(
+        fs::read(&conflicting_path).expect("file should exist after overwrite"),
+        fs::read(tmp.path().join("home/.oh-my-zsh/custom/aliases.zsh"))
+            .expect("original aliases.zsh should exist"),
+        "overwrite_existing=true must let the Backup's content replace the pre-existing file"
+    );
+}
+
+/// Issue #26 / story 56: `reinstall.sh` is written from the Manifest's actual captured
+/// Package lists (#25) — unpinned, correct per-manager counts, never executed by anything
+/// in `core`.
+#[test]
+fn reinstall_script_is_written_with_correct_per_manager_counts_from_captured_packages() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output.clone());
+    let selection = shell_selection(&ctx);
+
+    let runner = FakeCommandRunner {
+        pacman: Some("acpi 1.8-2\nripgrep 13.0.0-1\n"),
+        npm: Some(r#"{"dependencies": {"typescript": {"version": "4.8.3"}}}"#),
+    };
+    let outcome = linux_backup_core::backup(&selection, &ctx, &Encryption::None, &runner)
+        .expect("backup should succeed");
+
+    assert_eq!(
+        outcome.manifest.packages[linux_backup_core::packages::PACMAN].len(),
+        2
+    );
+    assert_eq!(
+        outcome.manifest.packages[linux_backup_core::packages::NPM].len(),
+        1
+    );
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
+
+    assert_eq!(
+        restore_outcome.package_counts[linux_backup_core::packages::PACMAN],
+        2
+    );
+    assert_eq!(
+        restore_outcome.package_counts[linux_backup_core::packages::NPM],
+        1
+    );
+
+    assert_eq!(
+        restore_outcome.reinstall_script_path,
+        restore_home.join("reinstall.sh")
+    );
+    let script = fs::read_to_string(&restore_outcome.reinstall_script_path)
+        .expect("reinstall.sh should have been written");
+    assert!(script.contains("sudo pacman -S --needed acpi ripgrep"));
+    assert!(script.contains("npm install -g typescript"));
+    // Story 48/56: never pin captured versions.
+    assert!(!script.contains("1.8-2") && !script.contains("13.0.0") && !script.contains("4.8.3"));
+}
+
+/// Issue #26 / story 57: the opt-in `--verify` pass (the underlying `core` function; wiring
+/// an actual CLI flag is #29's job) must catch a restored file that was tampered with after
+/// a successful restore.
+#[test]
+fn verify_pass_flags_a_deliberately_corrupted_restored_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output.clone());
+    let selection = shell_selection(&ctx);
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home.clone(), output.clone());
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
+    assert!(restore_outcome.failures.is_empty());
+
+    // Tamper with one restored file after a successful restore.
+    let tampered = restore_home.join(".oh-my-zsh/custom/aliases.zsh");
+    fs::write(
+        &tampered,
+        b"tampered bytes that do not match the Manifest checksum",
+    )
+    .expect("tamper with restored file");
+
+    let report = linux_backup_core::restore::verify(&restore_ctx, &restore_outcome.manifest);
+
+    assert!(!report.is_clean());
+    assert_eq!(report.mismatched.len(), 1);
+    assert_eq!(
+        report.mismatched[0].path,
+        "home/.oh-my-zsh/custom/aliases.zsh"
+    );
+    assert!(report.missing.is_empty());
+    // The other, untouched restored file must still verify clean.
+    assert!(report
+        .matched
+        .contains(&"home/.oh-my-zsh/custom/plugins/my-plugin/my-plugin.plugin.zsh".to_string()));
 }
