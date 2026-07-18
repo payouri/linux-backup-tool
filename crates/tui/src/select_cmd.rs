@@ -22,7 +22,7 @@
 //! background-updating widget.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use inquire::error::InquireError;
@@ -113,12 +113,18 @@ fn empty_selection_message() -> &'static str {
     "Selection is empty — check something, add a Custom path, or Esc to quit."
 }
 
-/// Lets the user fine-tune one Category's individual Entries (CONTEXT.md's "Drill-down"):
-/// unconditionally loads every one of `scan`'s Entries into `model` first
-/// (`SelectionModel::select_category` is idempotent and preserves any already-withheld
-/// Entry), so the per-Entry checklist below always has something in the model to
-/// reselect/deselect against — including for a Category whose Smart default was OFF and so
-/// was never part of `model` at all before this call.
+/// Lets the user fine-tune one Category by toggling its Curated-allowlist roots
+/// (CONTEXT.md's "Drill-down", #38 / story 13): unconditionally loads every one of `scan`'s
+/// Entries into `model` first (`SelectionModel::select_category` is idempotent and preserves
+/// any already-deselected root), so the checklist below always has something in the model to
+/// reselect/deselect against — including for a Category whose Smart default was OFF and so was
+/// never part of `model` at all before this call.
+///
+/// The toggleable unit is the allowlist *root*, not each expanded file: a single-file root
+/// (e.g. `.config/kwinrc`) is its own row, a heavy directory root (`.local/share/icons`, the
+/// ~40,000-file icon theme) is one row standing in for its whole subtree — so dropping it is a
+/// single toggle rather than unchecking tens of thousands of files. Only roots that actually
+/// resolved to Entries on this machine are shown.
 fn drill_down(scan: &CategoryScan, model: &mut SelectionModel) -> Result<()> {
     if scan.entries.is_empty() {
         println!("{} has no discovered Entries.", scan.category.name);
@@ -127,33 +133,53 @@ fn drill_down(scan: &CategoryScan, model: &mut SelectionModel) -> Result<()> {
 
     model.select_category(scan);
 
-    let default_indices: Vec<usize> = scan
-        .entries
+    let roots: Vec<&'static str> = scan
+        .category
+        .allowlist
+        .iter()
+        .copied()
+        .filter(|root| {
+            scan.entries
+                .iter()
+                .any(|entry| entry.relative_path.starts_with(root))
+        })
+        .collect();
+
+    if roots.is_empty() {
+        println!(
+            "{} has no allowlist roots to drill into.",
+            scan.category.name
+        );
+        return Ok(());
+    }
+
+    let default_indices: Vec<usize> = roots
         .iter()
         .enumerate()
-        .filter(|(_, e)| !model.is_deselected(&e.relative_path))
+        .filter(|(_, root)| !model.is_root_deselected(Path::new(root)))
         .map(|(i, _)| i)
         .collect();
 
     let message = format!(
-        "Drill-down: {} — space to toggle an Entry, enter to confirm",
+        "Drill-down: {} — space to toggle an allowlist root, enter to confirm",
         scan.category.name
     );
-    let rows: Vec<EntryRow> = scan.entries.iter().map(entry_row).collect();
+    let rows: Vec<RootRow> = roots.iter().map(|root| root_row(root, scan)).collect();
 
     let selected = MultiSelect::new(&message, rows)
         .with_default(&default_indices)
         .prompt()
         .context("Drill-down prompt failed")?;
 
-    let selected_paths: std::collections::BTreeSet<PathBuf> =
-        selected.into_iter().map(|row| row.relative_path).collect();
+    let selected_roots: std::collections::BTreeSet<PathBuf> =
+        selected.into_iter().map(|row| row.root).collect();
 
-    for entry in &scan.entries {
-        if selected_paths.contains(&entry.relative_path) {
-            model.reselect_entry(&entry.relative_path);
+    for root in &roots {
+        let root_path = PathBuf::from(root);
+        if selected_roots.contains(&root_path) {
+            model.reselect_root(&root_path);
         } else {
-            model.deselect_entry(&entry.relative_path);
+            model.deselect_root(&root_path);
         }
     }
 
@@ -326,34 +352,54 @@ fn footer_text(model: &SelectionModel) -> String {
     format!("Running total: {size} · {encryption}")
 }
 
-/// One Drill-down Entry row: the relative path (for diffing the `MultiSelect` result back
-/// against `scan.entries` in [`drill_down`]) alongside its pre-rendered display text.
-struct EntryRow {
-    relative_path: PathBuf,
+/// One Drill-down root row: the allowlist root (for diffing the `MultiSelect` result back
+/// against `roots` in [`drill_down`]) alongside its pre-rendered display text.
+struct RootRow {
+    root: PathBuf,
     label: String,
 }
 
-impl fmt::Display for EntryRow {
+impl fmt::Display for RootRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.label)
     }
 }
 
-fn entry_row(entry: &Entry) -> EntryRow {
-    EntryRow {
-        relative_path: entry.relative_path.clone(),
-        label: entry_row_label(entry),
+fn root_row(root: &str, scan: &CategoryScan) -> RootRow {
+    RootRow {
+        root: PathBuf::from(root),
+        label: root_row_label(root, scan),
     }
 }
 
-/// Renders one Drill-down Entry row: relative path, 🔒 if Sensitive, and on-disk size.
-/// Checked/unchecked state itself is `MultiSelect`'s own rendering (driven by
-/// `with_default`), not encoded in this label.
-fn entry_row_label(entry: &Entry) -> String {
-    let lock = if entry.sensitive { " 🔒" } else { "" };
-    let size = std::fs::metadata(&entry.absolute_path)
-        .map_or_else(|_| "unknown size".to_string(), |m| format_size(m.len()));
-    format!("{}{lock} — {size}", entry.relative_path.display())
+/// Renders one Drill-down root row: the root path, 🔒 if any Entry under it is Sensitive, and
+/// the count + summed on-disk size of the subtree it stands for — so a user weighs a whole
+/// directory Entry (e.g. the ~226MB icon theme) before dropping it in one toggle.
+/// Checked/unchecked state itself is `MultiSelect`'s own rendering (driven by `with_default`),
+/// not encoded in this label.
+fn root_row_label(root: &str, scan: &CategoryScan) -> String {
+    let under: Vec<&Entry> = scan
+        .entries
+        .iter()
+        .filter(|entry| entry.relative_path.starts_with(root))
+        .collect();
+    let count = under.len();
+    let size: u64 = under
+        .iter()
+        .filter_map(|entry| std::fs::metadata(&entry.absolute_path).ok())
+        .map(|m| m.len())
+        .sum();
+    let lock = if under.iter().any(|entry| entry.sensitive) {
+        " 🔒"
+    } else {
+        ""
+    };
+    let files = if count == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{count} files")
+    };
+    format!("{root}{lock} — {files}, {}", format_size(size))
 }
 
 /// Human-readable byte count (`B`/`KB`/`MB`/`GB`, 1024-based), shared by Category and Entry
@@ -587,18 +633,54 @@ mod tests {
     }
 
     #[test]
-    fn entry_row_label_includes_lock_icon_only_when_sensitive() {
+    fn root_row_label_sums_the_subtree_and_locks_when_any_entry_is_sensitive() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let sensitive_entry = entry_with_size(tmp.path(), catalog::SSH.name, "id_ed25519", 256);
-        let sensitive_entry = Entry {
-            sensitive: true,
-            ..sensitive_entry
+        // Two files under one heavy directory root — the row must report the whole subtree
+        // (2 files, 300 B), not a single Entry, since the root is the toggleable unit.
+        let icon_a = entry_with_size(
+            tmp.path(),
+            catalog::KDE_PLASMA.name,
+            ".local/share/icons/a.svg",
+            100,
+        );
+        let icon_b = entry_with_size(
+            tmp.path(),
+            catalog::KDE_PLASMA.name,
+            ".local/share/icons/b.svg",
+            200,
+        );
+        let scan = CategoryScan {
+            category: catalog::KDE_PLASMA,
+            entries: vec![icon_a, icon_b],
         };
-        let plain_entry = entry_with_size(tmp.path(), catalog::SHELL.name, "aliases.zsh", 256);
 
-        assert!(entry_row_label(&sensitive_entry).contains('🔒'));
-        assert!(!entry_row_label(&plain_entry).contains('🔒'));
-        assert!(entry_row_label(&plain_entry).contains("256 B"));
+        let label = root_row_label(".local/share/icons", &scan);
+
+        assert!(label.starts_with(".local/share/icons"));
+        assert!(label.contains("2 files"));
+        assert!(label.contains("300 B"));
+        // Nothing under this root is Sensitive, so no lock.
+        assert!(!label.contains('🔒'));
+    }
+
+    #[test]
+    fn root_row_label_marks_a_single_file_root_and_flags_sensitivity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key = entry_with_size(tmp.path(), catalog::SSH.name, ".ssh/id_ed25519", 256);
+        let key = Entry {
+            sensitive: true,
+            ..key
+        };
+        let scan = CategoryScan {
+            category: catalog::SSH,
+            entries: vec![key],
+        };
+
+        let label = root_row_label(".ssh/id_ed25519", &scan);
+
+        assert!(label.contains("1 file"));
+        assert!(label.contains("256 B"));
+        assert!(label.contains('🔒'));
     }
 
     #[test]

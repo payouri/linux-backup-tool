@@ -981,6 +981,91 @@ fn kde_plasma_drill_down_deselection_excludes_exactly_those_entries_from_the_rou
     );
 }
 
+/// Issue #38 / story 13: proves *root-level* Drill-down deselection through the full
+/// backup/restore seam — deselecting KDE Plasma's `.local/share/icons` and
+/// `.local/share/wallpapers` allowlist roots as whole units (not each expanded file) keeps
+/// their entire subtrees out of the Manifest, Archive, and restore, while `kwinrc` (the rest
+/// of the otherwise-checked Category) still lands and the Category-level Smart default is
+/// never touched. This is the acceptance test for dropping the ~226MB icon theme in one action.
+#[test]
+fn kde_plasma_root_level_deselection_excludes_the_whole_subtree_from_the_round_trip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_kde_plasma_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home.clone(), output.clone());
+    let scanned = scan::scan_taxonomy(&ctx);
+    let mut selection = SelectionModel::from_smart_defaults(&scanned);
+
+    let icons_root = PathBuf::from(".local/share/icons");
+    let wallpapers_root = PathBuf::from(".local/share/wallpapers");
+
+    // One toggle per heavy directory root drops its whole subtree — the point of #38.
+    selection.deselect_root(&icons_root);
+    selection.deselect_root(&wallpapers_root);
+
+    // The Category-level checkbox is untouched: kwinrc stays selected (partial, not off), and
+    // the roots are recorded as two root paths — not the individual files they expand to.
+    assert!(selection
+        .entries()
+        .iter()
+        .any(|e| e.relative_path == Path::new(".config/kwinrc")));
+    assert!(!selection.is_empty());
+    assert!(selection.is_root_deselected(&icons_root));
+    assert!(selection.is_root_deselected(&wallpapers_root));
+    assert!(
+        selection.deselected_paths().is_empty(),
+        "a root deselection records roots, never each expanded file"
+    );
+    assert_eq!(
+        selection.deselected_roots(),
+        &std::collections::BTreeSet::from([icons_root.clone(), wallpapers_root.clone()])
+    );
+
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    let manifest_paths: std::collections::BTreeSet<&str> = outcome
+        .manifest
+        .entries
+        .iter()
+        .map(|e| e.path.as_str())
+        .collect();
+    assert!(manifest_paths.contains(".config/kwinrc"));
+    assert!(
+        manifest_paths
+            .iter()
+            .all(|p| !p.contains("icons") && !p.contains("wallpapers")),
+        "no Entry under a deselected root may reach the Manifest: {manifest_paths:?}"
+    );
+    assert!(outcome.manifest.checksums.keys().all(
+        |archive_path| !archive_path.contains("icons") && !archive_path.contains("wallpapers")
+    ));
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home.clone(), output);
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
+
+    assert!(
+        restore_outcome.failures.is_empty(),
+        "unexpected restore failures: {:?}",
+        restore_outcome.failures
+    );
+    assert_eq!(
+        fs::read(restore_home.join(".config/kwinrc")).expect("restored kwinrc should exist"),
+        fs::read(home.join(".config/kwinrc")).expect("original kwinrc should exist"),
+    );
+    assert!(
+        !restore_home.join(".local/share/icons").exists(),
+        "the deselected icons/ root must never land on restore"
+    );
+    assert!(
+        !restore_home.join(".local/share/wallpapers").exists(),
+        "the deselected wallpapers/ root must never land on restore"
+    );
+}
+
 /// A [`CommandRunner`] returning fixed, canned stdout per program — unlike
 /// `packages::NoCommandRunner` (every manager absent, used by every other test on this
 /// seam), this lets a test exercise `reinstall.sh` generation against Manifest Package

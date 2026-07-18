@@ -45,6 +45,11 @@ pub struct Profile {
     /// [`SelectionModel::deselected_paths`] (CONTEXT.md's "Drill-down": deselections persist).
     #[serde(default)]
     pub deselected_paths: Vec<PathBuf>,
+    /// Drill-down deselected allowlist roots (#38, story 13), straight from
+    /// [`SelectionModel::deselected_roots`] — a whole heavy directory Entry (e.g. KDE Plasma's
+    /// `icons/`) remembered as one root path rather than the many files it expands to.
+    #[serde(default)]
+    pub deselected_roots: Vec<PathBuf>,
     /// The last Output location (a directory, never the Backup dir itself). `None` after a
     /// prune drops it (the drive it named is gone) or when no run has bound one yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,11 +89,13 @@ impl Profile {
             .collect();
 
         let deselected_paths = selection.deselected_paths().iter().cloned().collect();
+        let deselected_roots = selection.deselected_roots().iter().cloned().collect();
 
         Self {
             selected_categories,
             custom_paths,
             deselected_paths,
+            deselected_roots,
             output_location,
         }
     }
@@ -125,6 +132,13 @@ impl Profile {
         }
         for deselected in &self.deselected_paths {
             model.deselect_entry(deselected);
+        }
+        // Root-level deselections (#38) re-apply the same self-correcting way as per-file ones:
+        // a remembered root whose subtree no longer scans records nothing
+        // ([`SelectionModel::deselect_root`] is a no-op when it covers no Entry), so a vanished
+        // heavy directory needs no dedicated prune pass.
+        for root in &self.deselected_roots {
+            model.deselect_root(root);
         }
         model
     }
@@ -220,6 +234,7 @@ mod tests {
             selected_categories: vec!["SSH".to_string(), "KDE Plasma".to_string()],
             custom_paths: vec![PathBuf::from("/home/test/notes")],
             deselected_paths: vec![PathBuf::from(".local/share/icons/heavy.svg")],
+            deselected_roots: vec![PathBuf::from(".local/share/wallpapers")],
             output_location: Some(PathBuf::from("/run/media/test/USB")),
         };
 
@@ -301,6 +316,7 @@ mod tests {
             selected_categories: vec!["SSH".to_string()],
             custom_paths: vec![PathBuf::from("/home/test/notes")],
             deselected_paths: vec![PathBuf::from(".config/kwinrc")],
+            deselected_roots: vec![PathBuf::from(".local/share/icons")],
             output_location: Some(PathBuf::from("/run/media/test/USB")),
         };
 
@@ -362,6 +378,55 @@ mod tests {
         assert_eq!(
             profile.output_location,
             Some(PathBuf::from("/run/media/test/USB"))
+        );
+    }
+
+    #[test]
+    fn selection_round_trips_a_root_level_deselection() {
+        // #38: a whole allowlist root dropped in Drill-down must persist as one root path and
+        // reconstruct into the same withheld subtree on the next run.
+        let home = PathBuf::from("/home/test");
+        let plasma = scan(
+            catalog::KDE_PLASMA,
+            vec![
+                entry(catalog::KDE_PLASMA.name, false, ".config/kwinrc"),
+                entry(catalog::KDE_PLASMA.name, false, ".local/share/icons/a.svg"),
+                entry(catalog::KDE_PLASMA.name, false, ".local/share/icons/b.svg"),
+            ],
+        );
+        let scanned = vec![plasma];
+
+        let mut original = SelectionModel::new(
+            scanned
+                .iter()
+                .flat_map(|s| s.entries.iter().cloned())
+                .collect(),
+        );
+        original.deselect_root(Path::new(".local/share/icons"));
+
+        let profile = Profile::from_selection(&original, None);
+        // Persisted as exactly one root, not the two files it expands to.
+        assert_eq!(
+            profile.deselected_roots,
+            vec![PathBuf::from(".local/share/icons")]
+        );
+        assert!(profile.deselected_paths.is_empty());
+
+        let reconstructed = profile.to_selection_model(&scanned, &home);
+
+        let active_paths: BTreeSet<PathBuf> = reconstructed
+            .entries()
+            .iter()
+            .map(|e| e.relative_path.clone())
+            .collect();
+        assert_eq!(
+            active_paths,
+            BTreeSet::from([PathBuf::from(".config/kwinrc")])
+        );
+        assert!(reconstructed.is_root_deselected(Path::new(".local/share/icons")));
+        assert_eq!(
+            reconstructed.deselected_roots(),
+            original.deselected_roots()
         );
     }
 

@@ -15,11 +15,23 @@
 //! physically moved out of `entries` into `withheld`, so every "what's actually selected"
 //! accessor below (`selected_paths`, `total_size`, `warnings`, `encryption_required`, and the
 //! `entries()` slice `backup()` hands to `archive::build`/the Manifest builder) sees it
-//! disappear for free, with no per-accessor filtering to keep in sync. `withheld` and
-//! `deselected` exist side by side because they serve different callers: `withheld` keeps
-//! the full `Entry` around so a Drill-down UI can re-list and reselect it; `deselected` is
-//! the plain `BTreeSet<PathBuf>` of relative paths — the storable shape #34 (Profile
-//! persistence) needs to remember deselections across runs (CONTEXT.md's "Profile").
+//! disappear for free, with no per-accessor filtering to keep in sync. `withheld` keeps the
+//! full `Entry` around so a Drill-down UI can re-list and reselect it; `deselected` is the
+//! plain `BTreeSet<PathBuf>` of relative paths — the storable shape #34 (Profile persistence)
+//! needs to remember deselections across runs (CONTEXT.md's "Profile").
+//!
+//! #38 scope (story 13, the same "Drill-down"): `deselect_root`/`reselect_root` deselect a
+//! whole allowlist root (a directory Entry like KDE Plasma's `icons/`/`wallpapers/`) as one
+//! toggleable unit, so dropping a ~40,000-file icon theme is a single action rather than
+//! unchecking every expanded file. A root deselection is prefix-based — every Entry whose
+//! `relative_path` is under the root moves to `withheld` — and is remembered in its own
+//! `deselected_roots` set (the storable shape the Profile persists, one root path instead of
+//! the tens of thousands it expands to). An Entry is withheld from the active Selection when
+//! *either* registry excludes it: its exact path is in `deselected`, or one of
+//! `deselected_roots` is a path-prefix of it (`is_under_deselected_root`). Every path that
+//! (re)activates an Entry — `reselect_entry`, `reselect_root`, `select_category` — honors both
+//! registries, so an Entry under a still-deselected root can never slip back into the active
+//! Selection.
 //!
 //! #22 scope: `encryption_required` delegates to `crypto::evaluate`'s Auto-insist policy —
 //! see that module for which specific Categories/Entries triggered it.
@@ -124,12 +136,19 @@ pub struct SelectionModel {
     /// The currently active Entries — see the module doc's #21 section for why every
     /// derived accessor reads only this field.
     entries: Vec<Entry>,
-    /// Entries deselected via Drill-down, held here rather than dropped so
-    /// `entries_in_category`/`reselect_entry` can still find them.
+    /// Entries deselected via Drill-down (per-file or by root), held here rather than dropped
+    /// so `entries_in_category`/`reselect_entry`/`reselect_root` can still find them.
     withheld: Vec<Entry>,
-    /// The relative paths of every currently-withheld Entry, kept in lockstep with
-    /// `withheld` — the storable shape exposed by `deselected_paths` for #34 to persist.
+    /// The relative paths of Entries deselected individually (per-file Drill-down) — the
+    /// storable shape exposed by `deselected_paths` for #34 to persist. A subset of the
+    /// withheld Entries' paths: a root-level deselection withholds Entries without listing
+    /// each here (that's `deselected_roots`' job).
     deselected: BTreeSet<PathBuf>,
+    /// The allowlist roots deselected as whole units (#38) — a directory Entry like
+    /// `.local/share/icons` recorded once instead of every file under it. Any withheld Entry
+    /// whose `relative_path` starts with one of these is excluded by that root, not a per-file
+    /// mark. The storable shape exposed by `deselected_roots` for the Profile to persist.
+    deselected_roots: BTreeSet<PathBuf>,
 }
 
 impl SelectionModel {
@@ -142,6 +161,7 @@ impl SelectionModel {
             entries,
             withheld: Vec::new(),
             deselected: BTreeSet::new(),
+            deselected_roots: BTreeSet::new(),
         }
     }
 
@@ -208,25 +228,41 @@ impl SelectionModel {
         self.withheld.push(entry);
     }
 
-    /// Reverses `deselect_entry`: moves the Entry back into the active Selection. A no-op
-    /// if `relative_path` isn't currently withheld.
+    /// Reverses `deselect_entry`: clears `relative_path`'s per-file deselection and moves the
+    /// Entry back into the active Selection. A no-op if `relative_path` isn't currently
+    /// withheld. If the Entry is *also* under a still-deselected root (#38), the per-file mark
+    /// is cleared but the Entry stays withheld — the root deselection still excludes it, so it
+    /// must not slip back into the active Selection.
     pub fn reselect_entry(&mut self, relative_path: &Path) {
-        let Some(pos) = self
+        self.deselected.remove(relative_path);
+        if self.is_under_deselected_root(relative_path) {
+            return;
+        }
+        if let Some(pos) = self
             .withheld
             .iter()
             .position(|e| e.relative_path == relative_path)
-        else {
-            return;
-        };
-        let entry = self.withheld.remove(pos);
-        self.deselected.remove(&entry.relative_path);
-        self.entries.push(entry);
+        {
+            let entry = self.withheld.remove(pos);
+            self.entries.push(entry);
+        }
     }
 
-    /// Whether `relative_path` is currently deselected (withheld from the active
-    /// Selection).
+    /// Whether `relative_path` carries an individual (per-file) Drill-down deselection. This
+    /// is the per-file registry only — an Entry withheld because a whole root above it was
+    /// deselected (#38) is *not* reported here; use `is_root_deselected` for that.
     pub fn is_deselected(&self, relative_path: &Path) -> bool {
         self.deselected.contains(relative_path)
+    }
+
+    /// Whether `relative_path` falls under any currently-deselected allowlist root (#38) — a
+    /// root path-prefix of it. Path-component-wise (`Path::starts_with`), so a deselected
+    /// `.local/share/icons` covers `.local/share/icons/hicolor/x.svg` but not a sibling
+    /// `.local/share/icons-backup`.
+    fn is_under_deselected_root(&self, relative_path: &Path) -> bool {
+        self.deselected_roots
+            .iter()
+            .any(|root| relative_path.starts_with(root))
     }
 
     /// Category-level toggle ON (the WHAT screen's Category checkbox, #30): adds every
@@ -256,23 +292,34 @@ impl SelectionModel {
             .collect();
 
         let mut to_reselect = Vec::new();
-        let mut to_push = Vec::new();
+        let mut to_push_active = Vec::new();
+        let mut to_push_withheld = Vec::new();
         for entry in &scan.entries {
             let path = entry.relative_path.as_path();
             if active.contains(path) {
                 continue;
             }
+            // A root-level Drill-down deselection (#38) survives a Category (re)select: its
+            // subtree stays withheld even as the Category is turned on as a whole. Only a
+            // per-file withhold is lifted here — so an Entry already withheld under a
+            // still-deselected root is left where it is, and a brand-new Entry that lands under
+            // one goes straight to `withheld` rather than the active Selection.
             if withheld.contains(path) {
-                to_reselect.push(entry.relative_path.clone());
+                if !self.is_under_deselected_root(path) {
+                    to_reselect.push(entry.relative_path.clone());
+                }
+            } else if self.is_under_deselected_root(path) {
+                to_push_withheld.push(entry.clone());
             } else {
-                to_push.push(entry.clone());
+                to_push_active.push(entry.clone());
             }
         }
 
         for path in to_reselect {
             self.reselect_entry(&path);
         }
-        self.entries.extend(to_push);
+        self.entries.extend(to_push_active);
+        self.withheld.extend(to_push_withheld);
     }
 
     /// Category-level toggle OFF: removes every Entry belonging to `category_name` from the
@@ -295,13 +342,87 @@ impl SelectionModel {
         for path in removed_withheld {
             self.deselected.remove(&path);
         }
+        // Drop any root-level deselection (#38) that no longer covers a remaining Entry: a
+        // Category toggled fully off carries no partial memory — per-file or per-root — into
+        // its next toggle-on, matching this method's existing "an unchecked box carries no
+        // partial memory" contract above.
+        self.deselected_roots.retain(|root| {
+            self.entries
+                .iter()
+                .chain(self.withheld.iter())
+                .any(|e| e.relative_path.starts_with(root))
+        });
+    }
+
+    /// Deselects a whole allowlist root (#38, story 13): every currently-active Entry whose
+    /// `relative_path` is under `root` moves to `withheld` in one action, and `root` is
+    /// recorded in `deselected_roots` (so the exclusion — and its size — survives without
+    /// listing each expanded file). This is how a heavy directory Entry (KDE Plasma's
+    /// `icons/`/`wallpapers/`) is dropped as a single toggleable unit rather than by unchecking
+    /// tens of thousands of files. A no-op that records nothing if no known Entry (active or
+    /// withheld) falls under `root`, so a phantom root never lingers in the persisted set.
+    pub fn deselect_root(&mut self, root: &Path) {
+        let covers_any = self
+            .entries
+            .iter()
+            .chain(self.withheld.iter())
+            .any(|e| e.relative_path.starts_with(root));
+        if !covers_any {
+            return;
+        }
+
+        let mut still_active = Vec::with_capacity(self.entries.len());
+        for entry in std::mem::take(&mut self.entries) {
+            if entry.relative_path.starts_with(root) {
+                self.withheld.push(entry);
+            } else {
+                still_active.push(entry);
+            }
+        }
+        self.entries = still_active;
+        self.deselected_roots.insert(root.to_path_buf());
+    }
+
+    /// Reverses `deselect_root`: clears `root`'s deselection and moves its withheld Entries
+    /// back into the active Selection — except any Entry still excluded by another origin: an
+    /// individual per-file deselection (`deselected`) or a *different* root still deselected
+    /// and also covering it. A no-op if `root` wasn't deselected.
+    pub fn reselect_root(&mut self, root: &Path) {
+        self.deselected_roots.remove(root);
+
+        let mut still_withheld = Vec::with_capacity(self.withheld.len());
+        for entry in std::mem::take(&mut self.withheld) {
+            let reactivatable = entry.relative_path.starts_with(root)
+                && !self.deselected.contains(&entry.relative_path)
+                && !self.is_under_deselected_root(&entry.relative_path);
+            if reactivatable {
+                self.entries.push(entry);
+            } else {
+                still_withheld.push(entry);
+            }
+        }
+        self.withheld = still_withheld;
+    }
+
+    /// Whether `root` is currently deselected as a whole unit (#38) — the exact-match query a
+    /// Drill-down UI uses to render a root's checkbox, distinct from `is_under_deselected_root`
+    /// (which asks whether an arbitrary Entry path falls under *some* deselected root).
+    pub fn is_root_deselected(&self, root: &Path) -> bool {
+        self.deselected_roots.contains(root)
     }
 
     /// The relative paths of every currently-deselected Entry — the plain, storable shape
-    /// #34 (Profile persistence) needs to remember Drill-down deselections across runs
+    /// #34 (Profile persistence) needs to remember per-file Drill-down deselections across runs
     /// (CONTEXT.md's "Drill-down": "Deselections persist in the Profile").
     pub fn deselected_paths(&self) -> &BTreeSet<PathBuf> {
         &self.deselected
+    }
+
+    /// The allowlist roots currently deselected as whole units (#38) — the storable shape the
+    /// Profile persists alongside `deselected_paths`, one root path instead of the many files
+    /// it expands to.
+    pub fn deselected_roots(&self) -> &BTreeSet<PathBuf> {
+        &self.deselected_roots
     }
 
     /// Every Entry belonging to `category` — active or withheld — for a Drill-down UI to
@@ -806,6 +927,194 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "select_category took {elapsed:?} for 20,000 Entries — the O(n^2) regression is back"
+        );
+    }
+
+    #[test]
+    fn deselect_root_withholds_the_whole_subtree_from_entries_and_total_size_in_one_action() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kwinrc = entry_with_size(tmp.path(), ".config/kwinrc", 100);
+        let icon_a = entry_with_size(tmp.path(), ".local/share/icons/hicolor/a.svg", 200);
+        let icon_b = entry_with_size(tmp.path(), ".local/share/icons/hicolor/b.svg", 300);
+        let mut selection = SelectionModel::new(vec![kwinrc, icon_a, icon_b]);
+
+        // Story 13: one toggle drops the whole heavy icon theme, not each expanded file.
+        selection.deselect_root(Path::new(".local/share/icons"));
+
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(
+            selection.entries()[0].relative_path,
+            Path::new(".config/kwinrc")
+        );
+        // AC2: the running-total size drops the whole subtree, not just one file.
+        assert_eq!(selection.total_size(), 100);
+        assert!(selection.is_root_deselected(Path::new(".local/share/icons")));
+        assert_eq!(
+            selection.deselected_roots(),
+            &BTreeSet::from([PathBuf::from(".local/share/icons")])
+        );
+        // The per-file registry stays empty — a root deselection records one root, not the
+        // many files under it (the whole point of the storable shape #38 persists).
+        assert!(selection.deselected_paths().is_empty());
+    }
+
+    #[test]
+    fn deselect_root_matches_on_path_components_not_a_string_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let icon = entry_with_size(tmp.path(), ".local/share/icons/a.svg", 10);
+        let sibling = entry_with_size(tmp.path(), ".local/share/icons-backup/b.svg", 20);
+        let mut selection = SelectionModel::new(vec![icon, sibling]);
+
+        selection.deselect_root(Path::new(".local/share/icons"));
+
+        // `icons-backup` is a sibling, not under `icons/`, so it must survive.
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(
+            selection.entries()[0].relative_path,
+            Path::new(".local/share/icons-backup/b.svg")
+        );
+    }
+
+    #[test]
+    fn deselect_root_covering_a_single_file_root_behaves_like_a_per_entry_deselection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kwinrc = entry_with_size(tmp.path(), ".config/kwinrc", 100);
+        let plasmarc = entry_with_size(tmp.path(), ".config/plasmarc", 50);
+        let mut selection = SelectionModel::new(vec![kwinrc, plasmarc]);
+
+        // A single-file allowlist root (`.config/kwinrc`) is its own unit: deselecting it is
+        // the same as excluding that one Entry, so file-roots keep individual control.
+        selection.deselect_root(Path::new(".config/kwinrc"));
+
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(
+            selection.entries()[0].relative_path,
+            Path::new(".config/plasmarc")
+        );
+        assert!(selection.is_root_deselected(Path::new(".config/kwinrc")));
+    }
+
+    #[test]
+    fn deselect_root_records_nothing_when_no_entry_falls_under_it() {
+        let mut selection = SelectionModel::new(vec![entry(
+            catalog::KDE_PLASMA.name,
+            false,
+            ".config/kwinrc",
+        )]);
+
+        selection.deselect_root(Path::new(".local/share/wallpapers"));
+
+        assert_eq!(selection.entries().len(), 1);
+        assert!(selection.deselected_roots().is_empty());
+    }
+
+    #[test]
+    fn reselect_root_restores_exactly_the_previously_root_deselected_subtree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kwinrc = entry_with_size(tmp.path(), ".config/kwinrc", 100);
+        let icon_a = entry_with_size(tmp.path(), ".local/share/icons/a.svg", 200);
+        let icon_b = entry_with_size(tmp.path(), ".local/share/icons/b.svg", 300);
+        let mut selection = SelectionModel::new(vec![kwinrc, icon_a, icon_b]);
+        let root = Path::new(".local/share/icons");
+
+        selection.deselect_root(root);
+        assert_eq!(selection.entries().len(), 1);
+
+        selection.reselect_root(root);
+
+        assert_eq!(selection.entries().len(), 3);
+        assert!(!selection.is_root_deselected(root));
+        assert!(selection.deselected_roots().is_empty());
+        assert_eq!(selection.total_size(), 600);
+    }
+
+    #[test]
+    fn reselect_root_keeps_an_entry_that_is_also_individually_deselected_withheld() {
+        let mut selection = SelectionModel::new(vec![
+            entry(catalog::KDE_PLASMA.name, false, ".local/share/icons/a.svg"),
+            entry(catalog::KDE_PLASMA.name, false, ".local/share/icons/b.svg"),
+        ]);
+        let root = Path::new(".local/share/icons");
+
+        // Belt-and-suspenders: one icon dropped individually, then the whole root dropped.
+        selection.deselect_entry(Path::new(".local/share/icons/a.svg"));
+        selection.deselect_root(root);
+        assert!(selection.entries().is_empty());
+
+        // Lifting only the root must not resurrect the file the user also killed individually.
+        selection.reselect_root(root);
+
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(
+            selection.entries()[0].relative_path,
+            Path::new(".local/share/icons/b.svg")
+        );
+        assert!(selection.is_deselected(Path::new(".local/share/icons/a.svg")));
+    }
+
+    #[test]
+    fn select_category_keeps_a_root_deselected_subtree_withheld() {
+        let scan = CategoryScan {
+            category: catalog::KDE_PLASMA,
+            entries: vec![
+                entry(catalog::KDE_PLASMA.name, false, ".config/kwinrc"),
+                entry(catalog::KDE_PLASMA.name, false, ".local/share/icons/a.svg"),
+                entry(catalog::KDE_PLASMA.name, false, ".local/share/icons/b.svg"),
+            ],
+        };
+        let mut selection = SelectionModel::new(scan.entries.clone());
+        selection.deselect_root(Path::new(".local/share/icons"));
+        assert_eq!(selection.entries().len(), 1);
+
+        // A Drill-down UI calls `select_category` unconditionally before listing units — it
+        // must not resurrect a root the user deselected (contrast a per-file deselection,
+        // which the same call *does* lift, per the test below).
+        selection.select_category(&scan);
+
+        assert_eq!(selection.entries().len(), 1);
+        assert!(selection.is_root_deselected(Path::new(".local/share/icons")));
+    }
+
+    #[test]
+    fn deselect_category_forgets_its_root_deselections() {
+        let mut selection = SelectionModel::new(vec![
+            entry(catalog::KDE_PLASMA.name, false, ".config/kwinrc"),
+            entry(catalog::KDE_PLASMA.name, false, ".local/share/icons/a.svg"),
+            entry(catalog::SHELL.name, false, "aliases.zsh"),
+        ]);
+        selection.deselect_root(Path::new(".local/share/icons"));
+        assert_eq!(
+            selection.deselected_roots(),
+            &BTreeSet::from([PathBuf::from(".local/share/icons")])
+        );
+
+        selection.deselect_category(catalog::KDE_PLASMA.name);
+
+        // The whole Category is gone, so its root deselection is orphaned and must be dropped
+        // rather than lingering as a stale root pointing at nothing.
+        assert!(selection.deselected_roots().is_empty());
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(selection.entries()[0].category, catalog::SHELL.name);
+    }
+
+    #[test]
+    fn deselecting_a_root_leaves_the_category_partial_not_fully_off() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kwinrc = entry_with_size(tmp.path(), ".config/kwinrc", 100);
+        let icon = entry_with_size(tmp.path(), ".local/share/icons/a.svg", 200);
+        let mut selection = SelectionModel::new(vec![kwinrc, icon]);
+
+        selection.deselect_root(Path::new(".local/share/icons"));
+
+        // AC3: some-but-not-all deselected — the Category still has an active Entry, so it is
+        // partial, never fully off. `entries_in_category` still surfaces every unit for re-toggling.
+        assert!(!selection.is_empty());
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(
+            selection
+                .entries_in_category(catalog::KDE_PLASMA.name)
+                .len(),
+            2
         );
     }
 
