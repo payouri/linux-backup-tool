@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog;
 use crate::error::CoreError;
-use crate::model::{Entry, EntryRoot, SelectionModel};
+use crate::model::{Entry, EntryRoot, EntryType, SelectionModel};
 use crate::scan::{self, CategoryScan};
 
 /// The persistable shape of a Selection plus its Output location — everything a returning run
@@ -144,6 +144,10 @@ fn custom_entry(path: &Path, home: &Path) -> Entry {
         absolute_path: path.to_path_buf(),
         relative_path,
         root,
+        // A Custom path can point at a symlink (common with dotfile managers) — classify it
+        // by lstat so `archive::build` preserves the link rather than storing its target's
+        // bytes (issue #36), rather than assuming a regular file.
+        entry_type: EntryType::classify(path),
         category: catalog::CUSTOM_PATHS.name,
         sensitive: scan::is_safety_net_match(path),
     }
@@ -222,6 +226,7 @@ mod tests {
             absolute_path: PathBuf::from(format!("/home/test/{relative}")),
             relative_path: PathBuf::from(relative),
             root: EntryRoot::Home,
+            entry_type: EntryType::File,
             category,
             sensitive,
         }

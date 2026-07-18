@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 use crate::catalog::{self, Category};
 use crate::context::RunContext;
-use crate::model::{Entry, EntryRoot};
+use crate::model::{Entry, EntryRoot, EntryType};
 
 /// Walks `category`'s Curated allowlist under `ctx.home`, producing one [`Entry`] per
 /// regular file found (directories on the allowlist are walked recursively; missing
@@ -37,6 +37,10 @@ pub fn scan_category(category: &Category, ctx: &RunContext) -> Vec<Entry> {
                 absolute_path,
                 relative_path,
                 root: EntryRoot::Home,
+                // `walk_allowlist_root` keeps only `is_file()` entries (symlinks are not
+                // followed by walkdir here), so a scanned Category Entry is always a regular
+                // file.
+                entry_type: EntryType::File,
                 category: category.name,
                 sensitive,
             });
@@ -135,6 +139,9 @@ pub fn scan_taxonomy(ctx: &RunContext) -> Vec<CategoryScan> {
             absolute_path,
             relative_path,
             root: EntryRoot::Home,
+            // Candidates come from `walk_allowlist_root`'s `is_file()` filter, so every
+            // resolved Entry is a regular file (see `scan_category`).
+            entry_type: EntryType::File,
             category: owner.name,
             sensitive,
         });

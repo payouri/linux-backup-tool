@@ -20,7 +20,7 @@ use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 
 use crate::error::CoreError;
-use crate::model::Entry;
+use crate::model::{Entry, EntryType};
 use crate::progress::{Phase, Progress};
 
 /// The Archive's filename within a Backup dir, before any encryption suffix.
@@ -104,6 +104,35 @@ pub fn build(entries: &[Entry], progress: &mut dyn Progress) -> Result<BuiltArch
         let archive_path = entry.archive_path();
         let archive_path_str = archive_path.to_string_lossy().into_owned();
 
+        // A symlink is captured AS a symlink — its target path preserved, never dereferenced
+        // to the target's bytes (issue #36). Every other Entry (a regular file; a directory
+        // Entry falls through here too and, having no readable bytes, aborts exactly as it
+        // did before) is read for its contents.
+        if entry.entry_type == EntryType::Symlink {
+            match append_symlink(&mut tar_builder, entry, &archive_path) {
+                Ok(()) => {}
+                Err(AppendError::Vanished) => {
+                    vanished.push(VanishedDuringArchive {
+                        archive_path: archive_path_str,
+                        sensitive: entry.sensitive,
+                    });
+                }
+                Err(AppendError::Read(source)) => {
+                    return Err(CoreError::ReadFailed {
+                        path: entry.absolute_path.clone(),
+                        source,
+                    });
+                }
+                Err(AppendError::Build(message)) => {
+                    return Err(CoreError::ArchiveBuildFailed(message));
+                }
+            }
+            // A symlink has no file bytes, so it carries no per-file checksum: the tar
+            // stream owns the link target, and `restore::verify` only re-hashes entries that
+            // recorded a checksum (regular files).
+            continue;
+        }
+
         let bytes = match fs::read(&entry.absolute_path) {
             Ok(bytes) => bytes,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -165,6 +194,51 @@ pub fn build(entries: &[Entry], progress: &mut dyn Progress) -> Result<BuiltArch
         checksums,
         vanished,
     })
+}
+
+/// Why appending a symlink Entry to the tar stream didn't complete. Kept separate from
+/// [`CoreError`] so `build` maps each case to the right ADR-0002 outcome (benign Vanished
+/// vs. fatal read vs. archive-build failure) at the one place it already makes that call for
+/// regular files.
+enum AppendError {
+    /// The symlink was gone (ENOENT) by read time — benign, recorded as Vanished.
+    Vanished,
+    /// A real read error other than ENOENT — fatal per ADR-0002.
+    Read(io::Error),
+    /// The tar writer rejected the entry.
+    Build(String),
+}
+
+/// Appends `entry` (a symlink) to `tar_builder` as a symlink tar entry whose link target is
+/// what the symlink points at, read via `fs::read_link` — the link is never followed to its
+/// target's contents (issue #36). An lstat supplies the link's own mode/uid/gid so the
+/// restored symlink carries the original metadata.
+fn append_symlink<W: Write>(
+    tar_builder: &mut tar::Builder<W>,
+    entry: &Entry,
+    archive_path: &Path,
+) -> Result<(), AppendError> {
+    let link_metadata = fs::symlink_metadata(&entry.absolute_path).map_err(classify_read_error)?;
+    let target = fs::read_link(&entry.absolute_path).map_err(classify_read_error)?;
+
+    let mut header = tar::Header::new_gnu();
+    // lstat metadata sets the tar entry type to Symlink and its size to 0; `append_link`
+    // then writes the link target into the header's link-name field and finalizes checksum.
+    header.set_metadata(&link_metadata);
+    tar_builder
+        .append_link(&mut header, archive_path, &target)
+        .map_err(|e| AppendError::Build(e.to_string()))
+}
+
+/// Splits an `fs::read_link`/`fs::symlink_metadata` I/O error into the benign Vanished case
+/// (ENOENT — the same scan-to-read race as a regular file) and every other, fatal case, per
+/// ADR-0002.
+fn classify_read_error(source: io::Error) -> AppendError {
+    if source.kind() == io::ErrorKind::NotFound {
+        AppendError::Vanished
+    } else {
+        AppendError::Read(source)
+    }
 }
 
 /// SHA-256 of `bytes`, hex-encoded. Shared by per-file checksums and `archive_sha256` so
@@ -293,6 +367,7 @@ mod tests {
             absolute_path,
             relative_path: std::path::PathBuf::from("thing"),
             root: EntryRoot::Home,
+            entry_type: EntryType::File,
             category: "Test",
             sensitive,
         }

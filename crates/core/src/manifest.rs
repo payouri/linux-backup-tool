@@ -16,11 +16,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::context::RunContext;
-use crate::model::{Entry, EntryRoot};
+use crate::model::{Entry, EntryRoot, EntryType};
 
 /// The Manifest schema version this build of `core` writes and can read. Bump alongside
 /// any breaking change to the fields below.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 adds the per-Entry `type` field (issue #36 / story 43); no released Backup predates
+/// it, so this is a straight bump rather than a compatibility shim.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The `manifest.json` schema (`manifest.json.age` sidecar name when the Archive is
 /// encrypted — the suffix, not this struct, is the authoritative encryption signal).
@@ -68,12 +71,37 @@ impl From<EntryRoot> for ManifestRoot {
     }
 }
 
-/// One selected root as recorded in the Manifest: `path`, `root` tag, Category, and
-/// sensitivity — no POSIX metadata (that lives in the tar stream).
+/// The Manifest's `type` tag on an Entry — mirrors [`EntryType`] but is the
+/// serde-serializable, on-disk form of it (story 43: a Backup is self-describing about what
+/// each Entry is). Serialized lowercase (`"file"`/`"directory"`/`"symlink"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManifestEntryType {
+    #[default]
+    File,
+    Directory,
+    Symlink,
+}
+
+impl From<EntryType> for ManifestEntryType {
+    fn from(entry_type: EntryType) -> Self {
+        match entry_type {
+            EntryType::File => Self::File,
+            EntryType::Directory => Self::Directory,
+            EntryType::Symlink => Self::Symlink,
+        }
+    }
+}
+
+/// One selected root as recorded in the Manifest: `path`, `root` tag, `type`, Category, and
+/// sensitivity — no POSIX metadata (mode/uid/gid live in the tar stream; only the coarse
+/// file/directory/symlink `type` is duplicated here so the Manifest is self-describing).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub path: String,
     pub root: ManifestRoot,
+    #[serde(rename = "type")]
+    pub entry_type: ManifestEntryType,
     pub category: String,
     pub sensitive: bool,
 }
@@ -83,6 +111,7 @@ impl From<&Entry> for ManifestEntry {
         Self {
             path: entry.relative_path.to_string_lossy().into_owned(),
             root: entry.root.into(),
+            entry_type: entry.entry_type.into(),
             category: entry.category.to_string(),
             sensitive: entry.sensitive,
         }

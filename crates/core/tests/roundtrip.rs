@@ -27,7 +27,7 @@ use secrecy::SecretString;
 
 use linux_backup_core::archive::Encryption;
 use linux_backup_core::context::{Privilege, RunContext};
-use linux_backup_core::model::{Entry, EntryRoot, SelectionModel};
+use linux_backup_core::model::{Entry, EntryRoot, EntryType, SelectionModel};
 use linux_backup_core::packages::{CommandRunner, NoCommandRunner};
 use linux_backup_core::progress::{NoopProgress, Phase, Progress};
 use linux_backup_core::restore::RestoreOutcome;
@@ -574,6 +574,10 @@ fn hard_read_error_aborts_run_and_leaves_no_backup_dir_or_manifest() {
     fs::create_dir_all(&broken_dir).expect("create broken entry directory");
     entries.push(Entry {
         absolute_path: broken_dir,
+        // Typed as a File though it points at a directory: `archive::build` then tries to
+        // read it as bytes and hits a non-ENOENT error — exactly the "real read error"
+        // ADR-0002 says is fatal.
+        entry_type: EntryType::File,
         relative_path: PathBuf::from("broken-entry-is-a-directory"),
         root: EntryRoot::Home,
         category: catalog::SHELL.name,
@@ -1167,4 +1171,89 @@ fn backup_drives_progress_through_the_phases_in_order() {
     // on_entry ticks once per Entry and reaches (total, total) on the last one.
     assert_eq!(progress.entry_ticks, 2);
     assert_eq!(progress.last_entry, Some((2, 2)));
+}
+
+/// Issue #36 / stories 45+43: a symlink Entry survives the backup/restore round-trip AS a
+/// symlink — its target path preserved verbatim, never dereferenced to the target's bytes —
+/// and the Manifest records its `type` as `symlink`. The pre-fix archive step read every
+/// Entry with a symlink-following `fs::read`, silently storing a copy of the target's
+/// contents and restoring a plain file; this pins the corrected behavior down.
+#[test]
+fn round_trip_preserves_a_symlink_entry_and_records_its_type() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let output = tmp.path().join("output");
+    fs::create_dir_all(home.join(".config")).expect("create .config dir");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    // A real target file the symlink points at. If `build` regressed to dereferencing, the
+    // Backup would carry a copy of THESE bytes as a regular file rather than the link — so a
+    // distinctive target makes that failure mode unambiguous.
+    fs::write(home.join(".config/target.txt"), b"i am the link target\n").expect("write target");
+
+    // A relative symlink `.config/mylink -> target.txt`. Relative so the recreated link is
+    // meaningful under the *restoring* home too (Re-rooting), not tied to the original path.
+    let link_target = PathBuf::from("target.txt");
+    let link_path = home.join(".config/mylink");
+    std::os::unix::fs::symlink(&link_target, &link_path).expect("create symlink");
+
+    let ctx = test_ctx(home, output.clone());
+    let symlink_entry = Entry {
+        absolute_path: link_path,
+        relative_path: PathBuf::from(".config/mylink"),
+        root: EntryRoot::Home,
+        entry_type: EntryType::Symlink,
+        category: catalog::SHELL.name,
+        sensitive: false,
+    };
+    let selection = SelectionModel::new(vec![symlink_entry]);
+
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    // The Manifest records the Entry's `type` as symlink (story 43) and nothing Vanished...
+    assert_eq!(outcome.manifest.entries.len(), 1);
+    let manifest_entry = &outcome.manifest.entries[0];
+    assert_eq!(manifest_entry.path, ".config/mylink");
+    assert_eq!(
+        manifest_entry.entry_type,
+        manifest::ManifestEntryType::Symlink,
+        "the Manifest must record the Entry's type as symlink"
+    );
+    assert!(outcome.manifest.vanished.is_empty());
+    // ...and a symlink carries no per-file checksum (it has no file bytes; its target lives
+    // in the tar stream).
+    assert!(
+        !outcome
+            .manifest
+            .checksums
+            .contains_key("home/.config/mylink"),
+        "a symlink Entry must not record a file-content checksum: {:?}",
+        outcome.manifest.checksums
+    );
+
+    // Restore into a DIFFERENT fresh root.
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home.clone(), output);
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
+    assert!(
+        restore_outcome.failures.is_empty(),
+        "unexpected restore failures: {:?}",
+        restore_outcome.failures
+    );
+
+    // The restored path is a symlink (NOT a regular file of the target's bytes), pointing at
+    // the original target path verbatim.
+    let restored_link = restore_home.join(".config/mylink");
+    let restored_meta =
+        fs::symlink_metadata(&restored_link).expect("restored symlink should exist");
+    assert!(
+        restored_meta.file_type().is_symlink(),
+        "the restored Entry must be a symlink, not a dereferenced copy of the target"
+    );
+    assert_eq!(
+        fs::read_link(&restored_link).expect("restored symlink should be readable"),
+        link_target,
+        "the restored symlink must point at the original target path"
+    );
 }

@@ -321,7 +321,7 @@ fn format_size(bytes: u64) -> String {
 mod tests {
     use super::*;
     use linux_backup_core::catalog;
-    use linux_backup_core::model::EntryRoot;
+    use linux_backup_core::model::{EntryRoot, EntryType};
     use std::path::Path;
 
     /// Builds a real on-disk Entry of `len` bytes under `tmp`, at `relative_path`, since
@@ -336,6 +336,7 @@ mod tests {
             absolute_path,
             relative_path: PathBuf::from(relative_path),
             root: EntryRoot::Home,
+            entry_type: EntryType::File,
             category,
             sensitive: false,
         }

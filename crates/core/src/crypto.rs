@@ -160,7 +160,7 @@ pub fn passphrase_strength(candidate: &str) -> PassphraseStrength {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Entry, EntryRoot};
+    use crate::model::{Entry, EntryRoot, EntryType};
     use std::path::PathBuf;
 
     fn entry(category: &'static str, sensitive: bool, name: &str) -> Entry {
@@ -168,6 +168,7 @@ mod tests {
             absolute_path: PathBuf::from(format!("/tmp/does-not-need-to-exist/{name}")),
             relative_path: PathBuf::from(name),
             root: EntryRoot::Home,
+            entry_type: EntryType::File,
             category,
             sensitive,
         }

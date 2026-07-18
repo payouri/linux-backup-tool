@@ -267,7 +267,7 @@ fn join_entries(entries: &[std::path::PathBuf]) -> String {
 mod tests {
     use super::*;
     use linux_backup_core::crypto::evaluate;
-    use linux_backup_core::model::{Entry, EntryRoot};
+    use linux_backup_core::model::{Entry, EntryRoot, EntryType};
     use std::path::PathBuf;
 
     fn entry(category: &'static str, sensitive: bool, name: &str) -> Entry {
@@ -275,6 +275,7 @@ mod tests {
             absolute_path: PathBuf::from(format!("/does-not-need-to-exist/{name}")),
             relative_path: PathBuf::from(name),
             root: EntryRoot::Home,
+            entry_type: EntryType::File,
             category,
             sensitive,
         }

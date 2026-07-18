@@ -451,7 +451,7 @@ mod tests {
     use super::*;
     use linux_backup_core::location::FreeSpaceWarning;
     use linux_backup_core::manifest::{Manifest, PackageInfo, VanishedEntry, SCHEMA_VERSION};
-    use linux_backup_core::model::{Entry, EntryRoot};
+    use linux_backup_core::model::{Entry, EntryRoot, EntryType};
     use secrecy::SecretString;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -461,6 +461,7 @@ mod tests {
             absolute_path: PathBuf::from(format!("/does-not-need-to-exist/{name}")),
             relative_path: PathBuf::from(name),
             root: EntryRoot::Home,
+            entry_type: EntryType::File,
             category,
             sensitive,
         }

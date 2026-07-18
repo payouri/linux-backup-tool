@@ -34,6 +34,38 @@ use crate::scan::CategoryScan;
 /// The size threshold (story 4: ">1GB") above which a User-data Selection earns a warning.
 const USER_DATA_WARNING_THRESHOLD_BYTES: u64 = 1_000_000_000;
 
+/// What kind of filesystem object an Entry points at — recorded per-Entry in the Manifest
+/// (story 43) and, for a [`EntryType::Symlink`], the signal that `archive::build` must
+/// capture the link itself (its target preserved) rather than dereferencing it to the
+/// target's bytes (issue #36).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EntryType {
+    /// A regular file: its bytes are read and stored, and a per-file checksum is recorded.
+    #[default]
+    File,
+    /// A directory.
+    Directory,
+    /// A symbolic link: archived as a symlink whose target path is preserved verbatim,
+    /// never followed to the target's contents.
+    Symlink,
+}
+
+impl EntryType {
+    /// Classifies `path` by an lstat (`fs::symlink_metadata`), so a symlink is reported as a
+    /// [`EntryType::Symlink`] rather than resolved to whatever it points at. An unreadable
+    /// path (e.g. one that Vanished between add and classify) falls back to
+    /// [`EntryType::File`]: `archive::build`'s per-Entry read is the single authoritative
+    /// place a genuine read failure or a benign Vanish is decided (ADR-0002), never this
+    /// classifier.
+    pub fn classify(path: &Path) -> Self {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => Self::Symlink,
+            Ok(meta) if meta.is_dir() => Self::Directory,
+            _ => Self::File,
+        }
+    }
+}
+
 /// Whether an Entry's path is anchored under `$HOME` or stands on its own. See
 /// CONTEXT.md's "Re-rooting" entry — this is the Manifest's `root` tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +88,11 @@ pub struct Entry {
     pub relative_path: PathBuf,
     /// Home-tagged or absolute — see [`EntryRoot`].
     pub root: EntryRoot,
+    /// File, directory, or symlink — see [`EntryType`]. Set once when the Entry is
+    /// constructed (at scan time, or by `profile::custom_entry` for a Custom path); carried
+    /// verbatim into the Manifest's per-Entry `type` and consulted by `archive::build` to
+    /// preserve a symlink rather than dereference it.
+    pub entry_type: EntryType,
     /// The Category name this Entry belongs to.
     pub category: &'static str,
     /// Whether this Entry is Sensitive: true if its Category is Sensitive, OR it carries a
@@ -328,6 +365,7 @@ mod tests {
             absolute_path: PathBuf::from(format!("/tmp/does-not-need-to-exist/{name}")),
             relative_path: PathBuf::from(name),
             root: EntryRoot::Home,
+            entry_type: EntryType::File,
             category,
             sensitive,
         }
@@ -383,6 +421,7 @@ mod tests {
             absolute_path: big_file,
             relative_path: PathBuf::from("Documents/huge.bin"),
             root: EntryRoot::Home,
+            entry_type: EntryType::File,
             category: catalog::USER_DATA.name,
             sensitive: false,
         }]);
@@ -415,6 +454,7 @@ mod tests {
             absolute_path,
             relative_path: PathBuf::from(relative_path),
             root: EntryRoot::Home,
+            entry_type: EntryType::File,
             category: catalog::KDE_PLASMA.name,
             sensitive: false,
         }
