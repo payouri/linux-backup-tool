@@ -55,3 +55,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets
+
+  msrv:
+    name: msrv (1.95)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Enforces the declared rust-version floor (Cargo.toml / clippy.toml). Compile-only via
+    # cargo check, and without -D warnings, so a lint that differs between 1.95 and stable
+    # can't fail the floor -- this job answers "does it still build on 1.95?", nothing more.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
