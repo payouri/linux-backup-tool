@@ -11,6 +11,7 @@
 //! what #19's review anticipated.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -171,7 +172,14 @@ pub fn build(entries: &[Entry], progress: &mut dyn Progress) -> Result<BuiltArch
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        // sha2 0.11's `finalize` returns a `hybrid_array::Array` that no longer implements
+        // `LowerHex`, so hex-encode byte-by-byte; `write!` into a `String` cannot fail.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Encrypts `plaintext` per `encryption` (a no-op for [`Encryption::None`]). Story 21: a
