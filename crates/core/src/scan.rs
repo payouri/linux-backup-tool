@@ -120,18 +120,12 @@ pub fn scan_taxonomy(ctx: &RunContext) -> Vec<CategoryScan> {
         // `resolve_category` already returns the highest-precedence match across the whole
         // (precedence-ordered) `categories` slice, so a path never needs to be checked
         // Category-by-Category here — one call settles ownership.
-        let Some(owner) = catalog::resolve_category(&relative_path, &categories) else {
+        let Some((owner_index, owner)) = catalog::resolve_category(&relative_path, &categories)
+        else {
             // No allowlist covers this path — story 8: only addable via Custom paths, never
             // silently attributed to one of the ten here.
             continue;
         };
-        // ADR-0002: backup fails fast on bugs rather than silently dropping data; `owner`
-        // came from `categories` above, so this can only panic on a real invariant break.
-        #[allow(clippy::disallowed_methods)]
-        let owner_index = categories
-            .iter()
-            .position(|c| c.name == owner.name)
-            .expect("owner came from categories");
         // Strict superset, same as `scan_category`: each origin can only add sensitivity on
         // top of what another already set, never remove it.
         let sensitive = owner.sensitive

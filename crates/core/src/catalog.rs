@@ -248,15 +248,19 @@ pub fn entry_is_individually_sensitive(category: &Category, relative_path: &Path
 /// the first match, which is what makes "higher-precedence wins" a one-line rule instead of
 /// a comparison function.
 ///
+/// Returns the winner's index in `categories` alongside the Category so callers keying
+/// parallel per-Category state by position don't have to search for it again.
+///
 /// Returns `None` if `relative_path` matches no Category's allowlist at all (story 8: such
 /// a path is only addable via Custom paths, never silently attributed to one of the ten).
 pub fn resolve_category<'a>(
     relative_path: &Path,
     categories: &'a [Category],
-) -> Option<&'a Category> {
+) -> Option<(usize, &'a Category)> {
     categories
         .iter()
-        .find(|category| category_matches(category, relative_path))
+        .enumerate()
+        .find(|(_, category)| category_matches(category, relative_path))
 }
 
 /// Validates a Custom path against the root/non-root constraint (stories 10/11): root may
@@ -345,9 +349,10 @@ mod tests {
         // Both HIGH (".config/shared") and LOW (".config/shared/nested") match this path;
         // HIGH must win purely because it comes first in `categories`, regardless of which
         // allowlist entry is the more specific prefix.
-        let resolved =
+        let (index, resolved) =
             resolve_category(&overlapping, &categories).expect("should resolve to a category");
         assert_eq!(resolved.name, "High");
+        assert_eq!(index, 0);
     }
 
     #[test]
@@ -355,9 +360,10 @@ mod tests {
         let categories = [HIGH, LOW];
         let low_only = PathBuf::from(".config/only-low/file.txt");
 
-        let resolved =
+        let (index, resolved) =
             resolve_category(&low_only, &categories).expect("should resolve to a category");
         assert_eq!(resolved.name, "Low");
+        assert_eq!(index, 1);
     }
 
     #[test]

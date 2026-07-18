@@ -1,0 +1,27 @@
+# MSRV mirrors the toolchain this workspace is developed against; kept in sync with
+# `rust-version` in the root Cargo.toml.
+msrv = "1.95"
+
+# AGENTS.md: "no unwrap()/expect()/panic!() outside tests and main". Enforced here rather
+# than left as convention alone, same spirit as core/src/lib.rs's `forbid(unsafe_code)`.
+# `#[cfg(test)]` code is exempted from these via `cfg_attr(test, allow(...))` at each crate
+# root (see core/src/lib.rs, tui/src/main.rs) and, for the `tests/` integration binary,
+# an unconditional `#![allow(...)]` at its top (integration test crates are always built
+# under `--test`, so there is no non-test build of that file to protect).
+disallowed-methods = [
+    { path = "core::option::Option::unwrap", reason = "propagate with `?` or handle the None case; unwrap() is reserved for tests and main" },
+    { path = "core::option::Option::expect", reason = "propagate with `?` or handle the None case; expect() is reserved for tests and main" },
+    { path = "core::result::Result::unwrap", reason = "propagate with `?`; unwrap() is reserved for tests and main" },
+    { path = "core::result::Result::expect", reason = "propagate with `?`; expect() is reserved for tests and main" },
+    { path = "core::result::Result::unwrap_err", reason = "propagate with `?` or match on Ok; unwrap_err() panics just like unwrap() and is reserved for tests and main" },
+    { path = "core::result::Result::expect_err", reason = "propagate with `?` or match on Ok; expect_err() panics just like expect() and is reserved for tests and main" },
+]
+# `panic!`/`todo!`/`unimplemented!`/`unreachable!` all expand to a panic — the rule targets the
+# behavior, not just the `panic!` spelling AGENTS.md names as the exemplar. `assert!` is left out:
+# it is the sanctioned way to state an invariant and is not covered by the rule.
+disallowed-macros = [
+    { path = "std::panic", reason = "return a Result instead; panic! is reserved for tests and main" },
+    { path = "std::todo", reason = "return a Result or finish the code path; todo! panics and is reserved for tests and main" },
+    { path = "std::unimplemented", reason = "return a Result or implement the path; unimplemented! panics and is reserved for tests and main" },
+    { path = "std::unreachable", reason = "prove the case away in the type/return a Result; unreachable! panics and is reserved for tests and main" },
+]

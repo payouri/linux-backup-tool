@@ -2,7 +2,11 @@
 name = "tui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "linux-backup's inquire-based terminal wizard: a thin view over core's SelectionModel, owning only cursor/scroll state and rendering."
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "linux-backup"

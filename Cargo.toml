@@ -5,3 +5,8 @@ members = ["crates/core", "crates/tui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
+
+[workspace.lints.clippy]
+disallowed_methods = "warn"
+disallowed_macros = "warn"
