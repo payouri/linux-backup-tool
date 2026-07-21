@@ -33,7 +33,7 @@ pub mod scan;
 
 pub use context::{Privilege, RunContext};
 pub use error::CoreError;
-pub use model::SelectionModel;
+pub use model::{DirectoryState, SelectionModel};
 
 use std::fs;
 use std::path::{Path, PathBuf};

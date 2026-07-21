@@ -27,7 +27,7 @@ use secrecy::SecretString;
 
 use linux_backup_core::archive::Encryption;
 use linux_backup_core::context::{Privilege, RunContext};
-use linux_backup_core::model::{Entry, EntryRoot, EntryType, SelectionModel};
+use linux_backup_core::model::{DirectoryState, Entry, EntryRoot, EntryType, SelectionModel};
 use linux_backup_core::packages::{CommandRunner, NoCommandRunner};
 use linux_backup_core::progress::{NoopProgress, Phase, Progress};
 use linux_backup_core::restore::{CollisionPolicy, RestoreOutcome};
@@ -938,6 +938,22 @@ fn kde_plasma_drill_down_deselection_excludes_exactly_those_entries_from_the_rou
             icon_relative_path.clone(),
             wallpaper_relative_path.clone()
         ])
+    );
+
+    // The Drill-down explorer's tri-state (#48) is derived from this same withheld state, so it
+    // must agree with what the backup below actually excludes: the two deselected subtrees read
+    // None, the still-selected `.config` reads All, and their shared Category is Partial overall.
+    assert_eq!(
+        selection.directory_state(Path::new(".local/share/icons")),
+        DirectoryState::None
+    );
+    assert_eq!(
+        selection.directory_state(Path::new(".local/share/wallpapers")),
+        DirectoryState::None
+    );
+    assert_eq!(
+        selection.directory_state(Path::new(".config")),
+        DirectoryState::All
     );
 
     let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");

@@ -129,6 +129,21 @@ impl Entry {
     }
 }
 
+/// The tri-state of a directory node in the recursive Drill-down explorer (#48 / ADR-0006),
+/// derived live from the Selection rather than stored — ADR-0006 keeps the flat two-set model
+/// with no stored tri-state tree, so this is a computed view, never a field.
+///
+/// - `All` — every known Entry under the node is in the active Selection.
+/// - `None` — every known Entry under it is withheld (a Subtree deselection, or per-file
+///   deselections covering all of them), or the node covers no known Entry at all.
+/// - `Partial` — some in, some out (CONTEXT.md's "Partial selection").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryState {
+    All,
+    Partial,
+    None,
+}
+
 /// The user's chosen set of Entries for a run (CONTEXT.md's "Selection"). `core`'s
 /// authoritative model of what will be backed up.
 #[derive(Debug, Clone, Default)]
@@ -409,6 +424,34 @@ impl SelectionModel {
     /// (which asks whether an arbitrary Entry path falls under *some* deselected root).
     pub fn is_root_deselected(&self, root: &Path) -> bool {
         self.deselected_roots.contains(root)
+    }
+
+    /// The [`DirectoryState`] of the directory node at `prefix` — the single source of truth
+    /// for the recursive Drill-down explorer's `[x]`/`[~]`/`[ ]` tri-state (#48 / ADR-0006).
+    /// Derived live from the active/withheld split, so it agrees with `deselect_root`/
+    /// `reselect_root` by construction: a Subtree deselection moves every Entry under `prefix`
+    /// into `withheld`, which reads back as `None`, and re-selecting them all reads back as
+    /// `All`, with no stored tri-state to keep in sync. `prefix` is a relative path matched
+    /// component-wise (`Path::starts_with`, matching `is_under_deselected_root`), so
+    /// `.local/share/icons` covers `.local/share/icons/hicolor/x.svg` but not a sibling
+    /// `.local/share/icons-backup`. A `prefix` covering no known Entry (active or withheld)
+    /// reads as `None` — nothing there is selected; in practice the explorer only queries
+    /// prefixes drawn from real Entry paths, so that is the edge, not the norm.
+    pub fn directory_state(&self, prefix: &Path) -> DirectoryState {
+        let any_active = self
+            .entries
+            .iter()
+            .any(|e| e.relative_path.starts_with(prefix));
+        let any_withheld = self
+            .withheld
+            .iter()
+            .any(|e| e.relative_path.starts_with(prefix));
+
+        match (any_active, any_withheld) {
+            (true, false) => DirectoryState::All,
+            (true, true) => DirectoryState::Partial,
+            (false, _) => DirectoryState::None,
+        }
     }
 
     /// The relative paths of every currently-deselected Entry — the plain, storable shape
@@ -1165,6 +1208,193 @@ mod tests {
             selection.entries().len(),
             1,
             "re-adding the same Custom path must not double-count it"
+        );
+    }
+
+    /// A deep Drill-down tree (#48): several nested levels under one Category, so the
+    /// intermediate-depth cases the alpha's shallow `.local/share/icons` fixtures never
+    /// reach can be exercised.
+    fn deep_icon_selection() -> SelectionModel {
+        SelectionModel::new(vec![
+            entry(catalog::KDE_PLASMA.name, false, ".config/kwinrc"),
+            entry(
+                catalog::KDE_PLASMA.name,
+                false,
+                ".local/share/icons/hicolor/apps/firefox.svg",
+            ),
+            entry(
+                catalog::KDE_PLASMA.name,
+                false,
+                ".local/share/icons/hicolor/apps/code.svg",
+            ),
+            entry(
+                catalog::KDE_PLASMA.name,
+                false,
+                ".local/share/icons/hicolor/mimetypes/text.svg",
+            ),
+            entry(
+                catalog::KDE_PLASMA.name,
+                false,
+                ".local/share/icons/scalable/logo.svg",
+            ),
+        ])
+    }
+
+    #[test]
+    fn directory_state_is_all_when_every_entry_under_the_prefix_is_active() {
+        let selection = deep_icon_selection();
+
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons")),
+            DirectoryState::All
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons/hicolor/apps")),
+            DirectoryState::All
+        );
+    }
+
+    #[test]
+    fn directory_state_is_none_for_a_prefix_covering_no_known_entry() {
+        let selection = deep_icon_selection();
+
+        // An empty subtree holds nothing selected — the drill-disabled `—` node (#34).
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/wallpapers")),
+            DirectoryState::None
+        );
+    }
+
+    #[test]
+    fn directory_state_agrees_with_deselect_root_at_an_intermediate_depth() {
+        let mut selection = deep_icon_selection();
+        let intermediate = Path::new(".local/share/icons/hicolor/apps");
+
+        // Deselect a node several levels deep — the case the alpha's two-level fixtures never
+        // reached. Prefix-wins: both `apps/*` Entries are withheld as one unit.
+        selection.deselect_root(intermediate);
+
+        assert!(selection.is_root_deselected(intermediate));
+        assert_eq!(
+            selection.deselected_roots(),
+            &BTreeSet::from([intermediate.to_path_buf()])
+        );
+        // The deselected intermediate node reads None; every ancestor holding a still-active
+        // sibling reads Partial; the untouched sibling subtrees stay All.
+        assert_eq!(
+            selection.directory_state(intermediate),
+            DirectoryState::None
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons/hicolor")),
+            DirectoryState::Partial
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons")),
+            DirectoryState::Partial
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons/hicolor/mimetypes")),
+            DirectoryState::All
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons/scalable")),
+            DirectoryState::All
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".config")),
+            DirectoryState::All
+        );
+        // No per-file marks recorded — an intermediate Subtree deselection stays one root.
+        assert!(selection.deselected_paths().is_empty());
+    }
+
+    #[test]
+    fn directory_state_reflects_a_nested_deselect_root_prefix_wins_over_the_whole_subtree() {
+        let mut selection = deep_icon_selection();
+        let hicolor = Path::new(".local/share/icons/hicolor");
+
+        // Deselecting the intermediate `hicolor` node withholds every leaf beneath it (apps +
+        // mimetypes) in one action, leaving only the `scalable` sibling active.
+        selection.deselect_root(hicolor);
+
+        assert_eq!(selection.directory_state(hicolor), DirectoryState::None);
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons/hicolor/apps")),
+            DirectoryState::None,
+            "a descendant of a deselected intermediate node is also None"
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons")),
+            DirectoryState::Partial
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons/scalable")),
+            DirectoryState::All
+        );
+    }
+
+    #[test]
+    fn directory_state_agrees_with_reselect_root_restoring_all() {
+        let mut selection = deep_icon_selection();
+        let intermediate = Path::new(".local/share/icons/hicolor/apps");
+
+        selection.deselect_root(intermediate);
+        selection.reselect_root(intermediate);
+
+        // Reversing the intermediate deselection reads back as All everywhere it had read None.
+        assert_eq!(selection.directory_state(intermediate), DirectoryState::All);
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons/hicolor")),
+            DirectoryState::All
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons")),
+            DirectoryState::All
+        );
+    }
+
+    #[test]
+    fn directory_state_matches_on_path_components_not_a_string_prefix() {
+        let mut selection = SelectionModel::new(vec![
+            entry(catalog::KDE_PLASMA.name, false, ".local/share/icons/a.svg"),
+            entry(
+                catalog::KDE_PLASMA.name,
+                false,
+                ".local/share/icons-backup/b.svg",
+            ),
+        ]);
+
+        selection.deselect_root(Path::new(".local/share/icons"));
+
+        // The deselected `icons` subtree is None; its string-prefixed sibling `icons-backup`
+        // is a different subtree and stays All (mirrors `deselect_root`'s component matching).
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons")),
+            DirectoryState::None
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons-backup")),
+            DirectoryState::All
+        );
+    }
+
+    #[test]
+    fn directory_state_reports_partial_from_a_per_file_deselection() {
+        let mut selection = deep_icon_selection();
+
+        // The tri-state tracks actual inclusion, so a per-file Drill-down deselection makes its
+        // ancestor Partial just as a root deselection does — the query is not root-only.
+        selection.deselect_entry(Path::new(".local/share/icons/hicolor/apps/firefox.svg"));
+
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons/hicolor/apps")),
+            DirectoryState::Partial
+        );
+        assert_eq!(
+            selection.directory_state(Path::new(".local/share/icons/hicolor/apps/firefox.svg")),
+            DirectoryState::None,
+            "the deselected file node itself reads None"
         );
     }
 }
