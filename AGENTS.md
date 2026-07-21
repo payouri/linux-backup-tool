@@ -14,6 +14,7 @@ Read before working on any feature:
   - [`0004`](docs/adr/0004-core-runcontext-injection.md) — `core` takes a full injected `RunContext`, reads nothing ambient (see Testing gates below).
   - [`0005`](docs/adr/0005-ratatui-app-architecture-core-tui-boundary.md) — the ratatui TUI is one `App` reducer in `tui`; core stays synchronous and owns all filesystem content I/O.
   - [`0006`](docs/adr/0006-recursive-drill-down-exclusion-model.md) — recursive drill-down reuses the flat two-set exclusion model; no Manifest change, no Profile migration.
+  - [`0007`](docs/adr/0007-wizard-navigation-cross-step-invalidation.md) — the wizard is a completion-frontier stepper with targeted WHAT→encryption invalidation (set passphrase = safe harbor).
 - **`docs/research/`** — dated research notes backing early tickets (package inventory, Plasma capture, Rust crate choices). Check for an existing note before re-researching a settled question.
 
 ## Gates

@@ -14,6 +14,9 @@ reversed, add a new ADR and mark the old one `Superseded by 000N` — don't edit
   reducer in `tui`; core stays synchronous and owns all filesystem content I/O. Reaffirms 0001.
 - [`0006`](0006-recursive-drill-down-exclusion-model.md) — recursive drill-down reuses the flat
   two-set exclusion model; no Manifest change, no Profile migration. Builds on 0001 and 0005.
+- [`0007`](0007-wizard-navigation-cross-step-invalidation.md) — the wizard is a completion-frontier
+  stepper with targeted WHAT→encryption invalidation; a set passphrase is a safe harbor. Fills the
+  transition/invalidation hole 0005 left open.
 
 ## Behavior — backup/restore policy and feature capture
 
