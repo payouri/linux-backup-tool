@@ -123,13 +123,23 @@ fn run_backup(
         source,
     })?;
 
-    // `build` reports `Phase::Scanning` (the per-Entry read loop) itself; the two disk-write
-    // phases below are reported here at their real boundaries.
+    // `build` reports `Phase::Scanning` then `Phase::Compressing` itself; the encryption and
+    // disk-write phases below are reported here at their real boundaries.
     let built = archive::build(selection.entries(), progress)?;
 
-    progress.on_phase(Phase::WritingArchive);
+    // `Encrypting` is omitted entirely for a plaintext backup (issue #65): a run that isn't
+    // encrypting has no such phase to show, so the RUN screen never renders one. The Manifest
+    // is encrypted with the same key during `Finalizing` below — its tiny payload rides the
+    // Archive's `Encrypting` phase rather than warranting a second boundary.
+    if encryption.is_encrypted() {
+        progress.on_phase(Phase::Encrypting);
+    }
     let archive_sha256 = archive::sha256_hex(&built.plaintext_bytes);
     let archive_bytes_on_disk = archive::encrypt(&built.plaintext_bytes, encryption)?;
+
+    // Both on-disk write steps (Archive here, Manifest below) surface as one `Finalizing`
+    // phase — the write phases the alpha reported separately collapse into it (issue #65).
+    progress.on_phase(Phase::Finalizing);
     let archive_path = backup_dir.join(archive::archive_filename(encryption));
     archive::write_bytes(&archive_path, &archive_bytes_on_disk)?;
 
@@ -142,7 +152,6 @@ fn run_backup(
         })
         .collect();
 
-    progress.on_phase(Phase::WritingManifest);
     let captured_packages = packages::capture_all(package_runner);
 
     let manifest = manifest::build(manifest::ManifestInputs {

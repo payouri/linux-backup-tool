@@ -128,6 +128,7 @@ fn run_restore(
         ctx,
         passphrase,
         CollisionPolicy::Confirm(&mut decline),
+        &mut NoopProgress,
     )
 }
 
@@ -1140,6 +1141,7 @@ fn restore_collision_is_skipped_on_decline_and_overwritten_on_confirm_or_flag() 
         &restore_ctx,
         None,
         CollisionPolicy::Confirm(&mut decline),
+        &mut NoopProgress,
     )
     .expect("restore should still complete despite one declined collision (ADR-0002)");
 
@@ -1190,6 +1192,7 @@ fn restore_collision_is_skipped_on_decline_and_overwritten_on_confirm_or_flag() 
         &restore_ctx,
         None,
         CollisionPolicy::Confirm(&mut accept),
+        &mut NoopProgress,
     )
     .expect("restore should succeed once the overwrite is confirmed");
     assert!(
@@ -1213,6 +1216,7 @@ fn restore_collision_is_skipped_on_decline_and_overwritten_on_confirm_or_flag() 
         &restore_ctx,
         None,
         CollisionPolicy::Overwrite,
+        &mut NoopProgress,
     )
     .expect("restore with --overwrite should succeed");
     assert!(
@@ -1353,10 +1357,12 @@ impl Progress for RecordingProgress {
     }
 }
 
-/// Issue #33 / story 37: `backup` drives its injected [`Progress`] through the real phase
-/// boundaries in order — `Scanning` (the per-Entry archive-read loop, which also ticks
-/// `on_entry` once per Entry up to the total), then `WritingArchive`, then `WritingManifest`
-/// — so `crates/tui` can render live per-phase progress from a purely observational callback.
+/// Issue #33/#65 / story 37/44: `backup` drives its injected [`Progress`] through the real
+/// phase boundaries in order — `Scanning` (the per-Entry archive-read loop, which also ticks
+/// `on_entry` once per Entry up to the total), then `Compressing`, then `Finalizing` — so
+/// `crates/tui` can render live per-phase progress from a purely observational callback. A
+/// plaintext backup emits **no** `Encrypting` phase (#65: it is omitted entirely when the
+/// backup isn't encrypted).
 #[test]
 fn backup_drives_progress_through_the_phases_in_order() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1382,14 +1388,91 @@ fn backup_drives_progress_through_the_phases_in_order() {
 
     assert_eq!(
         progress.phases,
-        vec![
-            Phase::Scanning,
-            Phase::WritingArchive,
-            Phase::WritingManifest
-        ],
-        "phases must fire once each, in backup order"
+        vec![Phase::Scanning, Phase::Compressing, Phase::Finalizing],
+        "a plaintext backup must fire Scanning -> Compressing -> Finalizing, with no Encrypting"
+    );
+    assert!(
+        !progress.phases.contains(&Phase::Encrypting),
+        "a plaintext backup must omit the Encrypting phase entirely (#65)"
     );
     // on_entry ticks once per Entry and reaches (total, total) on the last one.
+    assert_eq!(progress.entry_ticks, 2);
+    assert_eq!(progress.last_entry, Some((2, 2)));
+}
+
+/// Issue #65 / story 44: an **encrypted** backup inserts the `Encrypting` phase between
+/// `Compressing` and `Finalizing` — the one phase difference from the plaintext run above,
+/// present precisely because there is real encryption work to report.
+#[test]
+fn encrypted_backup_inserts_the_encrypting_phase() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output);
+    let selection = shell_selection(&ctx);
+    let encryption = Encryption::Passphrase(SecretString::from("correct-horse-battery-staple"));
+
+    let mut progress = RecordingProgress::default();
+    linux_backup_core::backup(
+        &selection,
+        &ctx,
+        &encryption,
+        &NoCommandRunner,
+        &mut progress,
+    )
+    .expect("backup should succeed");
+
+    assert_eq!(
+        progress.phases,
+        vec![
+            Phase::Scanning,
+            Phase::Compressing,
+            Phase::Encrypting,
+            Phase::Finalizing
+        ],
+        "an encrypted backup must fire Scanning -> Compressing -> Encrypting -> Finalizing"
+    );
+}
+
+/// Issue #65 / story 50: `restore` drives the same injected [`Progress`] channel `backup`
+/// does (ADR-0005 D4's Progress-param extension) — `VerifyingArchive` (the pre-flight
+/// checksum pass) then `Restoring`, ticking `on_entry` once per unpacked Entry. Exercised by
+/// extending the restore half of this seam rather than adding a new one (spec #62 Testing
+/// Decisions).
+#[test]
+fn restore_drives_progress_through_verify_then_restore_phases() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output);
+    let selection = shell_selection(&ctx);
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home, ctx.output_location);
+    let mut progress = RecordingProgress::default();
+    let mut decline = |_: &[PathBuf]| false;
+    let restore_outcome = linux_backup_core::restore::restore(
+        &outcome.backup_dir,
+        &restore_ctx,
+        None,
+        CollisionPolicy::Confirm(&mut decline),
+        &mut progress,
+    )
+    .expect("restore should succeed");
+    assert_eq!(restore_outcome.restored_paths.len(), 2);
+
+    assert_eq!(
+        progress.phases,
+        vec![Phase::VerifyingArchive, Phase::Restoring],
+        "restore must fire VerifyingArchive then Restoring, in order"
+    );
+    // The two Shell fixture files unpack as two tar entries, ticking on_entry twice against
+    // the Manifest's Entry count as the (approximate) total.
     assert_eq!(progress.entry_ticks, 2);
     assert_eq!(progress.last_entry, Some((2, 2)));
 }

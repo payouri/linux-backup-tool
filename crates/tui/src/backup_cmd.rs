@@ -417,8 +417,9 @@ impl Progress for BarProgress {
 fn phase_label(phase: Phase) -> &'static str {
     match phase {
         Phase::Scanning => "Reading Entries",
-        Phase::WritingArchive => "Writing Archive",
-        Phase::WritingManifest => "Writing Manifest",
+        Phase::Compressing => "Compressing",
+        Phase::Encrypting => "Encrypting",
+        Phase::Finalizing => "Finalizing",
         // Restore-only phases; the `Progress` trait is shared with restore but a backup run
         // never reports these.
         Phase::VerifyingArchive | Phase::Restoring => "Working",
@@ -668,8 +669,9 @@ mod tests {
     #[test]
     fn phase_label_maps_each_backup_phase_to_a_distinct_label() {
         assert_eq!(phase_label(Phase::Scanning), "Reading Entries");
-        assert_eq!(phase_label(Phase::WritingArchive), "Writing Archive");
-        assert_eq!(phase_label(Phase::WritingManifest), "Writing Manifest");
+        assert_eq!(phase_label(Phase::Compressing), "Compressing");
+        assert_eq!(phase_label(Phase::Encrypting), "Encrypting");
+        assert_eq!(phase_label(Phase::Finalizing), "Finalizing");
     }
 
     // --- success_summary -------------------------------------------------------------

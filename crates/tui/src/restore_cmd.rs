@@ -65,8 +65,18 @@ pub fn run(args: &RestoreArgs) -> Result<()> {
         CollisionPolicy::Confirm(&mut confirm)
     };
 
-    let outcome = restore::restore(&args.backup_dir, &ctx, passphrase.as_ref(), policy)
-        .map_err(describe_restore_error)?;
+    // This alpha CLI restore path shows no live progress bar (the RUN/restore progress UI is
+    // the ratatui overhaul's job, spec #62); a `NoopProgress` satisfies the new parameter
+    // without drawing anything.
+    let mut progress = linux_backup_core::progress::NoopProgress;
+    let outcome = restore::restore(
+        &args.backup_dir,
+        &ctx,
+        passphrase.as_ref(),
+        policy,
+        &mut progress,
+    )
+    .map_err(describe_restore_error)?;
 
     println!("{}", format_summary(&outcome));
 

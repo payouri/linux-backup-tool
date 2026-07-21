@@ -8,11 +8,19 @@
 //! needing a signature change later.
 
 /// A coarse phase within a backup or restore run, reported through [`Progress`].
+///
+/// A backup run reports `Scanning` → `Compressing` → (`Encrypting`) → `Finalizing`, where
+/// `Encrypting` fires only when the backup is actually encrypted (it is omitted entirely for
+/// a plaintext backup, so a plaintext run's caller never sees it). The two on-disk write
+/// steps (Archive then Manifest) surface as the single `Finalizing` phase rather than as
+/// separate write phases — the coarse phase set tracks what the RUN screen shows, not each
+/// internal write. `VerifyingArchive` and `Restoring` are the restore-side phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Scanning,
-    WritingArchive,
-    WritingManifest,
+    Compressing,
+    Encrypting,
+    Finalizing,
     VerifyingArchive,
     Restoring,
 }

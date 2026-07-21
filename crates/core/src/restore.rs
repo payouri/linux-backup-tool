@@ -21,6 +21,7 @@ use crate::context::{Privilege, RunContext};
 use crate::error::CoreError;
 use crate::manifest::{Manifest, PackageInfo};
 use crate::packages::{AUR, CARGO, FLATPAK, NPM, PACMAN, SNAP};
+use crate::progress::{Phase, Progress};
 
 /// One per-Entry failure encountered during restore. Per ADR-0002, restore continues past
 /// these rather than aborting the whole run — collected here instead.
@@ -132,11 +133,18 @@ pub struct RestoreOutcome {
 /// `ctx.home` — the one place still guaranteed reachable after restore even if the Backup
 /// dir lived on a drive that gets unmounted (e.g. a USB stick) — never executed by
 /// anything here.
+///
+/// `progress` is the injected callback (ADR-0004: an injected notification, not an ambient
+/// read) the restore screen drives its progress from, mirroring how [`backup`](crate::backup)
+/// takes one. It observes [`Phase::VerifyingArchive`] (the pre-flight checksum pass) then
+/// [`Phase::Restoring`] with a per-Entry tick as files land. Like backup's, it is only ever
+/// notified, never consulted; callers that don't care pass `&mut progress::NoopProgress`.
 pub fn restore(
     backup_dir: &Path,
     ctx: &RunContext,
     passphrase: Option<&SecretString>,
     mut policy: CollisionPolicy<'_>,
+    progress: &mut dyn Progress,
 ) -> Result<RestoreOutcome, CoreError> {
     let (manifest_path, encrypted) = locate_manifest(backup_dir)?;
     let manifest_bytes = fs::read(&manifest_path).map_err(|source| CoreError::Io {
@@ -153,6 +161,7 @@ pub fn restore(
     })?;
     let archive_bytes = archive::decrypt(&archive_bytes, encrypted, passphrase)?;
 
+    progress.on_phase(Phase::VerifyingArchive);
     let actual_sha256 = archive::sha256_hex(&archive_bytes);
     if actual_sha256 != manifest.archive_sha256 {
         return Err(CoreError::ArchiveChecksumMismatch {
@@ -166,11 +175,18 @@ pub fn restore(
     // "confirm once" prompt (issue #37) rather than pausing per file.
     let overwrite = resolve_overwrite(&archive_bytes, ctx, &mut policy)?;
 
+    progress.on_phase(Phase::Restoring);
     let UnpackReport {
         restored_paths,
         mut failures,
         skipped_collisions,
-    } = unpack_all(&archive_bytes, ctx, overwrite)?;
+    } = unpack_all(
+        &archive_bytes,
+        ctx,
+        overwrite,
+        manifest.entries.len(),
+        progress,
+    )?;
 
     let ownership = match ctx.privilege {
         Privilege::Root => OwnershipOutcome::Restored,
@@ -291,10 +307,16 @@ fn scan_collisions(archive_bytes: &[u8], ctx: &RunContext) -> Result<Vec<PathBuf
 /// `false`, a target that already exists is left untouched and recorded as a
 /// [`SkippedCollision`] (issue #37 — a deliberate skip, not a failure); when `true`, it's
 /// overwritten.
+///
+/// `total` is the Manifest's Entry count, used only to tick `progress` toward a known
+/// denominator — an approximate total (the tar stream and the Manifest's Entry list needn't
+/// agree exactly), which the [`Progress`] contract explicitly permits.
 fn unpack_all(
     archive_bytes: &[u8],
     ctx: &RunContext,
     overwrite: bool,
+    total: usize,
+    progress: &mut dyn Progress,
 ) -> Result<UnpackReport, CoreError> {
     let zstd_decoder = zstd::stream::read::Decoder::new(archive_bytes)
         .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
@@ -307,7 +329,10 @@ fn unpack_all(
     let mut failures = Vec::new();
     let mut skipped_collisions = Vec::new();
 
-    for tar_entry in tar_entries {
+    for (index, tar_entry) in tar_entries.enumerate() {
+        // Ticked at the top of the body (mirroring `archive::build`) so it fires once per tar
+        // entry regardless of which skip/continue path the iteration takes below.
+        progress.on_entry(index + 1, total);
         let mut tar_entry = match tar_entry {
             Ok(entry) => entry,
             Err(e) => {
@@ -712,7 +737,14 @@ mod tests {
             restored_paths,
             failures,
             ..
-        } = unpack_all(&archive_bytes, &ctx, false).expect("unpack_all must not abort the run");
+        } = unpack_all(
+            &archive_bytes,
+            &ctx,
+            false,
+            1,
+            &mut crate::progress::NoopProgress,
+        )
+        .expect("unpack_all must not abort the run");
 
         let target = restore_home.join("greeting.txt");
         assert_eq!(

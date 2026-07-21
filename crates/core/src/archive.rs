@@ -82,8 +82,9 @@ pub struct BuiltArchive {
 /// policy. The caller is responsible for deleting the just-created Backup dir on `Err`.
 ///
 /// `progress` observes the per-Entry read loop (the [`Phase::Scanning`] phase, reported
-/// once up front here) so a caller can drive a live progress bar; it's only ever notified,
-/// never consulted — pass `&mut progress::NoopProgress` when progress isn't wanted.
+/// once up front here) and the trailing [`Phase::Compressing`] frame flush, so a caller can
+/// drive a live progress bar; it's only ever notified, never consulted — pass
+/// `&mut progress::NoopProgress` when progress isn't wanted.
 pub fn build(entries: &[Entry], progress: &mut dyn Progress) -> Result<BuiltArchive, CoreError> {
     let mut checksums = BTreeMap::new();
     let mut vanished = Vec::new();
@@ -182,6 +183,10 @@ pub fn build(entries: &[Entry], progress: &mut dyn Progress) -> Result<BuiltArch
             .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
     }
 
+    // The per-Entry reads above stream into the zstd encoder, but the trailing frame flush
+    // (`finish` below) is where the bulk of compression work lands — report it as its own
+    // phase so the RUN screen can distinguish reading from compressing.
+    progress.on_phase(Phase::Compressing);
     let zstd_encoder = tar_builder
         .into_inner()
         .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
