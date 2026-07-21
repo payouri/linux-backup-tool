@@ -195,11 +195,11 @@ fn prune(mut profile: Profile, exists: impl Fn(&Path) -> bool) -> (Profile, usiz
     profile.custom_paths.retain(|path| exists(path));
     let mut pruned = custom_before - profile.custom_paths.len();
 
-    if let Some(location) = &profile.output_location {
-        if !exists(location) {
-            profile.output_location = None;
-            pruned += 1;
-        }
+    if let Some(location) = &profile.output_location
+        && !exists(location)
+    {
+        profile.output_location = None;
+        pruned += 1;
     }
 
     (profile, pruned)

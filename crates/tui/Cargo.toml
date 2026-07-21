@@ -3,7 +3,7 @@ name = "tui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "linux-backup's inquire-based terminal wizard: a thin view over core's SelectionModel, owning only cursor/scroll state and rendering."
+description = "linux-backup's ratatui terminal app: one App reducer + pure render over core's SelectionModel, owning only view state (route, cursor/scroll, input buffers) and the terminal lifecycle."
 
 [lints]
 workspace = true
@@ -15,6 +15,17 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.103"
 linux_backup_core = { path = "../core", package = "linux-backup-core" }
+# The Rust TUI crate the whole interactive-surface overhaul (spec #62 / ADR-0005) is built
+# on: a persistent full-screen frame with an event loop and live redraw, which `inquire`'s
+# print-then-prompt model structurally cannot provide. Pinned to 0.30 per #46 /
+# docs/research/2026-07-18-ratatui-foundation.md; adopting it moves the workspace to edition
+# 2024 / MSRV 1.88. Bundles `crossterm` 0.29 as its backend.
+ratatui = "0.30"
+# Direct handle on the same `crossterm` 0.29 `ratatui` already pulls in, for the terminal
+# lifecycle the shared runtime owns (raw mode, alt screen, the event `read()` loop) and the
+# `KeyEvent`/`KeyModifiers`/`KeyEventKind` types the pure `update` reducer matches on. Pinned
+# to 0.29 to resolve one shared `crossterm` instance with ratatui rather than two.
+crossterm = "0.29"
 inquire = "0.9.4"
 # `age::Encryptor::with_user_passphrase` (in `core`) takes a `secrecy::SecretString`; this
 # crate needs the same type to carry the passphrase from `inquire::Password` into

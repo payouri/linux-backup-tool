@@ -4,8 +4,8 @@ members = ["crates/core", "crates/tui"]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.95"
+edition = "2024"
+rust-version = "1.88"
 
 [workspace.lints.clippy]
 # Enforce AGENTS.md's no-unwrap/expect/panic rule (disallowed lists live in clippy.toml).

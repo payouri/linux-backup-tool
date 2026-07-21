@@ -1,0 +1,4 @@
+# Pin formatting to the 2021 style so the edition-2024 bump (spec #62 / #63) is a compiler
+# edition change only, not a workspace-wide cosmetic reflow. Revisit when adopting the 2024
+# formatting style is a deliberate, separate change.
+style_edition = "2021"

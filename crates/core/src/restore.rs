@@ -358,13 +358,13 @@ fn unpack_all(
                 // Story 53: attempt chown only as root; never even try (let alone fail
                 // silently) as a non-root run — that decision is surfaced via
                 // `RestoreOutcome::ownership` rather than re-derived per file here.
-                if ctx.privilege == Privilege::Root {
-                    if let Err(reason) = chown_to_tar_owner(&tar_entry, &target) {
-                        failures.push(RestoreFailure {
-                            path: target.display().to_string(),
-                            reason: format!("ownership restore failed: {reason}"),
-                        });
-                    }
+                if ctx.privilege == Privilege::Root
+                    && let Err(reason) = chown_to_tar_owner(&tar_entry, &target)
+                {
+                    failures.push(RestoreFailure {
+                        path: target.display().to_string(),
+                        reason: format!("ownership restore failed: {reason}"),
+                    });
                 }
             }
             Err(source) => failures.push(RestoreFailure {

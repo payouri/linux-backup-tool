@@ -52,6 +52,9 @@ pub fn build_run_context() -> Result<RunContext> {
 ///
 /// Per ADR-0004 the `$XDG_CONFIG_HOME`/`$HOME` reads happen here in `tui`, never in `core` —
 /// `core::profile::{load,save}` take the already-resolved path.
+// Reachable again once the wizard/select builds (spec #62) load the Profile; the inquire
+// modules that call it today are no longer dispatched from `main` (see main.rs).
+#[allow(dead_code)]
 pub fn profile_path() -> Result<PathBuf> {
     let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(value) if !value.is_empty() => PathBuf::from(value),

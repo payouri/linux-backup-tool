@@ -416,14 +416,14 @@ fn is_unmounted_usb_partition(dev: &LsblkDevice) -> bool {
 /// level.
 fn collect_unmounted_usb_partitions(devices: &[LsblkDevice], out: &mut Vec<UnmountedPartition>) {
     for dev in devices {
-        if is_unmounted_usb_partition(dev) {
-            if let Some(path) = &dev.path {
-                out.push(UnmountedPartition {
-                    device: PathBuf::from(path),
-                    size: dev.size.unwrap_or(0),
-                    fstype: dev.fstype.clone(),
-                });
-            }
+        if is_unmounted_usb_partition(dev)
+            && let Some(path) = &dev.path
+        {
+            out.push(UnmountedPartition {
+                device: PathBuf::from(path),
+                size: dev.size.unwrap_or(0),
+                fstype: dev.fstype.clone(),
+            });
         }
         collect_unmounted_usb_partitions(&dev.children, out);
     }
