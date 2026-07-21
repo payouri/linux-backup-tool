@@ -162,9 +162,11 @@ fn choose_location(
     }
 }
 
-/// Prompt for a Custom path (story 30), expand `~`/`$VARS` and create it via core, then
-/// validate it like any other location. On any error (cancel, expansion/create failure,
-/// validation refusal) this returns `Ok(None)` so the caller re-lists the pick-list.
+/// Prompt for a Custom path (story 30), expand `~`/`$VARS`, then validate it like any other
+/// location. Existing paths only — the tool never creates a directory on the user's behalf
+/// (#52); a path that doesn't exist is refused by `resolve_selection` below, not conjured
+/// into being. On cancel or a validation refusal this returns `Ok(None)` so the caller
+/// re-lists the pick-list.
 fn prompt_custom_path(
     ctx: &RunContext,
     dir_name: &str,
@@ -178,14 +180,9 @@ fn prompt_custom_path(
         Err(other) => return Err(other).context("Custom-path prompt failed"),
     };
 
-    let resolved =
-        match location::resolve_custom_path(&typed, &ctx.home, |name| std::env::var(name).ok()) {
-            Ok(path) => path,
-            Err(err) => {
-                println!("Cannot use '{typed}': {err}");
-                return Ok(None);
-            }
-        };
+    // Env-var/`~` expansion stays at the tui boundary via the injected closure (ADR-0004);
+    // `core` receives the already-expanded path and reads no ambient environment.
+    let resolved = location::expand_path(&typed, &ctx.home, |name| std::env::var(name).ok());
 
     // A Custom path isn't tied to a discovered `DiskInfo`, so its free space is unknown here
     // (`None`) rather than fabricated — the free-space warning simply doesn't fire for it.

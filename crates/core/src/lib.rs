@@ -22,6 +22,7 @@ pub mod catalog;
 pub mod context;
 pub mod crypto;
 pub mod error;
+pub mod fs_probe;
 pub mod location;
 pub mod manifest;
 pub mod model;

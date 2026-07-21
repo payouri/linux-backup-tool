@@ -5,9 +5,10 @@
 //! Story 50 is the load-bearing ordering constraint: when the Backup is encrypted, the
 //! passphrase prompt must complete *before* `core::restore::restore` is called at all, so
 //! the user learns whether they have the right passphrase before a single file is touched.
-//! [`run`] enforces this structurally — `is_encrypted_backup` and `prompt_passphrase` both
-//! run to completion ahead of the one call into `restore::restore`, which is the only place
-//! in this module (or `core`) that writes anything to disk.
+//! [`run`] enforces this structurally — `core::fs_probe::is_encrypted_backup` and
+//! `prompt_passphrase` both run to completion ahead of the one call into `restore::restore`,
+//! which is the only place in this module (or `core`) that writes anything to disk. The
+//! encrypted-Backup probe itself lives in `core` (ADR-0005 D6); this module only reacts to it.
 //!
 //! Story 54 / issue #37's "confirm once" collision handling lives here: when a restore would
 //! overwrite existing file(s) and `--overwrite` was not passed, this module shows a single
@@ -18,28 +19,28 @@
 //! ([`CollisionPolicy::Overwrite`](restore::CollisionPolicy)), preserving the unchanged
 //! non-interactive AFK behaviour.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use inquire::{Confirm, Password};
 use linux_backup_core::restore::{
     self, CollisionPolicy, OwnershipOutcome, RestoreOutcome, VerifyReport,
 };
-use linux_backup_core::{archive, CoreError, Privilege};
+use linux_backup_core::{fs_probe, CoreError, Privilege};
 use secrecy::SecretString;
 
 use crate::cli::RestoreArgs;
 use crate::system;
 
 pub fn run(args: &RestoreArgs) -> Result<()> {
-    if !args.backup_dir.is_dir() {
+    if !fs_probe::is_dir(&args.backup_dir) {
         bail!(
             "backup dir {} does not exist or is not a directory",
             args.backup_dir.display()
         );
     }
 
-    let passphrase = if is_encrypted_backup(&args.backup_dir) {
+    let passphrase = if fs_probe::is_encrypted_backup(&args.backup_dir) {
         Some(prompt_passphrase()?)
     } else {
         None
@@ -86,18 +87,6 @@ pub fn run(args: &RestoreArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Whether `backup_dir` is encrypted, detected the same way `core::restore` itself does
-/// internally: the `.age`-suffixed Manifest filename is the authoritative signal
-/// (CONTEXT.md's Manifest entry — never a field inside the Manifest). Checking it here,
-/// ahead of calling `restore::restore` at all, is what makes story 50's ordering possible:
-/// `restore::restore` only discovers encryption *after* it's already been called, which
-/// would be too late for an up-front prompt.
-fn is_encrypted_backup(backup_dir: &Path) -> bool {
-    backup_dir
-        .join(archive::filename_for(archive::MANIFEST_FILENAME, true))
-        .is_file()
 }
 
 /// Story 53's up-front ownership warning: `None` when running as root (nothing to warn
@@ -298,26 +287,6 @@ mod tests {
         let warning = ownership_up_front_warning(Privilege::NonRoot).expect("non-root must warn");
         assert!(warning.contains("not running as root"));
         assert!(warning.contains("uid/gid"));
-    }
-
-    #[test]
-    fn is_encrypted_backup_is_true_when_the_age_suffixed_manifest_exists() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join("manifest.json.age"), b"ignored").expect("write");
-        assert!(is_encrypted_backup(tmp.path()));
-    }
-
-    #[test]
-    fn is_encrypted_backup_is_false_when_only_the_plain_manifest_exists() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join("manifest.json"), b"ignored").expect("write");
-        assert!(!is_encrypted_backup(tmp.path()));
-    }
-
-    #[test]
-    fn is_encrypted_backup_is_false_when_the_dir_has_neither_manifest() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        assert!(!is_encrypted_backup(tmp.path()));
     }
 
     #[test]

@@ -244,21 +244,6 @@ pub fn expand_path(input: &str, home: &Path, getenv: impl Fn(&str) -> Option<Str
     expand_tilde(&with_vars, home)
 }
 
-/// Expand a Custom path and create it if missing (story 30). The directory is created
-/// with `create_dir_all` so intermediate components are made too.
-pub fn resolve_custom_path(
-    input: &str,
-    home: &Path,
-    getenv: impl Fn(&str) -> Option<String>,
-) -> Result<PathBuf, CoreError> {
-    let expanded = expand_path(input, home, getenv);
-    fs::create_dir_all(&expanded).map_err(|source| CoreError::Io {
-        path: expanded.clone(),
-        source,
-    })?;
-    Ok(expanded)
-}
-
 /// Probe filename used by [`ensure_writable`]; namespaced and pid-suffixed so concurrent
 /// runs against the same location can't collide.
 fn write_probe_name() -> String {
@@ -732,28 +717,6 @@ mod tests {
             (name == "HOME").then(|| "~".to_string())
         });
         assert_eq!(out, home.join("backups"));
-    }
-
-    // --- resolve_custom_path (create-if-missing) ------------------------------------
-
-    #[test]
-    fn resolve_custom_path_creates_missing_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        let target = tmp.path().join("nested/does/not/exist");
-        assert!(!target.exists());
-        let resolved = resolve_custom_path(target.to_str().unwrap(), &home, |_| None).unwrap();
-        assert_eq!(resolved, target);
-        assert!(target.is_dir());
-    }
-
-    #[test]
-    fn resolve_custom_path_expands_tilde_and_creates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        let resolved = resolve_custom_path("~/my-backups", &home, |_| None).unwrap();
-        assert_eq!(resolved, home.join("my-backups"));
-        assert!(resolved.is_dir());
     }
 
     // --- ensure_writable (hard refusal) ---------------------------------------------

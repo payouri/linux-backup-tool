@@ -29,6 +29,7 @@ use inquire::error::InquireError;
 use inquire::{MultiSelect, Select, Text};
 use linux_backup_core::catalog;
 use linux_backup_core::crypto;
+use linux_backup_core::fs_probe;
 use linux_backup_core::location;
 use linux_backup_core::model::{Entry, SelectionModel};
 use linux_backup_core::profile::Profile;
@@ -384,11 +385,7 @@ fn root_row_label(root: &str, scan: &CategoryScan) -> String {
         .filter(|entry| entry.relative_path.starts_with(root))
         .collect();
     let count = under.len();
-    let size: u64 = under
-        .iter()
-        .filter_map(|entry| std::fs::metadata(&entry.absolute_path).ok())
-        .map(|m| m.len())
-        .sum();
+    let size = fs_probe::subtree_size(under.iter().map(|entry| entry.absolute_path.as_path()));
     let lock = if under.iter().any(|entry| entry.sensitive) {
         " 🔒"
     } else {
