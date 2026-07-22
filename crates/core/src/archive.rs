@@ -19,6 +19,7 @@ use std::path::Path;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 
+use crate::cancel::CancelToken;
 use crate::error::CoreError;
 use crate::model::{Entry, EntryType};
 use crate::progress::{Phase, Progress};
@@ -89,7 +90,17 @@ pub struct BuiltArchive {
 /// Takes `&[&Entry]` rather than `&[Entry]` (#82): `SelectionModel::entries` is a `BTreeMap`
 /// with no contiguous `Entry` storage to slice, so its accessor hands back borrowed references
 /// in path order instead.
-pub fn build(entries: &[&Entry], progress: &mut dyn Progress) -> Result<BuiltArchive, CoreError> {
+///
+/// `cancel` is polled once per Entry at the top of the read loop — this is the backup's
+/// cancel-safe front half, before any Archive bytes reach disk. A cancellation seen here aborts
+/// with [`CoreError::Cancelled`]; the caller ([`crate::backup`]) then runs ADR-0002 cleanup on
+/// the (still-empty) Backup dir. It is never polled during the trailing compression flush, so a
+/// cancel requested after the last Entry simply lets the run finish.
+pub fn build(
+    entries: &[&Entry],
+    progress: &mut dyn Progress,
+    cancel: &CancelToken,
+) -> Result<BuiltArchive, CoreError> {
     let mut checksums = BTreeMap::new();
     let mut vanished = Vec::new();
 
@@ -101,6 +112,13 @@ pub fn build(entries: &[&Entry], progress: &mut dyn Progress) -> Result<BuiltArc
     let mut tar_builder = tar::Builder::new(zstd_encoder);
 
     for (index, entry) in entries.iter().copied().enumerate() {
+        // Checked before this Entry's read (the front-half checkpoint): nothing is on disk yet,
+        // so aborting here is always clean. Past this loop the compression flush and Archive
+        // write commit bytes and are deliberately not cancellable.
+        if cancel.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+
         // Ticked once at the top of the body so it fires exactly `total` times regardless of
         // which path the iteration takes below (a Vanished `continue` would otherwise skip a
         // tick placed at the bottom, stalling the bar short of 100%).
@@ -390,6 +408,7 @@ mod tests {
         let built = build(
             &[&entry(missing, false)],
             &mut crate::progress::NoopProgress,
+            &CancelToken::new(),
         )
         .expect("a Vanished entry must not abort");
 
@@ -402,8 +421,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("gone-key");
 
-        let built = build(&[&entry(missing, true)], &mut crate::progress::NoopProgress)
-            .expect("build should succeed");
+        let built = build(
+            &[&entry(missing, true)],
+            &mut crate::progress::NoopProgress,
+            &CancelToken::new(),
+        )
+        .expect("build should succeed");
 
         assert_eq!(built.vanished.len(), 1);
         assert!(built.vanished[0].sensitive);
@@ -419,6 +442,7 @@ mod tests {
         let result = build(
             &[&entry(tmp.path().to_path_buf(), false)],
             &mut crate::progress::NoopProgress,
+            &CancelToken::new(),
         );
 
         match result {

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use secrecy::SecretString;
 
 use crate::archive;
+use crate::cancel::CancelToken;
 use crate::context::{Privilege, RunContext};
 use crate::error::CoreError;
 use crate::manifest::{Manifest, PackageInfo};
@@ -103,6 +104,14 @@ pub struct RestoreOutcome {
     pub reinstall_script_path: PathBuf,
     /// Per-manager package counts backing `reinstall.sh`, for a caller (TUI, #29) to print.
     pub package_counts: BTreeMap<String, usize>,
+    /// Whether the run was cancelled cooperatively (via its [`CancelToken`]) partway through
+    /// unpacking. Restore has no cancel-safe front half — every unpacked file is already a
+    /// commit (ADR-0002, no rollback) — so cancellation is reported *here*, on the `Ok` side,
+    /// with the partial [`restored_paths`](Self::restored_paths)/[`failures`](Self::failures)
+    /// reflecting exactly what landed before the stop, rather than as a
+    /// [`CoreError::Cancelled`] (the backup-only path). `false` for any run that ran to
+    /// completion.
+    pub cancelled: bool,
 }
 
 /// Reads the Backup dir at `backup_dir`: locates the Manifest and Archive (encrypted or
@@ -139,12 +148,22 @@ pub struct RestoreOutcome {
 /// takes one. It observes [`Phase::VerifyingArchive`] (the pre-flight checksum pass) then
 /// [`Phase::Restoring`] with a per-Entry tick as files land. Like backup's, it is only ever
 /// notified, never consulted; callers that don't care pass `&mut progress::NoopProgress`.
+///
+/// `cancel` is the cooperative-cancellation signal (its own parameter, not a `RunContext`
+/// field — see [`CancelToken`]'s doc). Unlike [`backup`](crate::backup), restore has no
+/// cancel-safe front half: it is polled per Entry in the unpack loop, and a cancellation
+/// there stops unpacking further Entries and returns the *partial*
+/// [`RestoreOutcome`](RestoreOutcome) with [`cancelled`](RestoreOutcome::cancelled) set — not a
+/// [`CoreError::Cancelled`]. The pre-flight checksum verify (before any file is touched) is not
+/// a cancel checkpoint; a cancel requested that early simply lets the run start. Callers that
+/// never cancel pass a fresh [`CancelToken::new`].
 pub fn restore(
     backup_dir: &Path,
     ctx: &RunContext,
     passphrase: Option<&SecretString>,
     mut policy: CollisionPolicy<'_>,
     progress: &mut dyn Progress,
+    cancel: &CancelToken,
 ) -> Result<RestoreOutcome, CoreError> {
     let (manifest_path, encrypted) = locate_manifest(backup_dir)?;
     let manifest_bytes = fs::read(&manifest_path).map_err(|source| CoreError::Io {
@@ -180,12 +199,14 @@ pub fn restore(
         restored_paths,
         mut failures,
         skipped_collisions,
+        cancelled,
     } = unpack_all(
         &archive_bytes,
         ctx,
         overwrite,
         manifest.entries.len(),
         progress,
+        cancel,
     )?;
 
     let ownership = match ctx.privilege {
@@ -210,6 +231,7 @@ pub fn restore(
         ownership,
         reinstall_script_path,
         package_counts: reinstall.counts,
+        cancelled,
     })
 }
 
@@ -245,6 +267,9 @@ struct UnpackReport {
     restored_paths: Vec<PathBuf>,
     failures: Vec<RestoreFailure>,
     skipped_collisions: Vec<SkippedCollision>,
+    /// Set when the unpack loop stopped early because the [`CancelToken`] was flipped —
+    /// [`restore`] surfaces it on [`RestoreOutcome::cancelled`].
+    cancelled: bool,
 }
 
 /// Resolves the whole-run overwrite decision (issue #37's "confirm once") before any file is
@@ -311,12 +336,18 @@ fn scan_collisions(archive_bytes: &[u8], ctx: &RunContext) -> Result<Vec<PathBuf
 /// `total` is the Manifest's Entry count, used only to tick `progress` toward a known
 /// denominator — an approximate total (the tar stream and the Manifest's Entry list needn't
 /// agree exactly), which the [`Progress`] contract explicitly permits.
+///
+/// `cancel` is polled once per Entry at the top of the loop. Because every unpacked file is
+/// already committed (ADR-0002, no rollback), a cancellation can't undo what landed — it only
+/// stops the loop from unpacking further Entries, and the returned report carries
+/// `cancelled: true` plus whatever had already been restored.
 fn unpack_all(
     archive_bytes: &[u8],
     ctx: &RunContext,
     overwrite: bool,
     total: usize,
     progress: &mut dyn Progress,
+    cancel: &CancelToken,
 ) -> Result<UnpackReport, CoreError> {
     let zstd_decoder = zstd::stream::read::Decoder::new(archive_bytes)
         .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
@@ -328,8 +359,16 @@ fn unpack_all(
     let mut restored_paths = Vec::new();
     let mut failures = Vec::new();
     let mut skipped_collisions = Vec::new();
+    let mut cancelled = false;
 
     for (index, tar_entry) in tar_entries.enumerate() {
+        // Checked before unpacking this Entry: already-restored files stay (no rollback,
+        // ADR-0002); we just stop advancing and report the partial state via `cancelled`.
+        if cancel.is_cancelled() {
+            cancelled = true;
+            break;
+        }
+
         // Ticked at the top of the body (mirroring `archive::build`) so it fires once per tar
         // entry regardless of which skip/continue path the iteration takes below.
         progress.on_entry(index + 1, total);
@@ -403,6 +442,7 @@ fn unpack_all(
         restored_paths,
         failures,
         skipped_collisions,
+        cancelled,
     })
 }
 
@@ -743,6 +783,7 @@ mod tests {
             false,
             1,
             &mut crate::progress::NoopProgress,
+            &CancelToken::new(),
         )
         .expect("unpack_all must not abort the run");
 

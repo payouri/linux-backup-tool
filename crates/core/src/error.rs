@@ -14,6 +14,16 @@ pub enum CoreError {
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),
 
+    /// The run was cancelled cooperatively via its [`CancelToken`](crate::cancel::CancelToken)
+    /// before it committed anything to disk. Backup-only: cancellation is honored solely in the
+    /// front-half scan loop (before the Archive is written), so this routes through
+    /// [`backup`](crate::backup)'s ADR-0002 fail-fast cleanup — the empty Backup dir is removed,
+    /// nothing is left behind. Restore has no cancel-safe front half and instead reports a
+    /// partial [`RestoreOutcome`](crate::restore::RestoreOutcome) rather than this error. Callers
+    /// render it neutrally, not as a failure.
+    #[error("run cancelled")]
+    Cancelled,
+
     /// The target Backup dir already exists. Per story 33 / ADR "collision unit", a
     /// backup run must refuse rather than silently overwrite a previous one.
     #[error("backup dir already exists: {0}")]

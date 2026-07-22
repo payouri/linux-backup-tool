@@ -31,7 +31,7 @@ use linux_backup_core::model::{DirectoryState, Entry, EntryRoot, EntryType, Sele
 use linux_backup_core::packages::{CommandRunner, NoCommandRunner};
 use linux_backup_core::progress::{NoopProgress, Phase, Progress};
 use linux_backup_core::restore::{CollisionPolicy, RestoreOutcome};
-use linux_backup_core::{catalog, crypto, manifest, scan, BackupOutcome, CoreError};
+use linux_backup_core::{catalog, crypto, manifest, scan, BackupOutcome, CancelToken, CoreError};
 
 /// Builds a synthetic `$HOME` under `root` containing:
 /// - two files *on* the Shell Category's Curated allowlist (`.oh-my-zsh/custom/...`),
@@ -106,6 +106,7 @@ fn run_backup(
         encryption,
         &NoCommandRunner,
         &mut NoopProgress,
+        &CancelToken::new(),
     )
 }
 
@@ -129,6 +130,7 @@ fn run_restore(
         passphrase,
         CollisionPolicy::Confirm(&mut decline),
         &mut NoopProgress,
+        &CancelToken::new(),
     )
 }
 
@@ -1146,6 +1148,7 @@ fn restore_collision_is_skipped_on_decline_and_overwritten_on_confirm_or_flag() 
         None,
         CollisionPolicy::Confirm(&mut decline),
         &mut NoopProgress,
+        &CancelToken::new(),
     )
     .expect("restore should still complete despite one declined collision (ADR-0002)");
 
@@ -1197,6 +1200,7 @@ fn restore_collision_is_skipped_on_decline_and_overwritten_on_confirm_or_flag() 
         None,
         CollisionPolicy::Confirm(&mut accept),
         &mut NoopProgress,
+        &CancelToken::new(),
     )
     .expect("restore should succeed once the overwrite is confirmed");
     assert!(
@@ -1221,6 +1225,7 @@ fn restore_collision_is_skipped_on_decline_and_overwritten_on_confirm_or_flag() 
         None,
         CollisionPolicy::Overwrite,
         &mut NoopProgress,
+        &CancelToken::new(),
     )
     .expect("restore with --overwrite should succeed");
     assert!(
@@ -1259,6 +1264,7 @@ fn reinstall_script_is_written_with_correct_per_manager_counts_from_captured_pac
         &Encryption::None,
         &runner,
         &mut NoopProgress,
+        &CancelToken::new(),
     )
     .expect("backup should succeed");
 
@@ -1386,6 +1392,7 @@ fn backup_drives_progress_through_the_phases_in_order() {
         &Encryption::None,
         &NoCommandRunner,
         &mut progress,
+        &CancelToken::new(),
     )
     .expect("backup should succeed");
     assert!(outcome.backup_dir.is_dir());
@@ -1425,6 +1432,7 @@ fn encrypted_backup_inserts_the_encrypting_phase() {
         &encryption,
         &NoCommandRunner,
         &mut progress,
+        &CancelToken::new(),
     )
     .expect("backup should succeed");
 
@@ -1466,6 +1474,7 @@ fn restore_drives_progress_through_verify_then_restore_phases() {
         None,
         CollisionPolicy::Confirm(&mut decline),
         &mut progress,
+        &CancelToken::new(),
     )
     .expect("restore should succeed");
     assert_eq!(restore_outcome.restored_paths.len(), 2);
@@ -1479,6 +1488,138 @@ fn restore_drives_progress_through_verify_then_restore_phases() {
     // the Manifest's Entry count as the (approximate) total.
     assert_eq!(progress.entry_ticks, 2);
     assert_eq!(progress.last_entry, Some((2, 2)));
+}
+
+/// A [`Progress`] that flips a [`CancelToken`] the moment the first Entry is processed — the
+/// only way, from a single-threaded test, to observe cancellation *mid-run* (after some work
+/// has landed) rather than before it starts. `on_entry` fires just after the loop's top-of-body
+/// cancel check for an Entry and just before that Entry's own work, so cancelling here lets the
+/// current Entry finish and makes the *next* iteration's check stop the loop — yielding a
+/// genuinely partial run.
+struct CancelOnFirstEntry {
+    cancel: CancelToken,
+    entry_ticks: usize,
+}
+
+impl Progress for CancelOnFirstEntry {
+    fn on_entry(&mut self, _done: usize, _total: usize) {
+        self.entry_ticks += 1;
+        if self.entry_ticks == 1 {
+            self.cancel.cancel();
+        }
+    }
+}
+
+/// Issue #98 (GUI prefactor #97): cancelling a backup in its front-half scan loop aborts with
+/// [`CoreError::Cancelled`] and, riding ADR-0002 fail-fast cleanup, leaves nothing on disk — a
+/// cancel there always precedes the first on-disk byte, so the freshly-created Backup dir is
+/// removed. Uses an already-cancelled token so the very first Entry's checkpoint trips.
+#[test]
+fn backup_cancelled_in_scan_loop_aborts_with_cancelled_and_leaves_nothing_behind() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output.clone());
+    let selection = shell_selection(&ctx);
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let result = linux_backup_core::backup(
+        &selection,
+        &ctx,
+        &Encryption::None,
+        &NoCommandRunner,
+        &mut NoopProgress,
+        &cancel,
+    );
+
+    match result {
+        Err(CoreError::Cancelled) => {}
+        other => panic!("expected Err(CoreError::Cancelled), got {other:?}"),
+    }
+    // The Backup dir `backup` would have computed must not survive a cancel (fail-fast cleanup):
+    // an aborted backup leaves the Output location exactly as it found it.
+    let backup_dir = output.join(linux_backup_core::backup_dir_name(&ctx));
+    assert!(
+        !backup_dir.exists(),
+        "a cancelled backup must remove the freshly-created Backup dir, leaving nothing behind"
+    );
+}
+
+/// Issue #98 (GUI prefactor #97): cancelling a restore mid-unpack returns `Ok` with a *partial*
+/// [`RestoreOutcome`] marked `cancelled` — restore has no cancel-safe front half (each unpacked
+/// file is a commit, ADR-0002, no rollback), so it reports what landed rather than erroring.
+/// The two-file Shell fixture, cancelled on its first Entry, restores exactly one file and stops.
+#[test]
+fn restore_cancelled_mid_unpack_returns_partial_outcome_marked_cancelled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output);
+    let selection = shell_selection(&ctx);
+    assert_eq!(
+        selection.entries().len(),
+        2,
+        "fixture must have two Entries"
+    );
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home, ctx.output_location);
+    let cancel = CancelToken::new();
+    let mut progress = CancelOnFirstEntry {
+        cancel: cancel.clone(),
+        entry_ticks: 0,
+    };
+    let mut decline = |_: &[PathBuf]| false;
+    let restore_outcome = linux_backup_core::restore::restore(
+        &outcome.backup_dir,
+        &restore_ctx,
+        None,
+        CollisionPolicy::Confirm(&mut decline),
+        &mut progress,
+        &cancel,
+    )
+    .expect("a cancelled restore reports partial success, never an error");
+
+    assert!(
+        restore_outcome.cancelled,
+        "a restore stopped mid-unpack must mark the outcome cancelled"
+    );
+    assert_eq!(
+        restore_outcome.restored_paths.len(),
+        1,
+        "cancelling on the first Entry lets that one land, then stops before the second"
+    );
+}
+
+/// The `cancelled` marker is `false` for a restore that runs to completion — the never-cancelled
+/// path, guarding against the marker being spuriously set.
+#[test]
+fn uncancelled_restore_reports_not_cancelled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = build_fixture_home(tmp.path());
+    let output = tmp.path().join("output");
+    fs::create_dir_all(&output).expect("create output dir");
+
+    let ctx = test_ctx(home, output);
+    let selection = shell_selection(&ctx);
+    let outcome = run_backup(&selection, &ctx, &Encryption::None).expect("backup should succeed");
+
+    let restore_home = tmp.path().join("restored-home");
+    let restore_ctx = test_ctx(restore_home, ctx.output_location);
+    let restore_outcome =
+        run_restore(&outcome.backup_dir, &restore_ctx, None).expect("restore should succeed");
+
+    assert!(
+        !restore_outcome.cancelled,
+        "a restore that ran to completion must not be marked cancelled"
+    );
+    assert_eq!(restore_outcome.restored_paths.len(), 2);
 }
 
 /// Issue #36 / stories 45+43: a symlink Entry survives the backup/restore round-trip AS a

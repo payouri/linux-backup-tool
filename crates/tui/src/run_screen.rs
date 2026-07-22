@@ -23,7 +23,7 @@ use linux_backup_core::archive::Encryption;
 use linux_backup_core::model::SelectionModel;
 use linux_backup_core::packages::SystemCommandRunner;
 use linux_backup_core::progress::{Phase, Progress};
-use linux_backup_core::{backup, crypto, BackupOutcome, CoreError, RunContext};
+use linux_backup_core::{backup, crypto, BackupOutcome, CancelToken, CoreError, RunContext};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -88,12 +88,17 @@ pub fn spawn(req: BackupRequest) -> BackupWorker {
     let handle = thread::spawn(move || {
         let mut progress = ChannelProgress { tx: tx.clone() };
         let runner = SystemCommandRunner;
+        // A never-cancelled token: the RUN screen's cancel control is #97 (GUI) / a later TUI
+        // slice's work. Threading one now keeps this call site on the post-prefactor signature
+        // without changing behavior.
+        let cancel = CancelToken::new();
         let message = match backup(
             &req.selection,
             &req.ctx,
             &req.encryption,
             &runner,
             &mut progress,
+            &cancel,
         ) {
             Ok(outcome) => RunMessage::Done(Box::new(outcome)),
             Err(error) => RunMessage::Failed {

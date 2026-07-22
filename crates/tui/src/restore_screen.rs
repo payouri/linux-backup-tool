@@ -42,7 +42,7 @@ use linux_backup_core::progress::{Phase, Progress};
 use linux_backup_core::restore::{
     self, CollisionPolicy, RestoreFailure, RestoreOutcome, VerifyReport,
 };
-use linux_backup_core::{fs_probe, CoreError, RunContext};
+use linux_backup_core::{fs_probe, CancelToken, CoreError, RunContext};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -491,12 +491,16 @@ fn spawn(
     let ctx = ctx.clone();
     std::thread::spawn(move || {
         let mut progress = ChannelProgress { tx };
+        // A never-cancelled token: mid-restore cancel is #97 (GUI) / a later TUI slice's work.
+        // Threading one now keeps this call site on the post-prefactor signature unchanged.
+        let cancel = CancelToken::new();
         let result = restore::restore(
             &backup_dir,
             &ctx,
             passphrase.as_ref(),
             CollisionPolicy::Overwrite,
             &mut progress,
+            &cancel,
         );
         let msg = match result {
             Ok(outcome) => done_message(outcome, &ctx, verify),
@@ -1552,6 +1556,7 @@ mod tests {
             ownership: OwnershipOutcome::SkippedNonRoot,
             reinstall_script_path: PathBuf::from("/home/tester/reinstall.sh"),
             package_counts: BTreeMap::new(),
+            cancelled: false,
         }
     }
 

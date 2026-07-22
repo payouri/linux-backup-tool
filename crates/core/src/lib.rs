@@ -18,6 +18,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_macros))]
 
 pub mod archive;
+pub mod cancel;
 pub mod catalog;
 pub mod context;
 pub mod crypto;
@@ -32,6 +33,7 @@ pub mod progress;
 pub mod restore;
 pub mod scan;
 
+pub use cancel::CancelToken;
 pub use context::{Privilege, RunContext};
 pub use error::CoreError;
 pub use model::{DirectoryState, SelectionModel};
@@ -76,12 +78,21 @@ pub struct BackupOutcome {
 /// each [`Phase`] boundary and the per-Entry archive-read count. It is only ever notified,
 /// never consulted; callers that don't care (the round-trip seam, most tests) pass
 /// `&mut progress::NoopProgress`.
+///
+/// `cancel` is the cooperative-cancellation signal (its own parameter, not a `RunContext`
+/// field — see [`CancelToken`]'s doc). It is polled only in the front-half scan/build loop:
+/// once the Archive starts being written there is nothing left that can be cancelled cleanly,
+/// so cancellation stops being honored past that point. A cancellation observed in the scan
+/// loop aborts with [`CoreError::Cancelled`], which rides the same ADR-0002 fail-fast cleanup
+/// every other error does — the freshly-created Backup dir is removed, leaving nothing behind.
+/// Callers that never cancel pass a fresh [`CancelToken::new`].
 pub fn backup(
     selection: &SelectionModel,
     ctx: &RunContext,
     encryption: &Encryption,
     package_runner: &dyn CommandRunner,
     progress: &mut dyn Progress,
+    cancel: &CancelToken,
 ) -> Result<BackupOutcome, CoreError> {
     // Story 42: refuse before any filesystem work — an empty Selection must not create a
     // Backup dir at all, so there is nothing to clean up on this path (unlike every other
@@ -102,6 +113,7 @@ pub fn backup(
         encryption,
         package_runner,
         progress,
+        cancel,
         &backup_dir,
     )
     .inspect_err(|_| {
@@ -117,6 +129,7 @@ fn run_backup(
     encryption: &Encryption,
     package_runner: &dyn CommandRunner,
     progress: &mut dyn Progress,
+    cancel: &CancelToken,
     backup_dir: &Path,
 ) -> Result<BackupOutcome, CoreError> {
     fs::create_dir_all(backup_dir).map_err(|source| CoreError::Io {
@@ -131,7 +144,7 @@ fn run_backup(
 
     // `build` reports `Phase::Scanning` then `Phase::Compressing` itself; the encryption and
     // disk-write phases below are reported here at their real boundaries.
-    let built = archive::build(&entries, progress)?;
+    let built = archive::build(&entries, progress, cancel)?;
 
     // `Encrypting` is omitted entirely for a plaintext backup (issue #65): a run that isn't
     // encrypting has no such phase to show, so the RUN screen never renders one. The Manifest
