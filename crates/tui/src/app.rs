@@ -13,9 +13,12 @@
 //! encryption, WHERE, REVIEW) and the restore/RUN screens land in later builds (#68–#72), so
 //! the bodies here are placeholders.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use linux_backup_core::model::SelectionModel;
-use linux_backup_core::{scan, RunContext};
+use linux_backup_core::{crypto, scan, RunContext};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -23,6 +26,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::reflow::ReflowTier;
+use crate::run_screen::{BackupRequest, RunMessage, RunPlan, RunScreen};
 use crate::wizard::{StepStatus, Wizard, WizardState, WizardStep};
 
 /// The entry route `main` seeds from the parsed CLI command. `backup` opens the wizard; the
@@ -52,11 +56,13 @@ impl Screen {
     }
 }
 
-/// The live content behind the frame: either the backup wizard or a not-yet-built screen's
-/// placeholder. Later builds replace the placeholders with the restore/RUN/dev screens.
-#[derive(Debug, Clone)]
+/// The live content behind the frame: the backup wizard, the RUN screen the wizard launches
+/// into, or a not-yet-built screen's placeholder. Later builds replace the remaining
+/// placeholders with the restore/dev screens.
+#[derive(Debug)]
 enum View {
     Wizard(Wizard),
+    Run(RunScreen),
     Placeholder(Screen),
 }
 
@@ -70,15 +76,18 @@ pub enum Event {
 }
 
 /// The whole application state: the active [`View`], the injected [`RunContext`] (ADR-0004:
-/// run facts are injected, never read ambiently by anything under `core`), and the quit flag
-/// the runtime watches.
-#[derive(Debug, Clone)]
+/// run facts are injected, never read ambiently by anything under `core`), the quit flag the
+/// runtime watches, and a one-shot backup-launch request the runtime drains to start the RUN
+/// worker.
+#[derive(Debug)]
 pub struct App {
     view: View,
-    // Held for the screens that read it in later builds; injected now (ADR-0004).
-    #[allow(dead_code)]
     run_context: RunContext,
     should_quit: bool,
+    /// Set once when REVIEW launches a backup; the runtime takes it to spawn the worker thread
+    /// (the reducer stays pure — it records the request, it doesn't touch a thread). `None`
+    /// whenever no launch is pending.
+    pending_backup: Option<BackupRequest>,
 }
 
 impl App {
@@ -96,6 +105,7 @@ impl App {
             view,
             run_context,
             should_quit: false,
+            pending_backup: None,
         }
     }
 
@@ -103,6 +113,44 @@ impl App {
     #[must_use]
     pub fn should_quit(&self) -> bool {
         self.should_quit
+    }
+
+    /// Takes the pending backup-launch request, if REVIEW just launched one. The runtime calls
+    /// this each loop turn and, on `Some`, spawns the worker thread that drives `core::backup`
+    /// over the RUN progress channel. One-shot: it yields the request once, then clears.
+    pub fn take_backup_request(&mut self) -> Option<BackupRequest> {
+        self.pending_backup.take()
+    }
+
+    /// Whether a backup is in flight — the runtime polls the progress channel + crossterm each
+    /// tick while this holds (RUN is the only polling screen) and blocks on input otherwise.
+    #[must_use]
+    pub fn is_backup_running(&self) -> bool {
+        matches!(&self.view, View::Run(run) if run.is_running())
+    }
+
+    /// Folds one worker [`RunMessage`] into the RUN screen (phase/entry progress, or the
+    /// terminal outcome). A no-op off the RUN screen.
+    pub fn apply_run_message(&mut self, message: RunMessage) {
+        if let View::Run(run) = &mut self.view {
+            run.apply(message);
+        }
+    }
+
+    /// The worker channel disconnected without a terminal message (a worker panic) — mark the
+    /// RUN as a failed run. A no-op off the RUN screen.
+    pub fn on_worker_disconnected(&mut self) {
+        if let View::Run(run) = &mut self.view {
+            run.on_worker_disconnected();
+        }
+    }
+
+    /// Advances the RUN spinner one frame — the runtime calls this each poll tick so an
+    /// indeterminate phase animates even on a tick with no worker message. A no-op elsewhere.
+    pub fn tick(&mut self) {
+        if let View::Run(run) = &mut self.view {
+            run.tick();
+        }
     }
 
     /// The pure reducer: fold one [`Event`] into the next state. Taking and returning `Self`
@@ -118,16 +166,61 @@ impl App {
         let Event::Key(key) = event else {
             return self;
         };
+        // `Ctrl-C` is the sole quit everywhere, and during a running backup it *is* the cancel
+        // (the run is abandoned as the app tears down — `core::backup` is synchronous with no
+        // cooperative cancellation, so aborting the process is the honest cancel here).
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return self;
         }
-        self.view = match self.view {
-            View::Wizard(wizard) => View::Wizard(wizard.handle_key(key)),
-            // Placeholder screens have no interactions yet; `Esc` is inert (never quits).
-            View::Placeholder(screen) => View::Placeholder(screen),
-        };
+        match self.view {
+            // Plain `Enter` on REVIEW launches the backup (#39: not `Ctrl-Enter`, which some
+            // terminals swallow); any other key drives the wizard.
+            View::Wizard(ref wizard)
+                if wizard.current() == WizardStep::Review
+                    && key.code == KeyCode::Enter
+                    && key.modifiers.is_empty() =>
+            {
+                self.launch_backup();
+            }
+            View::Wizard(wizard) => self.view = View::Wizard(wizard.handle_key(key)),
+            // On a finished run, plain `Enter` closes the app (#61's `Enter close`); while it
+            // runs, only `Ctrl-C` (handled above) does anything.
+            View::Run(ref run)
+                if run.is_terminal() && key.code == KeyCode::Enter && key.modifiers.is_empty() =>
+            {
+                self.should_quit = true;
+            }
+            // A running RUN ignores everything but Ctrl-C (above); placeholder screens have no
+            // interactions yet (`Esc` is inert, never quits).
+            View::Run(_) | View::Placeholder(_) => {}
+        }
         self
+    }
+
+    /// Transitions from REVIEW into the RUN screen and records the launch request the runtime
+    /// drains to start the worker. The Selection, encryption choice, and Output location are
+    /// cloned out of the wizard here so the worker owns self-contained inputs; the context's
+    /// `output_location` is pointed at the chosen Backup location (mirroring the alpha's
+    /// `ctx.output_location = location` before `core::backup`).
+    fn launch_backup(&mut self) {
+        let View::Wizard(wizard) = &self.view else {
+            return;
+        };
+        let state = wizard.state();
+        let mut ctx = self.run_context.clone();
+        if let Some(location) = state.location() {
+            ctx.output_location = location.to_path_buf();
+        }
+        let selection = state.selection().clone();
+        let encryption = state.encryption().clone();
+        let plan = RunPlan::new(&selection, &encryption, &ctx);
+        self.pending_backup = Some(BackupRequest {
+            selection,
+            ctx,
+            encryption,
+        });
+        self.view = View::Run(RunScreen::launching(plan));
     }
 
     /// The pure render: draw the current state into `frame`. Below the reflow ladder's Refuse
@@ -141,7 +234,8 @@ impl App {
             return;
         }
         match &self.view {
-            View::Wizard(wizard) => render_wizard(frame, area, wizard, tier),
+            View::Wizard(wizard) => render_wizard(frame, area, wizard, tier, &self.run_context),
+            View::Run(run) => crate::run_screen::render(frame, area, run, tier),
             View::Placeholder(screen) => render_placeholder(frame, area, *screen),
         }
     }
@@ -190,7 +284,13 @@ fn render_placeholder(frame: &mut Frame, area: Rect, screen: Screen) {
 /// optional gate banner, the body region, and the footer hints. Only the body swaps between
 /// steps — the header and footer keep their rows, so the frame never jumps on step change
 /// (ADR-0007 D6).
-fn render_wizard(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTier) {
+fn render_wizard(
+    frame: &mut Frame,
+    area: Rect,
+    wizard: &Wizard,
+    tier: ReflowTier,
+    ctx: &RunContext,
+) {
     let banner_rows = u16::from(wizard.gate_banner().is_some());
     let chunks = Layout::vertical([
         Constraint::Length(tier.header_rows()),
@@ -204,7 +304,7 @@ fn render_wizard(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTie
     if banner_rows > 0 {
         render_gate_banner(frame, chunks[1], wizard);
     }
-    render_body(frame, chunks[2], wizard);
+    render_body(frame, chunks[2], wizard, ctx);
     render_footer(frame, chunks[3], wizard, tier);
 }
 
@@ -300,9 +400,14 @@ fn render_gate_banner(frame: &mut Frame, area: Rect, wizard: &Wizard) {
     frame.render_widget(banner, area);
 }
 
-/// The body region — the only part that swaps between steps. Real bodies land in builds
-/// #68–#72; the shell shows which step is current.
-fn render_body(frame: &mut Frame, area: Rect, wizard: &Wizard) {
+/// The body region — the only part that swaps between steps. REVIEW renders its summary here
+/// (this build); the WHAT/encryption/WHERE bodies land in sibling builds #68–#70/#72 and stay
+/// placeholders until then.
+fn render_body(frame: &mut Frame, area: Rect, wizard: &Wizard, ctx: &RunContext) {
+    if wizard.current() == WizardStep::Review {
+        frame.render_widget(Paragraph::new(review_lines(wizard.state(), ctx)), area);
+        return;
+    }
     let body = format!(
         "{} — screen body lands in a later build",
         wizard.current().title()
@@ -310,8 +415,110 @@ fn render_body(frame: &mut Frame, area: Rect, wizard: &Wizard) {
     frame.render_widget(Paragraph::new(body).alignment(Alignment::Center), area);
 }
 
+/// The REVIEW summary (#61 copy): what will be backed up, where, and the encryption state —
+/// everything chosen, summarized before anything is written. The Backup dir is computed from
+/// the same `ctx` `core::backup` will use, so what REVIEW shows is exactly where the run lands.
+fn review_lines(state: &WizardState, ctx: &RunContext) -> Vec<Line<'static>> {
+    let selection = state.selection();
+    let mut categories: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for entry in selection.entries() {
+        *categories.entry(entry.category).or_insert(0) += 1;
+    }
+    let breakdown = categories
+        .iter()
+        .map(|(category, count)| format!("{category} {count}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let location = state
+        .location()
+        .map_or_else(|| ctx.output_location.clone(), Path::to_path_buf);
+    let backup_dir = location.join(linux_backup_core::backup_dir_name(ctx));
+
+    vec![
+        Line::from("REVIEW — nothing is written until you confirm"),
+        Line::default(),
+        Line::from(format!(
+            "Selection   {} Entries · {} Categories · {}",
+            selection.entries().len(),
+            categories.len(),
+            format_size(selection.total_size()),
+        )),
+        Line::from(format!("   {breakdown}")),
+        Line::from(format!("Output      {}", location.display())),
+        Line::from(format!("Backup dir  {}", backup_dir.display())),
+        encryption_review_line(state),
+        Line::default(),
+        Line::from("(To change anything, press 1–4 to jump back to a step.)"),
+        Line::default(),
+        Line::from(Span::styled(
+            "Enter start backup",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ]
+}
+
+/// The REVIEW encryption line's three #61 states: encrypted, plaintext with nothing Sensitive,
+/// or plaintext shipping Sensitive content anyway (named, warned).
+fn encryption_review_line(state: &WizardState) -> Line<'static> {
+    if state.encryption().is_encrypted() {
+        return Line::from("Encryption  encrypted with a passphrase");
+    }
+    let sensitive_categories = crypto::evaluate(state.selection()).sensitive_categories;
+    if sensitive_categories.is_empty() {
+        Line::from("Encryption  not encrypted")
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "Encryption  ⚠ not encrypted — {} in plaintext",
+                sensitive_categories.join(", ")
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    }
+}
+
+/// Human-readable byte count (`B`/`KB`/`MB`/`GB`, 1024-based), matching the other screens'
+/// size rendering.
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    #[allow(clippy::cast_precision_loss)]
+    let bytes_f = bytes as f64;
+    if bytes_f >= GB {
+        format!("{:.2} GB", bytes_f / GB)
+    } else if bytes_f >= MB {
+        format!("{:.2} MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.2} KB", bytes_f / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// The fixed footer hints, degrading down the reflow ladder but always keeping `? keys` (#50).
 fn render_footer(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTier) {
+    // REVIEW is terminal — the forward action is launching the run, so its footer leads with
+    // `Enter start backup` rather than the `Ctrl-→ next` the earlier steps show (#61).
+    if wizard.current() == WizardStep::Review {
+        let hints = match tier {
+            ReflowTier::Comfortable | ReflowTier::Default => {
+                "Enter start backup · Ctrl-← back · 1-4 jump · ? keys"
+            }
+            ReflowTier::Tight => "Enter start backup · Ctrl-← back · ? keys",
+            ReflowTier::Minimum | ReflowTier::Refuse => "Enter start backup · ? keys",
+        };
+        frame.render_widget(
+            Paragraph::new(hints).style(Style::default().add_modifier(Modifier::DIM)),
+            area,
+        );
+        return;
+    }
     let forward_hint = if wizard.state().step_complete(wizard.current()) {
         "Ctrl-→ next"
     } else {
@@ -382,6 +589,7 @@ mod tests {
             view: View::Wizard(wizard),
             run_context: test_context(),
             should_quit: false,
+            pending_backup: None,
         }
     }
 
@@ -566,6 +774,95 @@ mod tests {
                 "footer lost `? keys` at height {height}, got: {lines:?}"
             );
         }
+    }
+
+    /// A non-Sensitive wizard with a location, advanced all the way to the terminal REVIEW
+    /// step — the launch preconditions.
+    fn wizard_on_review() -> Wizard {
+        non_sensitive_wizard().handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('4'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ))
+    }
+
+    #[test]
+    fn enter_on_review_launches_the_backup() {
+        let mut app = app_with_wizard(wizard_on_review());
+        assert!(app.take_backup_request().is_none());
+        let mut app = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        // The view is now the RUN screen with a backup in flight, and a launch request is
+        // waiting for the runtime to spawn the worker.
+        assert!(app.is_backup_running());
+        assert!(!app.should_quit());
+        assert!(app.take_backup_request().is_some());
+        // One-shot: the request is drained, not handed out twice.
+        assert!(app.take_backup_request().is_none());
+    }
+
+    #[test]
+    fn enter_off_review_does_not_launch() {
+        // On WHAT (not the terminal step), plain Enter is not a launch.
+        let app =
+            app_with_wizard(non_sensitive_wizard()).update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.is_backup_running());
+    }
+
+    #[test]
+    fn enter_closes_a_finished_run() {
+        let mut app =
+            app_with_wizard(wizard_on_review()).update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let _ = app.take_backup_request();
+        // Feed a terminal outcome as the worker would.
+        app.apply_run_message(RunMessage::Failed {
+            message: "boom".to_string(),
+            cleaned_up: true,
+        });
+        assert!(!app.is_backup_running());
+        // Enter on the finished run closes the app.
+        let app = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn review_body_summarizes_the_run() {
+        let app = app_with_wizard(wizard_on_review());
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("REVIEW")),
+            "expected the REVIEW heading, got: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("Selection")));
+        assert!(lines.iter().any(|l| l.contains("Output")));
+        assert!(lines.iter().any(|l| l.contains("Backup dir")));
+        // Non-Sensitive plaintext reads as "not encrypted", not the warning form.
+        assert!(lines.iter().any(|l| l.contains("not encrypted")));
+        // The REVIEW footer leads with the launch action.
+        assert!(lines.iter().any(|l| l.contains("Enter start backup")));
+    }
+
+    #[test]
+    fn review_warns_when_sensitive_content_ships_in_plaintext() {
+        // A Sensitive Selection with a plaintext decision (Auto-insist disabled) sitting on
+        // REVIEW: the encryption line names the exposed Category with the warning glyph.
+        let mut state = WizardState::new(
+            SelectionModel::new(vec![entry("SSH", true, "id_ed25519")]),
+            Some(PathBuf::from("/home/tester")),
+        );
+        state.choose_plaintext();
+        let wizard = Wizard::new(state).handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('4'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        let app = app_with_wizard(wizard);
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("not encrypted")
+                && l.contains("SSH")
+                && l.contains("plaintext")),
+            "expected the plaintext-Sensitive warning, got: {lines:?}"
+        );
     }
 
     #[test]

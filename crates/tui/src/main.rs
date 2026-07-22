@@ -23,6 +23,7 @@
 mod app;
 mod cli;
 mod reflow;
+mod run_screen;
 mod runtime;
 mod system;
 mod wizard;

@@ -12,6 +12,8 @@
 //! rendering covered by the pure reducer and `TestBackend` tests in [`crate::app`].
 
 use std::io::{self, Stdout};
+use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event as CrosstermEvent, KeyEventKind};
@@ -23,8 +25,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{App, Event};
+use crate::run_screen::{self, BackupWorker};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+/// How long a RUN poll tick waits on crossterm before falling through to drain the progress
+/// channel and repaint. Short enough that a keypress (Ctrl-C cancel) still feels immediate and
+/// the spinner animates smoothly; long enough not to busy-spin the CPU during a long phase.
+const RUN_POLL_INTERVAL: Duration = Duration::from_millis(80);
 
 /// Drives an [`App`] to completion: sets up the terminal, runs the redraw-on-event loop until
 /// the app requests quit (or the read loop errors), then restores the terminal regardless of
@@ -48,31 +56,85 @@ pub fn run(app: App) -> Result<()> {
     loop_result.and(restore_result)
 }
 
-/// The redraw-on-event loop: draw once, block on the next input, fold it into state, repeat.
+/// The main loop. Every interactive screen is redraw-on-event: draw once, block on the next
+/// input, fold it into state, repeat. The one exception is RUN, which polls: while a backup is
+/// in flight the loop drains the worker's progress channel and crossterm together each tick
+/// (spec #62 / ADR-0005 — RUN is the *only* polling screen), so the frame stays live during
+/// the backup without any other screen spinning the CPU.
+///
 /// Only `KeyEventKind::Press` is forwarded — terminals that also report `Repeat`/`Release`
-/// would otherwise double-handle a single keystroke (spec #62 / ADR-0005). Non-key, non-resize
-/// events are ignored (mouse input is out of scope, spec #62).
+/// would otherwise double-handle a single keystroke. Non-key, non-resize events are ignored
+/// (mouse input is out of scope, spec #62).
 fn run_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
+    // Alive only while a backup runs; spawned when REVIEW hands over a launch request and
+    // dropped once the run is terminal (the thread has already exited by then).
+    let mut worker: Option<BackupWorker> = None;
     loop {
         terminal
             .draw(|frame| app.render(frame))
             .context("draw frame")?;
 
-        match event::read().context("read terminal event")? {
-            CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                app = app.update(Event::Key(key));
-            }
-            CrosstermEvent::Resize(width, height) => {
-                app = app.update(Event::Resize(width, height));
-            }
-            _ => {}
-        }
-
         if app.should_quit() {
             break;
         }
+
+        // A REVIEW launch produces a one-shot request the first turn after the transition;
+        // spawn the worker thread that drives `core::backup` over the progress channel.
+        if let Some(request) = app.take_backup_request() {
+            worker = Some(run_screen::spawn(request));
+        }
+
+        let next_event = if app.is_backup_running() {
+            run_poll_tick(&mut app, worker.as_ref())?
+        } else {
+            // Back to (or still) redraw-on-event; a finished worker can be released here — its
+            // thread already sent the terminal message and exited.
+            worker = None;
+            read_event()?
+        };
+
+        if let Some(event) = next_event {
+            app = app.update(event);
+        }
     }
     Ok(())
+}
+
+/// One RUN poll tick: drain every pending progress message into the app, animate the spinner,
+/// then wait (briefly) for one input event, returning it for the caller to fold in by value. A
+/// disconnected channel with no terminal message means the worker panicked, which reads as a
+/// failed run.
+fn run_poll_tick(app: &mut App, worker: Option<&BackupWorker>) -> Result<Option<Event>> {
+    if let Some(worker) = worker {
+        loop {
+            match worker.try_recv() {
+                Ok(message) => app.apply_run_message(message),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.on_worker_disconnected();
+                    break;
+                }
+            }
+        }
+    }
+    app.tick();
+
+    if event::poll(RUN_POLL_INTERVAL).context("poll terminal event")? {
+        read_event()
+    } else {
+        Ok(None)
+    }
+}
+
+/// Reads one crossterm event and maps it to the app [`Event`] the reducer consumes, or `None`
+/// for an event the app ignores (non-`Press` keys, mouse). Blocks until an event arrives, so
+/// it is only called when the caller intends to wait (redraw-on-event, or after `poll`).
+fn read_event() -> Result<Option<Event>> {
+    Ok(match event::read().context("read terminal event")? {
+        CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => Some(Event::Key(key)),
+        CrosstermEvent::Resize(width, height) => Some(Event::Resize(width, height)),
+        _ => None,
+    })
 }
 
 fn init_terminal() -> Result<Tui> {
