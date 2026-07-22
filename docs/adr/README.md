@@ -17,6 +17,9 @@ reversed, add a new ADR and mark the old one `Superseded by 000N` — don't edit
 - [`0007`](0007-wizard-navigation-cross-step-invalidation.md) — the wizard is a completion-frontier
   stepper with targeted WHAT→encryption invalidation; a set passphrase is a safe harbor. Fills the
   transition/invalidation hole 0005 left open.
+- [`0008`](0008-gui-tauri-entry-point-core-boundary.md) — the second entry point is a Tauri GUI in
+  `crates/gui` consuming a synchronous `core` over a JSON IPC boundary. Reaffirms 0001; the GUI
+  analogue of 0005.
 
 ## Behavior — backup/restore policy and feature capture
 
