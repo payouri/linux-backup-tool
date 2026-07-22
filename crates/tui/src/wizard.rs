@@ -147,6 +147,9 @@ pub enum GateReason {
     PassphrasesDoNotMatch,
     /// WHERE is incomplete: no Output location has been chosen.
     MissingBackupLocation,
+    /// WHERE is incomplete: an Output location is chosen but its parent-writable probe failed
+    /// (build #70's gate — the location doesn't resolve to a writable directory).
+    LocationNotWritable,
 }
 
 impl GateReason {
@@ -158,6 +161,7 @@ impl GateReason {
             Self::EnterPassphrase => "Enter a passphrase",
             Self::PassphrasesDoNotMatch => "Passphrases do not match",
             Self::MissingBackupLocation => "Missing backup location",
+            Self::LocationNotWritable => "Location is not writable",
         }
     }
 }
@@ -170,6 +174,11 @@ pub struct WizardState {
     encryption: Encryption,
     /// The chosen Output location (the WHERE step's product); `None` until WHERE is decided.
     location: Option<PathBuf>,
+    /// Whether the chosen `location`'s parent-writable probe passed (build #70). The probe runs
+    /// at the `tui` boundary (`core::location::ensure_writable`) and its result is pushed in via
+    /// [`Self::set_location`]; the seed is optimistic (a pre-filled location is assumed usable
+    /// until the WHERE screen's probe says otherwise), so the shell opens on a populated wizard.
+    location_writable: bool,
     /// The Sensitive Entry set the current *plaintext* decision was made against (ADR-0007
     /// D5's recorded context). `Some(set)` means a plaintext decision exists and covers
     /// `set` — the non-Sensitive default covers the empty set, a disabled Auto-insist covers
@@ -192,10 +201,12 @@ impl WizardState {
         } else {
             None
         };
+        let location_writable = location.is_some();
         Self {
             selection,
             encryption: Encryption::None,
             location,
+            location_writable,
             plaintext_baseline: baseline,
         }
     }
@@ -250,13 +261,14 @@ impl WizardState {
         }
     }
 
-    /// WHERE gate (ADR-0007 D2): an Output location is chosen. The full check also requires
-    /// the location to resolve and its parent to be writable; that probe arrives with the
-    /// WHERE screen (build #70), which owns the core FS calls — here the shell gates on a
-    /// location merely being present.
+    /// WHERE gate (ADR-0007 D2): an Output location is chosen, resolves, and its parent is
+    /// writable. The parent-writable probe is `core::location::ensure_writable`, run at the
+    /// `tui` boundary by the WHERE screen (build #70) and pushed in via [`Self::set_location`];
+    /// the advisory free-space warning is deliberately *not* part of this gate — WHERE space
+    /// never blocks (#61).
     #[must_use]
     pub fn where_complete(&self) -> bool {
-        self.location.is_some()
+        self.location.is_some() && self.location_writable
     }
 
     /// Whether `step`'s forward gate is satisfied. REVIEW is terminal — it never "completes"
@@ -292,13 +304,20 @@ impl WizardState {
     }
 
     /// The gate reason a failed forward move from `step` reports (#61 copy). REVIEW has no
-    /// forward gate (it's terminal), so it maps to `None`.
+    /// forward gate (it's terminal), so it maps to `None`. WHERE distinguishes "no location
+    /// chosen" from "chosen but not writable" (build #70) so the banner names the real fault.
     #[must_use]
-    fn gate_reason(step: WizardStep) -> Option<GateReason> {
+    fn gate_reason(&self, step: WizardStep) -> Option<GateReason> {
         match step {
             WizardStep::What => Some(GateReason::NothingSelected),
             WizardStep::Encryption => Some(GateReason::EnterPassphrase),
-            WizardStep::Where => Some(GateReason::MissingBackupLocation),
+            WizardStep::Where => {
+                if self.location.is_some() && !self.location_writable {
+                    Some(GateReason::LocationNotWritable)
+                } else {
+                    Some(GateReason::MissingBackupLocation)
+                }
+            }
             WizardStep::Review => None,
         }
     }
@@ -331,8 +350,10 @@ impl WizardState {
         self.location.as_deref()
     }
 
-    /// Records a chosen Output location (the WHERE step's product).
-    pub fn set_location(&mut self, location: Option<PathBuf>) {
+    /// Records a chosen Output location and its parent-writable probe result (the WHERE step's
+    /// product, build #70). `writable` only counts when a location is actually present.
+    pub fn set_location(&mut self, location: Option<PathBuf>, writable: bool) {
+        self.location_writable = location.is_some() && writable;
         self.location = location;
     }
 
@@ -410,6 +431,14 @@ impl Wizard {
     #[must_use]
     pub fn encryption_screen(&self) -> &EncryptionScreen {
         &self.encryption_screen
+    }
+
+    /// Records the WHERE step's chosen Output location and parent-writable probe result (build
+    /// #70). `App` calls this after routing a key to the WHERE screen so the completion frontier
+    /// tracks the live location; the advisory free-space warning is deliberately not threaded
+    /// here (it never gates, #61).
+    pub fn set_where(&mut self, location: Option<PathBuf>, writable: bool) {
+        self.state.set_location(location, writable);
     }
 
     /// The step the wizard is currently on.
@@ -516,7 +545,7 @@ impl Wizard {
                 self.current = next;
             }
         } else {
-            self.gate_banner = WizardState::gate_reason(self.current);
+            self.gate_banner = self.state.gate_reason(self.current);
         }
     }
 

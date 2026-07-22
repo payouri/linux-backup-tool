@@ -9,9 +9,10 @@
 //! This build (#67) is the wizard *shell*: the four-step completion-frontier stepper over a
 //! persistent [`WizardState`] (module [`crate::wizard`]), the fixed header/footer frame that
 //! doesn't jump on step change, the reflow ladder (module [`crate::reflow`]), and the
-//! redraw-on-event loop's step-motion/esc/quit wiring. The per-step screen *bodies* (WHAT,
-//! encryption, WHERE, REVIEW) and the restore/RUN screens land in later builds (#68–#72), so
-//! the bodies here are placeholders.
+//! redraw-on-event loop's step-motion/esc/quit wiring. The WHERE step *body* (the location
+//! pick-list + custom-path autocomplete, module [`crate::where_step`]) lands here in build #70;
+//! the other step bodies (WHAT, encryption, REVIEW) and the restore/RUN screens land in the
+//! sibling builds (#68/#69/#71/#72), so those remain placeholders.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,6 +28,7 @@ use ratatui::Frame;
 
 use crate::reflow::ReflowTier;
 use crate::run_screen::{BackupRequest, RunMessage, RunPlan, RunScreen};
+use crate::where_step::WhereStep;
 use crate::wizard::{StepStatus, Wizard, WizardState, WizardStep};
 
 /// The entry route `main` seeds from the parsed CLI command. `backup` opens the wizard; the
@@ -82,6 +84,10 @@ pub enum Event {
 #[derive(Debug)]
 pub struct App {
     view: View,
+    /// The WHERE step's view state (build #70). It lives in `App` around the wizard's model
+    /// (ADR-0005) because it needs the injected [`RunContext`] (`home`, `privilege`) and the
+    /// env-var resolver the wizard reducer doesn't carry; only the Backup route populates it.
+    where_step: WhereStep,
     run_context: RunContext,
     should_quit: bool,
     /// Set once when REVIEW launches a backup; the runtime takes it to spawn the worker thread
@@ -102,12 +108,26 @@ impl App {
     /// opens on a populated wizard rather than an empty one.
     #[must_use]
     pub fn new(screen: Screen, run_context: RunContext) -> Self {
+        // Only the wizard shows a WHERE body; the other routes get an inert step that probes no
+        // hardware (they are separate invocations of the tool).
+        let where_step = match screen {
+            Screen::Backup => WhereStep::from_context(&run_context),
+            _ => WhereStep::empty(),
+        };
         let view = match screen {
-            Screen::Backup => View::Wizard(seed_wizard(&run_context)),
+            Screen::Backup => {
+                let mut wizard = seed_wizard(&run_context);
+                // Reconcile the wizard's optimistic seed with the WHERE screen's real
+                // parent-writable probe of the pre-filled Output location (build #70).
+                let (location, writable) = where_step.chosen();
+                wizard.set_where(location, writable);
+                View::Wizard(wizard)
+            }
             other => View::Placeholder(other),
         };
         Self {
             view,
+            where_step,
             run_context,
             should_quit: false,
             pending_backup: None,
@@ -195,7 +215,23 @@ impl App {
             {
                 self.launch_backup();
             }
-            View::Wizard(wizard) => self.view = View::Wizard(wizard.handle_key(key)),
+            View::Wizard(mut wizard) => {
+                // On the WHERE step the screen body owns the plain keys (typing, the candidate
+                // list, Tab/→/Enter); the global step-motion chords stay with the wizard (#51).
+                // The screen needs the injected run facts + env resolver, so it is driven here
+                // in `App` rather than inside the wizard reducer (ADR-0004/0005 D6).
+                if wizard.current() == WizardStep::Where
+                    && where_key_targets_screen(key, self.where_step.is_typing())
+                {
+                    self.where_step
+                        .handle_key(key, &|name| std::env::var(name).ok());
+                    let (location, writable) = self.where_step.chosen();
+                    wizard.set_where(location, writable);
+                    self.view = View::Wizard(wizard);
+                } else {
+                    self.view = View::Wizard(wizard.handle_key(key));
+                }
+            }
             // On a finished run, plain `Enter` closes the app (#61's `Enter close`); while it
             // runs, only `Ctrl-C` (handled above) does anything.
             View::Run(ref run)
@@ -247,11 +283,34 @@ impl App {
         }
         match &self.view {
             View::Wizard(wizard) => {
-                render_wizard(frame, area, wizard, tier, &self.run_context, self.reveal);
+                render_wizard(
+                    frame,
+                    area,
+                    wizard,
+                    &self.where_step,
+                    tier,
+                    &self.run_context,
+                    self.reveal,
+                );
             }
             View::Run(run) => crate::run_screen::render(frame, area, run, tier),
             View::Placeholder(screen) => render_placeholder(frame, area, *screen),
         }
+    }
+}
+
+/// Whether a key pressed on the WHERE step belongs to the screen body rather than the wizard's
+/// global navigation (#51). The step-motion chords (`Ctrl-←`/`Ctrl-→`) always stay with the
+/// wizard; `1`–`4` jump stays with the wizard *unless* the custom-path field is focused, where a
+/// typed digit must reach the field; `Esc` closes the field first while typing, else steps back.
+/// Everything else — typing, the candidate list, `Tab`/`→`/`Enter` — is the screen's.
+fn where_key_targets_screen(key: KeyEvent, typing: bool) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Left | KeyCode::Right if ctrl => false,
+        KeyCode::Char(c) if !ctrl && WizardStep::from_digit(c).is_some() => typing,
+        KeyCode::Esc => typing,
+        _ => true,
     }
 }
 
@@ -302,6 +361,7 @@ fn render_wizard(
     frame: &mut Frame,
     area: Rect,
     wizard: &Wizard,
+    where_step: &WhereStep,
     tier: ReflowTier,
     ctx: &RunContext,
     reveal: bool,
@@ -319,7 +379,7 @@ fn render_wizard(
     if banner_rows > 0 {
         render_gate_banner(frame, chunks[1], wizard);
     }
-    render_body(frame, chunks[2], wizard, ctx, reveal);
+    render_body(frame, chunks[2], wizard, where_step, ctx, reveal);
     render_footer(frame, chunks[3], wizard, tier);
 }
 
@@ -416,15 +476,32 @@ fn render_gate_banner(frame: &mut Frame, area: Rect, wizard: &Wizard) {
 }
 
 /// The body region — the only part that swaps between steps. WHAT is the two-pane explorer
-/// (build #68); the encryption body (build #69) and the REVIEW summary (build #71) render here
-/// too; the remaining body (WHERE) stays a placeholder until its build (#70/#72).
-fn render_body(frame: &mut Frame, area: Rect, wizard: &Wizard, ctx: &RunContext, reveal: bool) {
+/// (build #68), the encryption body (build #69), the WHERE pick-list + custom-path autocomplete
+/// (build #70), and the REVIEW summary (build #71) all render here; any remaining step stays a
+/// placeholder until its build (#72).
+fn render_body(
+    frame: &mut Frame,
+    area: Rect,
+    wizard: &Wizard,
+    where_step: &WhereStep,
+    ctx: &RunContext,
+    reveal: bool,
+) {
     if wizard.current() == WizardStep::What {
         crate::what_screen::render(frame, area, wizard.what(), wizard.state());
         return;
     }
     if wizard.current() == WizardStep::Encryption {
         crate::encryption_screen::render(frame, area, wizard, reveal);
+        return;
+    }
+    if wizard.current() == WizardStep::Where {
+        // The selection's uncompressed size feeds the advisory space warning only; it never
+        // gates (#61). Read it here (a `core` probe) rather than in the reducer.
+        let selection_size = wizard.state().selection().total_size();
+        where_step.render(frame, area, selection_size, &|name| {
+            std::env::var(name).ok()
+        });
         return;
     }
     if wizard.current() == WizardStep::Review {
@@ -610,6 +687,7 @@ mod tests {
     fn app_with_wizard(wizard: Wizard) -> App {
         App {
             view: View::Wizard(wizard),
+            where_step: WhereStep::empty(),
             run_context: test_context(),
             should_quit: false,
             pending_backup: None,
@@ -887,6 +965,82 @@ mod tests {
                 && l.contains("plaintext")),
             "expected the plaintext-Sensitive warning, got: {lines:?}"
         );
+    }
+
+    /// Steps a non-Sensitive, located wizard forward to the WHERE step (WHAT and encryption both
+    /// complete on arrival), so the WHERE body is what renders.
+    fn wizard_on_where() -> Wizard {
+        non_sensitive_wizard()
+            .handle_key(KeyEvent::new_with_kind(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ))
+            .handle_key(KeyEvent::new_with_kind(
+                KeyCode::Right,
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ))
+    }
+
+    #[test]
+    fn where_step_renders_its_body_not_the_placeholder() {
+        let app = app_with_wizard(wizard_on_where());
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("WHERE to write the backup")),
+            "expected the WHERE body, got: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("lands in a later build")),
+            "the WHERE step must render its real body, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn where_routing_keeps_step_chords_with_the_wizard_and_body_keys_with_the_screen() {
+        // Step-motion chords always route to the wizard, even on WHERE.
+        assert!(!where_key_targets_screen(
+            key_event(KeyCode::Right, KeyModifiers::CONTROL),
+            true
+        ));
+        assert!(!where_key_targets_screen(
+            key_event(KeyCode::Left, KeyModifiers::CONTROL),
+            false
+        ));
+        // A digit jumps steps while picking, but reaches the field while typing (#51).
+        assert!(!where_key_targets_screen(
+            key_event(KeyCode::Char('3'), KeyModifiers::NONE),
+            false
+        ));
+        assert!(where_key_targets_screen(
+            key_event(KeyCode::Char('3'), KeyModifiers::NONE),
+            true
+        ));
+        // Esc closes the field first while typing, else steps back through the wizard.
+        assert!(where_key_targets_screen(
+            key_event(KeyCode::Esc, KeyModifiers::NONE),
+            true
+        ));
+        assert!(!where_key_targets_screen(
+            key_event(KeyCode::Esc, KeyModifiers::NONE),
+            false
+        ));
+        // Ordinary body keys always belong to the screen.
+        assert!(where_key_targets_screen(
+            key_event(KeyCode::Tab, KeyModifiers::NONE),
+            false
+        ));
+        assert!(where_key_targets_screen(
+            key_event(KeyCode::Char('a'), KeyModifiers::NONE),
+            false
+        ));
+    }
+
+    fn key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press)
     }
 
     #[test]
