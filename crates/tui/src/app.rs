@@ -358,7 +358,15 @@ impl App {
                     );
                     self.view = View::Wizard(wizard);
                 } else {
-                    self.view = View::Wizard(wizard.handle_key(key));
+                    // This is the only path that can newly open the WHAT Custom-path field (a
+                    // `→`/`Enter` on the Custom-paths row), so the privilege-aware `~/`/`/`
+                    // prefill (#85) is primed right after. `prime_*` self-guards on an empty
+                    // buffer: it fills the field the frame it opens and is otherwise a no-op —
+                    // including when a step-motion chord (the one key that re-enters this branch
+                    // while the field is open) must not clobber what the user has typed.
+                    let mut wizard = wizard.handle_key(key);
+                    wizard.prime_what_custom_path(self.run_context.privilege);
+                    self.view = View::Wizard(wizard);
                 }
             }
             // On a finished run, plain `Enter` closes the app (#61's `Enter close`); while it

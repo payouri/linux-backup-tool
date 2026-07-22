@@ -1,15 +1,18 @@
 //! The WHAT step body: the two-pane recursive Drill-down explorer (#48 / #50 / ADR-0006).
 //!
 //! Left pane = Categories with a selected-Entry count; right pane = a *single-directory*
-//! explorer over the currently-focused Category's Entries, with a breadcrumb pinned above.
-//! `Tab`/`Shift-Tab` toggles focus; `→`/`Enter` descends into a directory (the breadcrumb
-//! grows, the column reloads with that directory's children) and `←`/`Backspace` climbs, to
-//! any depth. `Space` toggles the focused node — a directory toggles its whole subtree
-//! (prefix-wins, no carve-outs) — and `Ctrl-A`/`Ctrl-D` select/deselect the whole focused
-//! scope. Below [`TWO_PANE_MIN_WIDTH`] the split collapses to a single active column that
-//! `Tab` swaps. That focus-toggle meaning is only for the two-pane view: while the Custom-path
-//! add field is open, `Tab` instead accepts the highlighted autocomplete candidate (#84, see
-//! [`WhatScreen::handle_field_key`]).
+//! explorer over the currently-focused Category's Entries, with a breadcrumb (a literal `/`
+//! separator, #85) pinned above. `Tab`/`Shift-Tab` toggles focus; `→`/`Enter` descends into a
+//! directory (the breadcrumb grows, the column reloads with that directory's children) and
+//! `Backspace` climbs one level, to any depth (inert at the Category's top level). `←` climbs
+//! the same way while drilled in, but at the top level it instead switches focus to Categories
+//! (reusing `Tab`'s `toggle_focus`, #85) since there is nothing left to climb out of. `Space`
+//! toggles the focused node — a directory toggles its whole subtree (prefix-wins, no
+//! carve-outs) — and `Ctrl-A`/`Ctrl-D` select/deselect the whole focused scope. Below
+//! [`TWO_PANE_MIN_WIDTH`] the split collapses to a single active column that `Tab` swaps.
+//! That focus-toggle meaning is only for the two-pane view: while the Custom-path add field
+//! is open, `Tab`/`→`/`End` all accept the highlighted autocomplete candidate instead (#84,
+//! see [`WhatScreen::handle_field_key`]).
 //!
 //! The navigable tree is **presentation grouping of the already-scanned flat Entries** — this
 //! module derives it live from the [`SelectionModel`], never storing a tri-state tree (ADR-0006
@@ -38,6 +41,7 @@ use ratatui::Frame;
 
 use crate::glyphs::Glyphs;
 use crate::path_autocomplete::{self, Autocomplete, Getenv};
+use crate::reflow::{self, BreadcrumbWidth};
 use crate::wizard::WizardState;
 
 /// The always-shown Custom-paths Category (CONTEXT.md's "Custom path", story 6) — its left-pane
@@ -154,6 +158,13 @@ impl WhatScreen {
             KeyCode::End => self.move_down(state, usize::MAX),
             KeyCode::Char(' ') => self.toggle(state),
             KeyCode::Right | KeyCode::Enter if self.focus == Pane::Explorer => self.descend(state),
+            // At the Category's top level (nothing to climb) `←` instead switches focus to
+            // Categories — reusing `toggle_focus` so neither cursor resets (#85). `Backspace`
+            // stays climb-only and is simply inert there; drilled in, both climb as before, so
+            // this arm must be checked before the general climb arm below.
+            KeyCode::Left if self.focus == Pane::Explorer && self.breadcrumb.is_empty() => {
+                self.toggle_focus();
+            }
             KeyCode::Left | KeyCode::Backspace if self.focus == Pane::Explorer => self.climb(),
             // On the Categories pane, `→`/`Enter` opens the Custom-path add field when the
             // Custom-paths row is focused (#50), else moves focus into the explorer it drives.
@@ -357,6 +368,27 @@ impl WhatScreen {
     pub fn toggle_custom_show_hidden(&mut self) {
         if let Some(input) = self.custom_input.as_mut() {
             input.show_hidden = !input.show_hidden;
+        }
+    }
+
+    /// Seeds the just-opened Custom-path field with its privilege-aware literal prefill — `~/`
+    /// non-root, `/` root (#85) — left un-expanded in the buffer (ADR-0004: expansion happens
+    /// at the `tui` boundary on commit, never here). The buffer only ever grows/shrinks from
+    /// its end (there is no mid-buffer cursor), so this prefill *is* "cursor at end-of-buffer,
+    /// autocomplete fires immediately" — no separate cursor state to set. Guarded on an empty
+    /// buffer rather than a dedicated "just opened" flag: the field always opens from
+    /// [`CustomInput::default`]'s empty buffer, so the first call fills it, while the
+    /// step-motion chords (`Ctrl-←`/`Ctrl-→`) — the one plain-key path `App` still routes here
+    /// while the field is open — can only ever re-fill a buffer the user has already emptied,
+    /// never clobber one they are mid-editing.
+    pub fn prime_custom_path(&mut self, privilege: Privilege) {
+        if let Some(input) = self.custom_input.as_mut()
+            && input.buffer.is_empty()
+        {
+            input.buffer = match privilege {
+                Privilege::Root => "/".to_string(),
+                Privilege::NonRoot => "~/".to_string(),
+            };
         }
     }
 
@@ -758,13 +790,12 @@ pub fn render(
                 }
                 Pane::Explorer => {
                     let rows = screen.explorer_rows(state);
-                    let breadcrumb =
-                        breadcrumb_line(screen.current_category(), &screen.breadcrumb, glyphs);
                     render_explorer(
                         frame,
                         area,
                         &rows,
-                        &breadcrumb,
+                        screen.current_category(),
+                        &screen.breadcrumb,
                         screen.explorer_cursor,
                         true,
                         glyphs,
@@ -789,12 +820,12 @@ pub fn render(
         render_custom_field(frame, columns[1], screen, home, privilege, getenv, glyphs);
     } else {
         let rows = screen.explorer_rows(state);
-        let breadcrumb = breadcrumb_line(screen.current_category(), &screen.breadcrumb, glyphs);
         render_explorer(
             frame,
             columns[1],
             &rows,
-            &breadcrumb,
+            screen.current_category(),
+            &screen.breadcrumb,
             screen.explorer_cursor,
             screen.focus == Pane::Explorer,
             glyphs,
@@ -859,16 +890,19 @@ fn render_custom_field(
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
-/// The breadcrumb pinned above the explorer: the Category root plus every descended component.
-fn breadcrumb_line(category: Option<&str>, crumbs: &[OsString], glyphs: Glyphs) -> String {
-    let mut line = category.unwrap_or("").to_string();
-    for crumb in crumbs {
-        line.push(' ');
-        line.push_str(glyphs.pointer);
-        line.push(' ');
-        line.push_str(crumb.to_string_lossy().as_ref());
-    }
-    line
+/// The breadcrumb pinned above the explorer: the Category root plus every descended component,
+/// joined by a literal `/` separator — decoupled from `glyphs.pointer` (#85), which stays the
+/// pane-cursor/field-marker glyph. Responsive over the explorer pane's inner `cols` via
+/// [`BreadcrumbWidth`]; no leading `/`, since the head segment is always a Category display
+/// name, never a path root.
+fn breadcrumb_line(category: Option<&str>, crumbs: &[OsString], cols: u16) -> String {
+    let category = category.unwrap_or("");
+    let segments: Vec<String> = crumbs
+        .iter()
+        .map(|c| c.to_string_lossy().into_owned())
+        .collect();
+    let tier = BreadcrumbWidth::for_width(cols);
+    reflow::render_breadcrumb(tier, category, &segments, cols)
 }
 
 fn render_categories(
@@ -918,11 +952,16 @@ fn render_categories(
     );
 }
 
+// `category`/`crumbs` join `rows` rather than a pre-built breadcrumb string (#85) because the
+// text's responsive rung depends on this pane's own inner width, only known once `block.inner`
+// runs below.
+#[allow(clippy::too_many_arguments)]
 fn render_explorer(
     frame: &mut Frame,
     area: Rect,
     rows: &[ExplorerRow],
-    breadcrumb: &str,
+    category: Option<&str>,
+    crumbs: &[OsString],
     cursor: usize,
     focused: bool,
     glyphs: Glyphs,
@@ -937,9 +976,11 @@ fn render_explorer(
     }
 
     // The breadcrumb is pinned on the first inner row; the directory listing scrolls below it.
+    // Its responsive rung (#85) is keyed off this pane's own inner width, known only here.
     let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let breadcrumb = breadcrumb_line(category, crumbs, inner.width);
     frame.render_widget(
-        Paragraph::new(breadcrumb.to_string()).style(Style::default().add_modifier(Modifier::DIM)),
+        Paragraph::new(breadcrumb).style(Style::default().add_modifier(Modifier::DIM)),
         split[0],
     );
 
@@ -1086,6 +1127,73 @@ mod tests {
         assert_eq!(
             screen.breadcrumb,
             [OsString::from(".local"), OsString::from("share")]
+        );
+    }
+
+    #[test]
+    fn left_at_explorer_top_level_focuses_categories_without_resetting_cursors() {
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = 1; // Shell, per the alphabetical Category order
+        focus_explorer(&mut screen, &mut state);
+        assert!(
+            screen.breadcrumb.is_empty(),
+            "nothing drilled into yet, still top level"
+        );
+        let explorer_cursor_before = screen.explorer_cursor;
+
+        screen.handle_key(key(KeyCode::Left), &mut state);
+
+        assert_eq!(
+            screen.focus,
+            Pane::Categories,
+            "← at the top level switches focus"
+        );
+        assert_eq!(
+            screen.category_cursor, 1,
+            "toggle_focus never touches either cursor"
+        );
+        assert_eq!(
+            screen.explorer_cursor, explorer_cursor_before,
+            "explorer cursor is retained for a → back in"
+        );
+    }
+
+    #[test]
+    fn backspace_is_inert_at_the_explorer_top_level() {
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+        assert!(screen.breadcrumb.is_empty());
+
+        screen.handle_key(key(KeyCode::Backspace), &mut state);
+
+        assert_eq!(
+            screen.focus,
+            Pane::Explorer,
+            "Backspace stays climb-only, never switches focus"
+        );
+        assert!(screen.breadcrumb.is_empty(), "nothing to climb");
+    }
+
+    #[test]
+    fn left_climbs_one_level_when_drilled_in_like_backspace() {
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+        screen.handle_key(key(KeyCode::Right), &mut state); // into .local
+        assert_eq!(screen.breadcrumb, [OsString::from(".local")]);
+
+        screen.handle_key(key(KeyCode::Left), &mut state);
+
+        assert!(
+            screen.breadcrumb.is_empty(),
+            "← climbs back out while drilled in, same as Backspace"
+        );
+        assert_eq!(
+            screen.focus,
+            Pane::Explorer,
+            "climbing stays on the explorer pane"
         );
     }
 
@@ -1266,9 +1374,24 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("Categories"), "left pane title: {joined}");
         assert!(joined.contains("KDE Plasma"), "category name: {joined}");
-        // The explorer breadcrumb roots at the focused Category.
-        assert!(joined.contains("KDE Plasma ▸") || lines.iter().any(|l| l.contains("KDE Plasma")));
         assert!(joined.contains("[x]"), "a selected checkbox: {joined}");
+    }
+
+    #[test]
+    fn drilled_in_breadcrumb_uses_a_literal_slash_separator() {
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+        screen.handle_key(key(KeyCode::Right), &mut state); // into .local
+        screen.handle_key(key(KeyCode::Enter), &mut state); // into .local/share
+
+        // Wide enough (>= 60 explorer inner cols) to land on the Comfortable rung, which still
+        // shows the Category and spaces the `/` separators (#85) — decoupled from `glyphs.pointer`.
+        let joined = render_to_lines(&screen, &state, 90, 20).join("\n");
+        assert!(
+            joined.contains("KDE Plasma / .local / share"),
+            "breadcrumb: {joined}"
+        );
     }
 
     #[test]
@@ -1461,6 +1584,65 @@ mod tests {
         screen.handle_key(key(KeyCode::Right), &mut state);
         assert!(!screen.is_typing());
         assert_eq!(screen.focus, Pane::Explorer);
+    }
+
+    #[test]
+    fn opening_the_field_non_root_primes_the_tilde_slash_prefill() {
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+
+        screen.prime_custom_path(Privilege::NonRoot);
+
+        assert_eq!(
+            screen.custom_input.as_ref().expect("field open").buffer,
+            "~/"
+        );
+    }
+
+    #[test]
+    fn opening_the_field_as_root_primes_the_slash_prefill() {
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+
+        screen.prime_custom_path(Privilege::Root);
+
+        assert_eq!(
+            screen.custom_input.as_ref().expect("field open").buffer,
+            "/"
+        );
+    }
+
+    #[test]
+    fn priming_never_overwrites_a_buffer_the_user_already_edited() {
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+        screen.prime_custom_path(Privilege::NonRoot);
+        if let Some(input) = screen.custom_input.as_mut() {
+            input.buffer = "~/notes".to_string();
+        }
+
+        // A second prime (e.g. a stray call on an unrelated key) must not clobber the edit.
+        screen.prime_custom_path(Privilege::NonRoot);
+
+        assert_eq!(
+            screen.custom_input.as_ref().expect("field open").buffer,
+            "~/notes"
+        );
+    }
+
+    #[test]
+    fn priming_a_closed_field_is_a_no_op() {
+        let state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        assert!(!screen.is_typing());
+        screen.prime_custom_path(Privilege::NonRoot);
+        assert!(!screen.is_typing(), "priming never opens the field itself");
     }
 
     #[test]

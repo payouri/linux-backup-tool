@@ -455,6 +455,15 @@ impl Wizard {
         self.what.toggle_custom_show_hidden();
     }
 
+    /// Primes the WHAT Custom-path field with its privilege-aware `~/`/`/` prefill the instant
+    /// it opens (#85). `App` calls this right after routing a plain key to `handle_key` (the
+    /// only path that can newly open the field) with the injected [`Privilege`] the pure
+    /// reducer doesn't carry (ADR-0004); it is a no-op on every other keystroke, since the
+    /// field's buffer is only ever empty on the frame it opens.
+    pub fn prime_what_custom_path(&mut self, privilege: Privilege) {
+        self.what.prime_custom_path(privilege);
+    }
+
     /// The step the wizard is currently on.
     #[must_use]
     pub fn current(&self) -> WizardStep {

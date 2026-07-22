@@ -33,7 +33,8 @@ pub struct Glyphs {
     /// Locked/pending marker (`·` → `.`): the stepper's locked steps and pending RUN phases.
     /// Distinct from the `·` used as a separator, which is left Unicode.
     pub locked: &'static str,
-    /// Focus/breadcrumb pointer (`▸` → `>`): pane cursors, field markers, the breadcrumb.
+    /// Focus pointer (`▸` → `>`): pane cursors, field markers. The WHAT breadcrumb's `/`
+    /// separator is a literal character, decoupled from this glyph (#85).
     pub pointer: &'static str,
     /// Bullet (`•` → `*`): the passphrase mask, the offered/pick-list radio dot, the
     /// plaintext-modal Category list, and the restore partial-report failure lines.

@@ -91,6 +91,83 @@ impl ReflowTier {
     }
 }
 
+/// The WHAT explorer breadcrumb's responsive rungs (#85), mirroring [`ReflowTier`]'s pure
+/// `for_width` shape but keyed off the explorer pane's *inner* column width (post-border)
+/// rather than terminal height — the breadcrumb sheds width the same way the frame sheds
+/// height, one ladder per axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreadcrumbWidth {
+    /// >= 60 inner cols: `Category / segment / segment` — spaced separators, Category shown.
+    Comfortable,
+    /// 30-59 inner cols: `Category/segment/segment` — tight separators, Category still shown.
+    Tight,
+    /// < 30 inner cols: `../segment/segment` — Category dropped, `../` prefix; if still too
+    /// wide, [`render_breadcrumb`] sheds the oldest remaining segment first.
+    Compact,
+}
+
+impl BreadcrumbWidth {
+    /// Selects the rung for the explorer pane's inner `cols`. Pure and total, so the 60/30
+    /// rung boundaries are unit-tested without a terminal (the thresholds are tunable starting
+    /// cut points, not load-bearing constants).
+    #[must_use]
+    pub fn for_width(cols: u16) -> Self {
+        match cols {
+            c if c >= 60 => Self::Comfortable,
+            30..=59 => Self::Tight,
+            _ => Self::Compact,
+        }
+    }
+}
+
+/// Renders the WHAT breadcrumb's plain text for `tier`: the Category head plus every
+/// descended `segments` component, never with a leading `/` (the head is always a Category
+/// display name, never a path root). `Comfortable`/`Tight` differ only in separator spacing;
+/// `Compact` drops the Category and prefixes `../`, shedding the **oldest** remaining segment
+/// first when the full trail still overflows `cols` — the tail (what the user just descended
+/// into) is what they're looking at, so it is never shed, even if the result still overflows.
+#[must_use]
+pub fn render_breadcrumb(
+    tier: BreadcrumbWidth,
+    category: &str,
+    segments: &[String],
+    cols: u16,
+) -> String {
+    match tier {
+        BreadcrumbWidth::Comfortable => join_with_category(category, segments, " / "),
+        BreadcrumbWidth::Tight => join_with_category(category, segments, "/"),
+        BreadcrumbWidth::Compact => compact_breadcrumb(segments, cols),
+    }
+}
+
+/// The `Comfortable`/`Tight` form: the Category head followed by every segment, joined by
+/// `sep`. With no segments this is just the Category name (no dangling separator).
+fn join_with_category(category: &str, segments: &[String], sep: &str) -> String {
+    std::iter::once(category)
+        .chain(segments.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// The `Compact` form: no Category, a `../` prefix, oldest-first shedding until the trail fits
+/// `cols` — stopping at the tail regardless of fit, since dropping it would leave nothing of
+/// the current location on screen. Empty `segments` (the explorer's top level) renders empty:
+/// there is nothing descended into to abbreviate.
+fn compact_breadcrumb(segments: &[String], cols: u16) -> String {
+    if segments.is_empty() {
+        return String::new();
+    }
+    let cols = usize::from(cols);
+    let mut start = 0;
+    loop {
+        let candidate = format!("../{}", segments[start..].join("/"));
+        if candidate.chars().count() <= cols || start + 1 == segments.len() {
+            return candidate;
+        }
+        start += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +227,96 @@ mod tests {
         assert!(!ReflowTier::Default.compact_stepper());
         assert!(ReflowTier::Tight.compact_stepper());
         assert!(ReflowTier::Minimum.compact_stepper());
+    }
+
+    fn segs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|&s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn breadcrumb_width_rung_boundaries() {
+        assert_eq!(BreadcrumbWidth::for_width(61), BreadcrumbWidth::Comfortable);
+        assert_eq!(BreadcrumbWidth::for_width(60), BreadcrumbWidth::Comfortable);
+        assert_eq!(BreadcrumbWidth::for_width(59), BreadcrumbWidth::Tight);
+        assert_eq!(BreadcrumbWidth::for_width(30), BreadcrumbWidth::Tight);
+        assert_eq!(BreadcrumbWidth::for_width(29), BreadcrumbWidth::Compact);
+        assert_eq!(BreadcrumbWidth::for_width(0), BreadcrumbWidth::Compact);
+    }
+
+    #[test]
+    fn comfortable_spaces_the_separators_and_shows_the_category() {
+        let text = render_breadcrumb(
+            BreadcrumbWidth::Comfortable,
+            "Custom paths",
+            &segs(&["projects", "src", "actions"]),
+            60,
+        );
+        assert_eq!(text, "Custom paths / projects / src / actions");
+    }
+
+    #[test]
+    fn tight_packs_the_separators_and_still_shows_the_category() {
+        let text = render_breadcrumb(
+            BreadcrumbWidth::Tight,
+            "Custom paths",
+            &segs(&["projects", "src", "actions"]),
+            40,
+        );
+        assert_eq!(text, "Custom paths/projects/src/actions");
+    }
+
+    #[test]
+    fn comfortable_and_tight_show_just_the_category_at_the_top_level() {
+        assert_eq!(
+            render_breadcrumb(BreadcrumbWidth::Comfortable, "Shell", &[], 60),
+            "Shell"
+        );
+        assert_eq!(
+            render_breadcrumb(BreadcrumbWidth::Tight, "Shell", &[], 40),
+            "Shell"
+        );
+    }
+
+    #[test]
+    fn compact_drops_the_category_and_prefixes_dotdot_slash() {
+        let text = render_breadcrumb(
+            BreadcrumbWidth::Compact,
+            "Custom paths",
+            &segs(&["projects", "src", "actions"]),
+            23, // exactly fits the untruncated trail
+        );
+        assert_eq!(text, "../projects/src/actions");
+        assert!(!text.contains("Custom paths"));
+        assert!(!text.starts_with('/'), "no leading /: {text}");
+    }
+
+    #[test]
+    fn compact_sheds_the_oldest_segment_first_when_it_overflows() {
+        let text = render_breadcrumb(
+            BreadcrumbWidth::Compact,
+            "Custom paths",
+            &segs(&["projects", "src", "actions"]),
+            14, // too narrow for the full trail, exactly fits after shedding "projects"
+        );
+        assert_eq!(text, "../src/actions");
+    }
+
+    #[test]
+    fn compact_never_sheds_the_tail_even_if_still_overflowing() {
+        let text = render_breadcrumb(
+            BreadcrumbWidth::Compact,
+            "Custom paths",
+            &segs(&["projects", "src", "actions"]),
+            5, // narrower than even the last segment alone
+        );
+        assert_eq!(text, "../actions", "the tail survives regardless of fit");
+    }
+
+    #[test]
+    fn compact_at_the_top_level_renders_nothing() {
+        assert_eq!(
+            render_breadcrumb(BreadcrumbWidth::Compact, "Shell", &[], 20),
+            ""
+        );
     }
 }
