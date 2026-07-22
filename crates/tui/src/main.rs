@@ -22,8 +22,10 @@
 
 mod app;
 mod cli;
+mod reflow;
 mod runtime;
 mod system;
+mod wizard;
 
 // Retired screen by screen per spec #62: these inquire-based modules stay compiled (so
 // `inquire`/`indicatif` and their existing tests survive the interim) but are no longer
