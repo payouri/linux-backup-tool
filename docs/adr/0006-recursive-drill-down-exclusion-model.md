@@ -98,3 +98,59 @@ Core's public API grows by this one query and nothing else.
 - A contributor will be tempted to build a tri-state directory tree or gitignore-style negation "to
   do drill-down properly." Don't — Decisions 1 and 2 chose the flat, prefix-wins model on purpose;
   the richer models are later efforts gated on real demand.
+
+## Addendum: 2026-07-22 — `Vec<Entry>` → `BTreeMap<PathBuf, Entry>` (issue #82)
+
+Decision 1 kept `entries`/`withheld` as flat collections and Decision 5 gave `core` exactly one
+derived query, `directory_state`, computed by scanning them. Both held as written, but "scanning
+them" turned out not to scale: `directory_state` was O(n) per call and got called once per visible
+explorer row (O(rows × entries) per render), and `deselect_root` was O(n) per call while the WHAT
+screen's Category-off toggle calls it once *per Entry* in the Category — O(paths × entries),
+which froze the UI for a real ~40,000-file KDE Plasma icon theme. This is exactly the O(n²) shape
+Decision 1's sibling `select_category` fix (the #30 `BTreeSet`-membership fix, predating this ADR)
+already solved once for the *select* direction; #82 is the same shape on the *deselect* side, and
+Decision 5's own escape clause — the derived query "lives in core... rather than each UI screen
+re-deriving the withheld rule" — anticipates exactly this: a second consumer with a real
+performance requirement licenses hardening the query's implementation, not just adding it.
+
+**What changed.** `entries`/`withheld` are now `BTreeMap<PathBuf, Entry>` keyed by
+`relative_path`, still the *sole* source of truth Decision 1 requires (no second structure, no
+stored tri-state) — a `BTreeMap` is an ordered index over the same flat facts, not a different
+model of them. Keying by `relative_path` promotes an invariant every prior linear-scan
+implementation already relied on implicitly (each only ever found/acted on the *first* Entry
+matching a given path): `relative_path` is unique across a Selection.
+
+The prefix queries (`directory_state`, `deselect_root`, `reselect_root`,
+`is_under_deselected_root`, and the `deselected_roots` cleanup inside `deselect_category`) are now
+sorted-key range operations instead of `Path::starts_with` scans over every Entry:
+
+- A Subtree's sorted-key range is `[prefix, prefix_upper)`, where `prefix_upper` appends a `0x00`
+  byte (never a legal Unix path-component byte) to `prefix`'s last component — a bound that always
+  sorts after every real descendant (however deep) and before the next sibling, decided at that one
+  component regardless of remaining depth. `directory_state` and the `deselect_root`/
+  `deselect_category` no-op guards use this as an O(log n) existence check (`Range::next`, stopping
+  at the first match); `deselect_root`/`reselect_root` use it to collect exactly the Subtree's keys
+  (`O(log n + k)`) and remove them individually (`O(k log n)` total) — deliberately *not*
+  `BTreeMap::split_off`, whose single-split cost is O(log n) but whose remainder has to be merged
+  back with `append`, which is linear in the combined size of both maps: for the common
+  one-Entry-at-a-time call pattern, that merge alone would put the O(paths × entries) freeze right
+  back.
+- `is_under_deselected_root` walks `relative_path`'s ancestors (`Path::ancestors`, bounded by path
+  depth) doing an O(log m) `BTreeSet` lookup at each level, rather than testing every one of the
+  `m` deselected roots — `deselected_roots` has no path index of its own to range over, so this is
+  the cheap side of that particular check.
+
+**Consequence: `entries()` is now path-ordered, not scan-ordered**, and returns `Vec<&Entry>`
+(there is no contiguous `Entry` storage left to hand back as a slice). This is benign by
+Decision 3's own reasoning: the Manifest's `entries` array records *what* was selected, not an
+order anything replays — restore extracts the tar stream directly, `checksums` is already a sorted
+`BTreeMap`, and `verify` doesn't depend on sequence. The only observable effects are cosmetic: the
+Manifest's `entries` array and tar-entry order shift from scan order to path order, and
+`archive_sha256` (a hash of the whole `.tar.zst` stream) changes value accordingly — no schema
+change, no new field, nothing a consumer reads positionally.
+
+**No Profile change.** `deselected_paths`/`deselected_roots` (Decision 4) stay exactly the
+persisted `Vec<PathBuf>` shape; the `BTreeMap` is in-memory only, built fresh from them (and from a
+fresh scan) on load. No migration, no `SCHEMA_VERSION` bump — consistent with Decision 3's "the
+Archive itself is the record" and Decision 4's "no new field and no migration" already covering any
+representation the *in-memory* model chooses for the same persisted facts.

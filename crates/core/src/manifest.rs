@@ -147,7 +147,10 @@ pub struct PackageInfo {
 pub struct ManifestInputs<'a> {
     pub ctx: &'a RunContext,
     pub tool_version: &'a str,
-    pub entries: &'a [Entry],
+    /// `&[&Entry]` rather than `&[Entry]` (#82): `SelectionModel::entries` is a `BTreeMap`
+    /// with no contiguous `Entry` storage to slice, so its accessor hands back borrowed
+    /// references in path order instead.
+    pub entries: &'a [&'a Entry],
     pub checksums: BTreeMap<String, String>,
     pub archive_sha256: String,
     pub vanished: Vec<VanishedEntry>,
@@ -180,7 +183,12 @@ pub fn build(inputs: ManifestInputs<'_>) -> Manifest {
         uid: inputs.ctx.uid,
         home: inputs.ctx.home.clone(),
         os: inputs.ctx.os.clone(),
-        entries: inputs.entries.iter().map(ManifestEntry::from).collect(),
+        entries: inputs
+            .entries
+            .iter()
+            .copied()
+            .map(ManifestEntry::from)
+            .collect(),
         checksums: inputs.checksums,
         archive_sha256: inputs.archive_sha256,
         vanished: inputs.vanished,

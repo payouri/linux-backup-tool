@@ -124,9 +124,14 @@ fn run_backup(
         source,
     })?;
 
+    // Taken once and reused below for the Manifest: `SelectionModel::entries` builds a fresh
+    // path-ordered `Vec<&Entry>` from its `BTreeMap` each call (#82), so there's no reason to
+    // pay for it twice in one backup run.
+    let entries = selection.entries();
+
     // `build` reports `Phase::Scanning` then `Phase::Compressing` itself; the encryption and
     // disk-write phases below are reported here at their real boundaries.
-    let built = archive::build(selection.entries(), progress)?;
+    let built = archive::build(&entries, progress)?;
 
     // `Encrypting` is omitted entirely for a plaintext backup (issue #65): a run that isn't
     // encrypting has no such phase to show, so the RUN screen never renders one. The Manifest
@@ -158,7 +163,7 @@ fn run_backup(
     let manifest = manifest::build(manifest::ManifestInputs {
         ctx,
         tool_version: env!("CARGO_PKG_VERSION"),
-        entries: selection.entries(),
+        entries: &entries,
         checksums: built.checksums,
         archive_sha256,
         vanished,

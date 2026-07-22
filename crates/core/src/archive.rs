@@ -85,7 +85,11 @@ pub struct BuiltArchive {
 /// once up front here) and the trailing [`Phase::Compressing`] frame flush, so a caller can
 /// drive a live progress bar; it's only ever notified, never consulted — pass
 /// `&mut progress::NoopProgress` when progress isn't wanted.
-pub fn build(entries: &[Entry], progress: &mut dyn Progress) -> Result<BuiltArchive, CoreError> {
+///
+/// Takes `&[&Entry]` rather than `&[Entry]` (#82): `SelectionModel::entries` is a `BTreeMap`
+/// with no contiguous `Entry` storage to slice, so its accessor hands back borrowed references
+/// in path order instead.
+pub fn build(entries: &[&Entry], progress: &mut dyn Progress) -> Result<BuiltArchive, CoreError> {
     let mut checksums = BTreeMap::new();
     let mut vanished = Vec::new();
 
@@ -96,7 +100,7 @@ pub fn build(entries: &[Entry], progress: &mut dyn Progress) -> Result<BuiltArch
         .map_err(|e| CoreError::ArchiveBuildFailed(e.to_string()))?;
     let mut tar_builder = tar::Builder::new(zstd_encoder);
 
-    for (index, entry) in entries.iter().enumerate() {
+    for (index, entry) in entries.iter().copied().enumerate() {
         // Ticked once at the top of the body so it fires exactly `total` times regardless of
         // which path the iteration takes below (a Vanished `continue` would otherwise skip a
         // tick placed at the bottom, stalling the bar short of 100%).
@@ -383,8 +387,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("does-not-exist");
 
-        let built = build(&[entry(missing, false)], &mut crate::progress::NoopProgress)
-            .expect("a Vanished entry must not abort");
+        let built = build(
+            &[&entry(missing, false)],
+            &mut crate::progress::NoopProgress,
+        )
+        .expect("a Vanished entry must not abort");
 
         assert_eq!(built.vanished.len(), 1);
         assert!(built.checksums.is_empty());
@@ -395,7 +402,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("gone-key");
 
-        let built = build(&[entry(missing, true)], &mut crate::progress::NoopProgress)
+        let built = build(&[&entry(missing, true)], &mut crate::progress::NoopProgress)
             .expect("build should succeed");
 
         assert_eq!(built.vanished.len(), 1);
@@ -410,7 +417,7 @@ mod tests {
         // says is fatal. Deterministic and portable, unlike a permission-denied probe that
         // a root-run test suite would sail straight through.
         let result = build(
-            &[entry(tmp.path().to_path_buf(), false)],
+            &[&entry(tmp.path().to_path_buf(), false)],
             &mut crate::progress::NoopProgress,
         );
 

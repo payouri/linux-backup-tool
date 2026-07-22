@@ -35,8 +35,21 @@
 //!
 //! #22 scope: `encryption_required` delegates to `crypto::evaluate`'s Auto-insist policy —
 //! see that module for which specific Categories/Entries triggered it.
+//!
+//! #82 scope (ADR-0006's dated addendum): `entries`/`withheld` are `BTreeMap<PathBuf, Entry>`
+//! keyed by `relative_path`, not `Vec<Entry>` — the sole source of truth for what's
+//! active/withheld, so a Subtree query (`directory_state`, `deselect_root`, `reselect_root`,
+//! `is_under_deselected_root`, and the `deselected_roots` cleanup inside `deselect_category`)
+//! is a sorted-key range operation instead of a scan of every Entry. This is what makes
+//! toggling a Category with tens of thousands of Entries instant rather than the O(n²) freeze
+//! `select_category`'s doc below already fixed once for the *select* direction; #82 was the
+//! same shape on the *deselect* side; see `prefix_range_end`'s doc for the range-bound trick.
 
-use std::collections::BTreeSet;
+use std::collections::btree_map::Range;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::ops::Bound;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use crate::catalog;
@@ -148,12 +161,16 @@ pub enum DirectoryState {
 /// authoritative model of what will be backed up.
 #[derive(Debug, Clone, Default)]
 pub struct SelectionModel {
-    /// The currently active Entries — see the module doc's #21 section for why every
-    /// derived accessor reads only this field.
-    entries: Vec<Entry>,
+    /// The currently active Entries, keyed by `relative_path` — see the module doc's #21
+    /// section for why every derived accessor reads only this field, and the #82 section for
+    /// why a `BTreeMap` (a sorted-key index for free) rather than a `Vec`. Keying by
+    /// `relative_path` assumes it's unique across the Selection; every prior linear-scan
+    /// implementation already only ever found/acted on the first Entry matching a given
+    /// `relative_path`, so this is a documented existing invariant, not a new one.
+    entries: BTreeMap<PathBuf, Entry>,
     /// Entries deselected via Drill-down (per-file or by root), held here rather than dropped
     /// so `entries_in_category`/`reselect_entry`/`reselect_root` can still find them.
-    withheld: Vec<Entry>,
+    withheld: BTreeMap<PathBuf, Entry>,
     /// The relative paths of Entries deselected individually (per-file Drill-down) — the
     /// storable shape exposed by `deselected_paths` for #34 to persist. A subset of the
     /// withheld Entries' paths: a root-level deselection withholds Entries without listing
@@ -173,8 +190,11 @@ impl SelectionModel {
     /// otherwise Smart-defaulted Selection.
     pub fn new(entries: Vec<Entry>) -> Self {
         Self {
-            entries,
-            withheld: Vec::new(),
+            entries: entries
+                .into_iter()
+                .map(|entry| (entry.relative_path.clone(), entry))
+                .collect(),
+            withheld: BTreeMap::new(),
             deselected: BTreeSet::new(),
             deselected_roots: BTreeSet::new(),
         }
@@ -210,18 +230,23 @@ impl SelectionModel {
     pub fn add_custom_path(&mut self, absolute_path: &Path, home: &Path) {
         if self
             .entries
-            .iter()
+            .values()
             .any(|entry| entry.absolute_path == absolute_path)
         {
             return;
         }
-        self.entries.push(custom_entry(absolute_path, home));
+        let entry = custom_entry(absolute_path, home);
+        self.entries.insert(entry.relative_path.clone(), entry);
     }
 
-    /// The active (non-deselected) Entries, in scan order — what `archive::build` and the
-    /// Manifest builder actually consume.
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
+    /// The active (non-deselected) Entries, in path order (the `BTreeMap` key order — #82's
+    /// dated ADR-0006 addendum) — what `archive::build` and the Manifest builder actually
+    /// consume. Order was scan order before #82 and is now path order; nothing downstream
+    /// depends on the sequence itself (`checksums` is a sorted `BTreeMap`, and restore/verify
+    /// extract from the tar stream rather than replaying this order), so only
+    /// `archive_sha256` and the Manifest's `entries` array's cosmetic ordering shift.
+    pub fn entries(&self) -> Vec<&Entry> {
+        self.entries.values().collect()
     }
 
     /// Deselects (Drill-down, #21) the Entry whose relative path is `relative_path`,
@@ -231,16 +256,11 @@ impl SelectionModel {
     /// if no active Entry matches `relative_path` — already deselected, or never part of
     /// the Selection to begin with.
     pub fn deselect_entry(&mut self, relative_path: &Path) {
-        let Some(pos) = self
-            .entries
-            .iter()
-            .position(|e| e.relative_path == relative_path)
-        else {
+        let Some(entry) = self.entries.remove(relative_path) else {
             return;
         };
-        let entry = self.entries.remove(pos);
-        self.deselected.insert(entry.relative_path.clone());
-        self.withheld.push(entry);
+        self.deselected.insert(relative_path.to_path_buf());
+        self.withheld.insert(relative_path.to_path_buf(), entry);
     }
 
     /// Reverses `deselect_entry`: clears `relative_path`'s per-file deselection and moves the
@@ -253,13 +273,8 @@ impl SelectionModel {
         if self.is_under_deselected_root(relative_path) {
             return;
         }
-        if let Some(pos) = self
-            .withheld
-            .iter()
-            .position(|e| e.relative_path == relative_path)
-        {
-            let entry = self.withheld.remove(pos);
-            self.entries.push(entry);
+        if let Some(entry) = self.withheld.remove(relative_path) {
+            self.entries.insert(relative_path.to_path_buf(), entry);
         }
     }
 
@@ -271,13 +286,22 @@ impl SelectionModel {
     }
 
     /// Whether `relative_path` falls under any currently-deselected allowlist root (#38) — a
-    /// root path-prefix of it. Path-component-wise (`Path::starts_with`), so a deselected
-    /// `.local/share/icons` covers `.local/share/icons/hicolor/x.svg` but not a sibling
-    /// `.local/share/icons-backup`.
+    /// root path-prefix of it, `relative_path` itself included. Path-component-wise, so a
+    /// deselected `.local/share/icons` covers `.local/share/icons/hicolor/x.svg` but not a
+    /// sibling `.local/share/icons-backup`.
+    ///
+    /// Walked ancestor-by-ancestor (`Path::ancestors`, bounded by `relative_path`'s depth) with
+    /// an `O(log m)` `BTreeSet` lookup at each level (#82), rather than testing `starts_with`
+    /// against every one of the `m` deselected roots: `deselected_roots` has no path index of
+    /// its own to range over (it's not keyed by directory nesting), but any root that covers
+    /// `relative_path` must be one of its literal ancestors, so walking those is exactly the
+    /// candidate set — no shorter path through the sorted order (an ancestor is always `<=`
+    /// `relative_path` in the component order, but so are unrelated siblings, so a single
+    /// `range`/`next_back` lookup can't distinguish an ancestor from a smaller sibling root).
     fn is_under_deselected_root(&self, relative_path: &Path) -> bool {
-        self.deselected_roots
-            .iter()
-            .any(|root| relative_path.starts_with(root))
+        relative_path
+            .ancestors()
+            .any(|ancestor| self.deselected_roots.contains(ancestor))
     }
 
     /// Category-level toggle ON (the WHAT screen's Category checkbox, #30): adds every
@@ -289,29 +313,21 @@ impl SelectionModel {
     /// default was OFF and so has never been part of this model at all. Only a brand-new
     /// Entry (never seen by this model) is pushed straight into the active Selection.
     ///
-    /// Membership is checked via a `BTreeSet` snapshot taken once up front, not a
+    /// Membership is checked via a direct `BTreeMap::contains_key` per Entry, not a
     /// `Vec::iter().any(...)` per Entry: the naive per-Entry linear scan is O(current
     /// Selection size) each time, which turns loading a large Category into this model into
     /// an O(n²) scan — measured at ~88s for KDE Plasma's ~40,000-file icon theme (a real
-    /// Category size, story 13) during #30's manual verification against a real account.
+    /// Category size, story 13) during #30's manual verification against a real account. #82
+    /// replaced the `Vec`s (and the `BTreeSet` snapshot this method used to build from them
+    /// up front) with `BTreeMap`s that already carry a path index, so each check below is an
+    /// O(log n) lookup straight against `entries`/`withheld` with nothing to pre-snapshot.
     pub fn select_category(&mut self, scan: &CategoryScan) {
-        let active: BTreeSet<&Path> = self
-            .entries
-            .iter()
-            .map(|e| e.relative_path.as_path())
-            .collect();
-        let withheld: BTreeSet<&Path> = self
-            .withheld
-            .iter()
-            .map(|e| e.relative_path.as_path())
-            .collect();
-
         let mut to_reselect = Vec::new();
-        let mut to_push_active = Vec::new();
-        let mut to_push_withheld = Vec::new();
+        let mut to_insert_active = Vec::new();
+        let mut to_insert_withheld = Vec::new();
         for entry in &scan.entries {
             let path = entry.relative_path.as_path();
-            if active.contains(path) {
+            if self.entries.contains_key(path) {
                 continue;
             }
             // A root-level Drill-down deselection (#38) survives a Category (re)select: its
@@ -319,22 +335,26 @@ impl SelectionModel {
             // per-file withhold is lifted here — so an Entry already withheld under a
             // still-deselected root is left where it is, and a brand-new Entry that lands under
             // one goes straight to `withheld` rather than the active Selection.
-            if withheld.contains(path) {
+            if self.withheld.contains_key(path) {
                 if !self.is_under_deselected_root(path) {
                     to_reselect.push(entry.relative_path.clone());
                 }
             } else if self.is_under_deselected_root(path) {
-                to_push_withheld.push(entry.clone());
+                to_insert_withheld.push(entry.clone());
             } else {
-                to_push_active.push(entry.clone());
+                to_insert_active.push(entry.clone());
             }
         }
 
         for path in to_reselect {
             self.reselect_entry(&path);
         }
-        self.entries.extend(to_push_active);
-        self.withheld.extend(to_push_withheld);
+        for entry in to_insert_active {
+            self.entries.insert(entry.relative_path.clone(), entry);
+        }
+        for entry in to_insert_withheld {
+            self.withheld.insert(entry.relative_path.clone(), entry);
+        }
     }
 
     /// Category-level toggle OFF: removes every Entry belonging to `category_name` from the
@@ -345,27 +365,28 @@ impl SelectionModel {
     /// survive a full off/on cycle within the same run — an accepted simplification for the
     /// alpha's first Selection screen (#30); re-drilling after re-checking is cheap.
     pub fn deselect_category(&mut self, category_name: &str) {
-        self.entries.retain(|e| e.category != category_name);
+        self.entries.retain(|_, e| e.category != category_name);
 
         let removed_withheld: Vec<PathBuf> = self
             .withheld
             .iter()
-            .filter(|e| e.category == category_name)
-            .map(|e| e.relative_path.clone())
+            .filter(|(_, e)| e.category == category_name)
+            .map(|(path, _)| path.clone())
             .collect();
-        self.withheld.retain(|e| e.category != category_name);
+        self.withheld.retain(|_, e| e.category != category_name);
         for path in removed_withheld {
             self.deselected.remove(&path);
         }
         // Drop any root-level deselection (#38) that no longer covers a remaining Entry: a
         // Category toggled fully off carries no partial memory — per-file or per-root — into
         // its next toggle-on, matching this method's existing "an unchecked box carries no
-        // partial memory" contract above.
+        // partial memory" contract above. #82: an O(log n) range-existence check against
+        // `entries`/`withheld` per remaining root, rather than a scan of every surviving Entry
+        // per root — that nested shape is O(roots × entries), the same quadratic pattern #82
+        // fixed for `deselect_root` itself.
         self.deselected_roots.retain(|root| {
-            self.entries
-                .iter()
-                .chain(self.withheld.iter())
-                .any(|e| e.relative_path.starts_with(root))
+            prefix_range_nonempty(&self.entries, root)
+                || prefix_range_nonempty(&self.withheld, root)
         });
     }
 
@@ -376,25 +397,25 @@ impl SelectionModel {
     /// `icons/`/`wallpapers/`) is dropped as a single toggleable unit rather than by unchecking
     /// tens of thousands of files. A no-op that records nothing if no known Entry (active or
     /// withheld) falls under `root`, so a phantom root never lingers in the persisted set.
+    ///
+    /// #82: the whole active Subtree under `root` is lifted out via [`split_prefix_range`] —
+    /// O(log n + k) for the `k` Entries it contains — instead of partitioning every Entry in
+    /// the Selection. This is the fix for the Category-toggle freeze: `crates/tui`'s
+    /// `set_category` deselect branch calls this once per Entry `relative_path` in the
+    /// Category, so what used to be O(entries) per call (O(paths × entries) overall) is now
+    /// O(log n) per call when `k` is small (the common per-file case) and still bounded by the
+    /// touched subtree's own size otherwise.
     pub fn deselect_root(&mut self, root: &Path) {
-        let covers_any = self
-            .entries
-            .iter()
-            .chain(self.withheld.iter())
-            .any(|e| e.relative_path.starts_with(root));
-        if !covers_any {
+        let moved = split_prefix_range(&mut self.entries, root);
+        if moved.is_empty() && !prefix_range_nonempty(&self.withheld, root) {
+            // Nothing (active or withheld) falls under `root` — `moved` being empty already
+            // means nothing was removed from `self.entries` above, so there is nothing to
+            // undo before returning.
             return;
         }
-
-        let mut still_active = Vec::with_capacity(self.entries.len());
-        for entry in std::mem::take(&mut self.entries) {
-            if entry.relative_path.starts_with(root) {
-                self.withheld.push(entry);
-            } else {
-                still_active.push(entry);
-            }
+        for (path, entry) in moved {
+            self.withheld.insert(path, entry);
         }
-        self.entries = still_active;
         self.deselected_roots.insert(root.to_path_buf());
     }
 
@@ -402,21 +423,23 @@ impl SelectionModel {
     /// back into the active Selection — except any Entry still excluded by another origin: an
     /// individual per-file deselection (`deselected`) or a *different* root still deselected
     /// and also covering it. A no-op if `root` wasn't deselected.
+    ///
+    /// #82: the withheld Subtree under `root` is lifted out via [`split_prefix_range`] (same
+    /// O(log n + k) shape as `deselect_root`) rather than partitioning every withheld Entry;
+    /// each of the `k` candidates then gets its own O(log n) reactivation check.
     pub fn reselect_root(&mut self, root: &Path) {
         self.deselected_roots.remove(root);
 
-        let mut still_withheld = Vec::with_capacity(self.withheld.len());
-        for entry in std::mem::take(&mut self.withheld) {
-            let reactivatable = entry.relative_path.starts_with(root)
-                && !self.deselected.contains(&entry.relative_path)
-                && !self.is_under_deselected_root(&entry.relative_path);
+        let candidates = split_prefix_range(&mut self.withheld, root);
+        for (path, entry) in candidates {
+            let reactivatable =
+                !self.deselected.contains(&path) && !self.is_under_deselected_root(&path);
             if reactivatable {
-                self.entries.push(entry);
+                self.entries.insert(path, entry);
             } else {
-                still_withheld.push(entry);
+                self.withheld.insert(path, entry);
             }
         }
-        self.withheld = still_withheld;
     }
 
     /// Whether `root` is currently deselected as a whole unit (#38) — the exact-match query a
@@ -432,20 +455,19 @@ impl SelectionModel {
     /// `reselect_root` by construction: a Subtree deselection moves every Entry under `prefix`
     /// into `withheld`, which reads back as `None`, and re-selecting them all reads back as
     /// `All`, with no stored tri-state to keep in sync. `prefix` is a relative path matched
-    /// component-wise (`Path::starts_with`, matching `is_under_deselected_root`), so
-    /// `.local/share/icons` covers `.local/share/icons/hicolor/x.svg` but not a sibling
-    /// `.local/share/icons-backup`. A `prefix` covering no known Entry (active or withheld)
-    /// reads as `None` — nothing there is selected; in practice the explorer only queries
-    /// prefixes drawn from real Entry paths, so that is the edge, not the norm.
+    /// component-wise (matching `is_under_deselected_root`), so `.local/share/icons` covers
+    /// `.local/share/icons/hicolor/x.svg` but not a sibling `.local/share/icons-backup`. A
+    /// `prefix` covering no known Entry (active or withheld) reads as `None` — nothing there
+    /// is selected; in practice the explorer only queries prefixes drawn from real Entry
+    /// paths, so that is the edge, not the norm.
+    ///
+    /// #82: each check below is an O(log n) sorted-key range existence test
+    /// ([`prefix_range_nonempty`]) rather than an O(n) scan of `entries`/`withheld` — this was
+    /// called once per visible explorer row (`crates/tui`'s `explorer_rows`), so the old O(n)
+    /// cost compounded into O(rows × entries) across one render.
     pub fn directory_state(&self, prefix: &Path) -> DirectoryState {
-        let any_active = self
-            .entries
-            .iter()
-            .any(|e| e.relative_path.starts_with(prefix));
-        let any_withheld = self
-            .withheld
-            .iter()
-            .any(|e| e.relative_path.starts_with(prefix));
+        let any_active = prefix_range_nonempty(&self.entries, prefix);
+        let any_withheld = prefix_range_nonempty(&self.withheld, prefix);
 
         match (any_active, any_withheld) {
             (true, false) => DirectoryState::All,
@@ -473,8 +495,8 @@ impl SelectionModel {
     /// Category itself is checked.
     pub fn entries_in_category(&self, category: &str) -> Vec<&Entry> {
         self.entries
-            .iter()
-            .chain(self.withheld.iter())
+            .values()
+            .chain(self.withheld.values())
             .filter(|e| e.category == category)
             .collect()
     }
@@ -482,7 +504,7 @@ impl SelectionModel {
     /// The absolute, on-disk paths of every selected Entry.
     pub fn selected_paths(&self) -> Vec<&Path> {
         self.entries
-            .iter()
+            .values()
             .map(|e| e.absolute_path.as_path())
             .collect()
     }
@@ -494,7 +516,7 @@ impl SelectionModel {
     /// not this method's concern).
     pub fn total_size(&self) -> u64 {
         self.entries
-            .iter()
+            .values()
             .filter_map(|e| std::fs::metadata(&e.absolute_path).ok())
             .map(|m| m.len())
             .sum()
@@ -521,7 +543,7 @@ impl SelectionModel {
     pub fn warnings(&self) -> Vec<String> {
         let user_data_size: u64 = self
             .entries
-            .iter()
+            .values()
             .filter(|e| e.category == catalog::USER_DATA.name)
             .filter_map(|e| std::fs::metadata(&e.absolute_path).ok())
             .map(|m| m.len())
@@ -538,6 +560,87 @@ impl SelectionModel {
         }
         warnings
     }
+}
+
+/// The exclusive upper bound of the sorted-key range holding `prefix` itself and every path
+/// with `prefix` as a component-wise prefix (CONTEXT.md's Subtree deselection) — `None` when
+/// `prefix` has no components, meaning the range is the whole map.
+///
+/// Built by appending a NUL byte (`0x00`, never a legal byte in a Unix path component) to
+/// `prefix`'s final component. The bumped component always sorts strictly after the
+/// unmodified component every real descendant shares with `prefix` at that same position —
+/// so it never clips a descendant, however deep — and strictly before any sibling whose
+/// component at that position diverges and is lexicographically greater — so it never spills
+/// into the next subtree. Both properties are decided at this one component regardless of a
+/// descendant's remaining depth (`PathBuf`'s `Ord` compares components left-to-right, so once
+/// one component differs, nothing after it matters), which is the load-bearing fact that lets
+/// one bumped key stand in as the upper bound of an entire Subtree instead of the biggest key
+/// actually inside it (which the caller doesn't know without the linear scan this exists to
+/// avoid). See ADR-0006's dated addendum for the full argument.
+fn prefix_range_end(prefix: &Path) -> Option<PathBuf> {
+    let mut components: Vec<OsString> = prefix
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let mut bumped_last = components.pop()?.into_vec();
+    bumped_last.push(0);
+    components.push(OsString::from_vec(bumped_last));
+
+    let mut bumped = PathBuf::new();
+    for component in components {
+        bumped.push(component);
+    }
+    Some(bumped)
+}
+
+/// The sorted-key range of `map` holding `prefix` and its whole Subtree — `prefix_range_end`'s
+/// bound turned into an actual `BTreeMap` range lookup, `O(log n)` to position. Shared by
+/// every Subtree query (`directory_state`, `deselect_root`, `reselect_root`, and
+/// `deselect_category`'s `deselected_roots` cleanup) so the range-bound trick above has one
+/// place to be correct.
+fn prefix_range<'m>(map: &'m BTreeMap<PathBuf, Entry>, prefix: &Path) -> Range<'m, PathBuf, Entry> {
+    match prefix_range_end(prefix) {
+        Some(upper) => {
+            map.range::<Path, _>((Bound::Included(prefix), Bound::Excluded(upper.as_path())))
+        }
+        None => map.range::<Path, _>((Bound::Included(prefix), Bound::Unbounded)),
+    }
+}
+
+/// Whether `map` holds any Entry at or under `prefix` — an `O(log n)` existence check (stops
+/// at the first match) rather than a full scan, the basis of `directory_state`'s tri-state and
+/// the `deselect_root`/`deselect_category` no-op guards.
+fn prefix_range_nonempty(map: &BTreeMap<PathBuf, Entry>, prefix: &Path) -> bool {
+    prefix_range(map, prefix).next().is_some()
+}
+
+/// Removes `prefix`'s whole Subtree (itself plus every descendant) from `map` and returns
+/// exactly the removed range as its own map, keyed the same way — `O(log n + k)` for the `k`
+/// Entries actually under `prefix`, not a `retain`/partition over every Entry in `map` — the
+/// core fix behind issue #82's Category-toggle freeze.
+///
+/// Deliberately *not* `BTreeMap::split_off` (which would seem the obvious tool): splitting at
+/// `prefix` and again at the Subtree's upper bound isolates the target range, but stitching
+/// the untouched remainder back onto `map` needs `BTreeMap::append`, and `append` is linear in
+/// the combined size of both maps being merged — not the `O(log n)` its single-split cost
+/// suggests. A single deep leaf's remainder is most of `map`, so that merge alone would put
+/// the O(paths × entries) freeze right back for the common one-leaf-at-a-time call pattern
+/// (`crates/tui`'s `set_category`). Collecting the range's keys read-only
+/// ([`prefix_range`], `O(log n + k)`) and removing each by key (`O(log n)` per key, no
+/// merge-back) avoids it.
+fn split_prefix_range(
+    map: &mut BTreeMap<PathBuf, Entry>,
+    prefix: &Path,
+) -> BTreeMap<PathBuf, Entry> {
+    let keys: Vec<PathBuf> = prefix_range(map, prefix)
+        .map(|(path, _)| path.clone())
+        .collect();
+    keys.into_iter()
+        .filter_map(|path| {
+            let entry = map.remove(&path)?;
+            Some((path, entry))
+        })
+        .collect()
 }
 
 /// Builds an [`Entry`] for a Custom path — the one part of a Selection `scan::scan_taxonomy`
@@ -950,8 +1053,8 @@ mod tests {
         // Plasma's icon theme alone produced ~40,000 real Entries on the author's account,
         // and the original `Vec::iter().any(...)`-per-Entry membership check made loading
         // that many Entries an O(n^2) scan — measured at ~88s in practice. This pins the fix
-        // (a `BTreeSet` snapshot for O(log n) membership) down with a generous, non-flaky
-        // time budget: comfortably above what the fixed version needs (single-digit
+        // (an O(log n) `BTreeMap::contains_key` lookup per Entry, #82) down with a generous,
+        // non-flaky time budget: comfortably above what the fixed version needs (single-digit
         // milliseconds), but far below what the O(n^2) version would take at this size.
         let entries: Vec<Entry> = (0..20_000)
             .map(|i| entry(catalog::KDE_PLASMA.name, false, &format!("icon{i}.svg")))
@@ -970,6 +1073,46 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "select_category took {elapsed:?} for 20,000 Entries — the O(n^2) regression is back"
+        );
+    }
+
+    #[test]
+    fn deselecting_a_realistically_large_category_one_leaf_at_a_time_stays_fast() {
+        // Regression test for issue #82: `crates/tui`'s `set_category` deselect branch
+        // (the WHAT screen's Category checkbox turned off) calls `deselect_root` once per
+        // Entry `relative_path` in the Category, not once for the whole Category — so the
+        // bug wasn't `deselect_root` being slow on its own, it was O(entries) *per call*,
+        // compounding into O(paths × entries) across the loop. This is what froze toggling
+        // off KDE Plasma's ~40,000-file icon theme in practice. Pinning `select_category`
+        // alone (the test above, fixed back in #30) doesn't cover this: that bug is entirely
+        // on the deselect side.
+        let leaf_paths: Vec<PathBuf> = (0..40_000)
+            .map(|i| PathBuf::from(format!("icon{i}.svg")))
+            .collect();
+        let entries: Vec<Entry> = leaf_paths
+            .iter()
+            .map(|path| {
+                entry(
+                    catalog::KDE_PLASMA.name,
+                    false,
+                    path.to_str().expect("ascii test path"),
+                )
+            })
+            .collect();
+        let mut selection = SelectionModel::new(entries);
+
+        let started = std::time::Instant::now();
+        for path in &leaf_paths {
+            selection.deselect_root(path);
+        }
+        let elapsed = started.elapsed();
+
+        assert!(selection.is_empty());
+        assert_eq!(selection.deselected_roots().len(), 40_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "deselecting 40,000 Entries one leaf at a time took {elapsed:?} — the O(paths × \
+             entries) Category-toggle freeze (#82) is back"
         );
     }
 

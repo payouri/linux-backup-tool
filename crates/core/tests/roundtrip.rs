@@ -638,7 +638,11 @@ fn hard_read_error_aborts_run_and_leaves_no_backup_dir_or_manifest() {
     fs::create_dir_all(&output).expect("create output dir");
 
     let ctx = test_ctx(home.clone(), output.clone());
-    let mut entries = shell_selection(&ctx).entries().to_vec();
+    let mut entries: Vec<Entry> = shell_selection(&ctx)
+        .entries()
+        .into_iter()
+        .cloned()
+        .collect();
 
     // A directory can't be read as file bytes: `fs::read` fails with something other than
     // `NotFound` (e.g. `IsADirectory`) — exactly the "real read error" ADR-0002 says is
@@ -694,7 +698,7 @@ fn vanished_benign_file_is_skipped_and_recorded_without_aborting() {
     let selection = shell_selection(&ctx);
     let vanishing_entry = selection
         .entries()
-        .iter()
+        .into_iter()
         .find(|e| e.relative_path.ends_with("aliases.zsh"))
         .expect("aliases.zsh should be in the Shell selection")
         .clone();
@@ -742,7 +746,7 @@ fn vanished_sensitive_entry_is_named_by_vanished_sensitive_names() {
 
     let ssh_key_entry = selection
         .entries()
-        .iter()
+        .into_iter()
         .find(|e| e.category == catalog::SSH.name)
         .expect("SSH key should be in the Smart-defaults Selection")
         .clone();
@@ -798,7 +802,7 @@ fn safety_net_only_entry_flows_sensitive_through_the_round_trip() {
 
     let credentials_entry = selection
         .entries()
-        .iter()
+        .into_iter()
         .find(|e| e.relative_path == Path::new(".config/git/credentials"))
         .expect("credentials file should be selected via Program configs' Smart default");
     assert_eq!(credentials_entry.category, "Program configs");
@@ -891,7 +895,7 @@ fn kde_plasma_drill_down_deselection_excludes_exactly_those_entries_from_the_rou
     // Entries start in the active Selection before any Drill-down toggling.
     let plasma_entries_before: Vec<PathBuf> = selection
         .entries()
-        .iter()
+        .into_iter()
         .filter(|e| e.category == catalog::KDE_PLASMA.name)
         .map(|e| e.relative_path.clone())
         .collect();
@@ -914,15 +918,15 @@ fn kde_plasma_drill_down_deselection_excludes_exactly_those_entries_from_the_rou
     // could re-toggle the withheld ones — only the *active* Selection shrank.
     assert!(selection
         .entries()
-        .iter()
+        .into_iter()
         .any(|e| e.relative_path == kwinrc_relative_path));
     assert!(!selection
         .entries()
-        .iter()
+        .into_iter()
         .any(|e| e.relative_path == icon_relative_path));
     assert!(!selection
         .entries()
-        .iter()
+        .into_iter()
         .any(|e| e.relative_path == wallpaper_relative_path));
     assert_eq!(
         selection
@@ -1026,7 +1030,7 @@ fn kde_plasma_root_level_deselection_excludes_the_whole_subtree_from_the_round_t
     // the roots are recorded as two root paths — not the individual files they expand to.
     assert!(selection
         .entries()
-        .iter()
+        .into_iter()
         .any(|e| e.relative_path == Path::new(".config/kwinrc")));
     assert!(!selection.is_empty());
     assert!(selection.is_root_deselected(&icons_root));
