@@ -39,7 +39,7 @@ Read before writing or changing tests:
 
 ## Coding conventions
 
-- **Consult the `/rust-skills` skill** for idiomatic Rust guidance (ownership, error handling, async, API design, performance, testing, etc.) before writing, reviewing, or refactoring Rust code. The conventions below take precedence where they overlap or narrow its general rules.
+- **Any agent implementing or reviewing Rust code MUST use the `/rust-skills` skill** for idiomatic Rust guidance (ownership, error handling, async, API design, performance, testing, etc.) — invoke it before writing, reviewing, or refactoring Rust, not optionally. The conventions below take precedence where they overlap or narrow its general rules.
 - **Comments explain why, never what or how.** Well-named code already says what/how; a comment earns its place only by carrying a reason the code can't: a non-obvious constraint, an invariant, a workaround for a specific bug. If removing it wouldn't confuse a future reader, don't write it.
 - **Error handling**: `Result`/`?` throughout, no `unwrap()`/`expect()`/`panic!()` outside tests and `main`. `core` errors use `thiserror`; `tui`'s boundary uses `anyhow`. Don't mix the two within a crate.
 - **`core`'s public API stays minimal.** Default everything private; promote to `pub` only when `tui` (or a future `gui`) actually needs it.
