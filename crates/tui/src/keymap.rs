@@ -57,8 +57,10 @@ impl Chord {
 
 // --- Chords, defined once -------------------------------------------------------------------
 
-const CTRL_RIGHT: Chord = ctrl("Ctrl-→", KeyCode::Right);
-const CTRL_LEFT: Chord = ctrl("Ctrl-←", KeyCode::Left);
+/// The wizard step-motion chords. `pub(crate)` so `app`'s WHERE/WHAT screen-vs-wizard routing
+/// matches them from the catalog via [`Chord::matches`] instead of restating `Left/Right + CONTROL`.
+pub(crate) const CTRL_RIGHT: Chord = ctrl("Ctrl-→", KeyCode::Right);
+pub(crate) const CTRL_LEFT: Chord = ctrl("Ctrl-←", KeyCode::Left);
 const ENTER: Chord = plain("Enter", KeyCode::Enter);
 const ESC: Chord = plain("Esc", KeyCode::Esc);
 const F1: Chord = plain("F1", KeyCode::F(1));
@@ -185,6 +187,11 @@ pub(crate) struct Binding {
     /// The overlay group this binding lists under, or `None` for a footer-only binding the
     /// overlay does not carry (`Enter unlock`, the restore `↑/↓ scroll`, the reveal toggle).
     pub group: Option<Group>,
+    /// An overlay-only qualifier appended after the label in the `?` panel (never in the footer):
+    /// context the reference needs but a footer has no room for, e.g. `Enter close` is only live
+    /// `(when done)`. Kept on the binding so the overlay renders it from one source rather than a
+    /// parallel literal in `help.rs`.
+    pub overlay_note: Option<&'static str>,
 }
 
 impl Binding {
@@ -198,6 +205,16 @@ impl Binding {
             format!("{} {}", self.chord.spelling, self.verb)
         }
     }
+
+    /// The label as the `?` overlay prints it: [`label`](Self::label) plus any [`overlay_note`]
+    /// qualifier. The footer uses `label` and so never shows the note.
+    #[must_use]
+    pub(crate) fn overlay_label(&self) -> String {
+        match self.overlay_note {
+            Some(note) => format!("{} {note}", self.label()),
+            None => self.label(),
+        }
+    }
 }
 
 const fn binding(chord: Chord, verb: &'static str, group: Group) -> Binding {
@@ -205,6 +222,7 @@ const fn binding(chord: Chord, verb: &'static str, group: Group) -> Binding {
         chord,
         verb,
         group: Some(group),
+        overlay_note: None,
     }
 }
 
@@ -214,6 +232,7 @@ const fn footer_only(chord: Chord, verb: &'static str) -> Binding {
         chord,
         verb,
         group: None,
+        overlay_note: None,
     }
 }
 
@@ -230,7 +249,14 @@ pub(crate) const CHOOSE: Binding = binding(LEFT_RIGHT, "choose", Group::Modals);
 pub(crate) const CONFIRM: Binding = binding(ENTER, "confirm", Group::Modals);
 pub(crate) const MODAL_CANCEL: Binding = binding(ESC, "cancel", Group::Modals);
 pub(crate) const RUN_CANCEL: Binding = binding(CTRL_C, "cancel", Group::Run);
-pub(crate) const CLOSE: Binding = binding(ENTER, "close", Group::Run);
+pub(crate) const CLOSE: Binding = Binding {
+    chord: ENTER,
+    verb: "close",
+    group: Some(Group::Run),
+    // `Enter close` is only live once the run is terminal; the footer omits this (a running RUN
+    // shows no `Enter` hint), the overlay carries it.
+    overlay_note: Some("(when done)"),
+};
 pub(crate) const UNLOCK: Binding = footer_only(ENTER, "unlock");
 pub(crate) const SCROLL: Binding = footer_only(UP_DOWN_SLASH, "scroll");
 /// The restore unlock reveal toggle; the footer flips its verb to `hide` while revealed (a state
@@ -242,26 +268,10 @@ pub(crate) const REVEAL: Binding = footer_only(F2, "reveal");
 /// the drift-guard and overlay-coverage tests read.
 pub(crate) const CATALOG: &[Binding] = &[
     // Move
-    Binding {
-        chord: UP_DOWN,
-        verb: "",
-        group: Some(Group::Move),
-    },
-    Binding {
-        chord: PGUP_PGDN,
-        verb: "",
-        group: Some(Group::Move),
-    },
-    Binding {
-        chord: HOME_END,
-        verb: "",
-        group: Some(Group::Move),
-    },
-    Binding {
-        chord: TYPE_JUMP,
-        verb: "",
-        group: Some(Group::Move),
-    },
+    binding(UP_DOWN, "", Group::Move),
+    binding(PGUP_PGDN, "", Group::Move),
+    binding(HOME_END, "", Group::Move),
+    binding(TYPE_JUMP, "", Group::Move),
     // Panes
     binding(TAB_SHIFT_TAB, "focus", Group::Panes),
     binding(RIGHT_ENTER, "into dir", Group::Panes),
@@ -291,11 +301,7 @@ pub(crate) const CATALOG: &[Binding] = &[
     CHOOSE,
     CONFIRM,
     MODAL_CANCEL,
-    Binding {
-        chord: TYPE_PLAINTEXT,
-        verb: "",
-        group: Some(Group::Modals),
-    },
+    binding(TYPE_PLAINTEXT, "", Group::Modals),
     // RUN
     RUN_CANCEL,
     CLOSE,
@@ -486,6 +492,52 @@ mod tests {
                 "{:?}: ALT and `Alt-` prefix must agree",
                 chord.spelling
             );
+        }
+    }
+
+    /// The spelling a standard (non-decorative) chord must have, derived from its `code`/`mods`,
+    /// or `None` for the chords whose spelling is a custom glyph the catalog owns deliberately:
+    /// the arrow chords (`→`/`←` are decorative per #61) and the display-only composites (whose
+    /// `code` is only a representative key). This is the derivation the doc comment on [`Chord`]
+    /// claims for standard chords; the test below enforces it so a spelling can't silently name a
+    /// different key than it binds (`plain("Entr", KeyCode::Enter)` must fail).
+    fn derived_spelling(chord: Chord) -> Option<String> {
+        let base = match chord.code {
+            KeyCode::Enter => "Enter".to_owned(),
+            KeyCode::Esc => "Esc".to_owned(),
+            KeyCode::Char(' ') => "Space".to_owned(),
+            KeyCode::Char(c) => c.to_ascii_uppercase().to_string(),
+            KeyCode::F(n) => format!("F{n}"),
+            _ => return None,
+        };
+        let prefix = if chord.mods.contains(KeyModifiers::CONTROL) {
+            "Ctrl-"
+        } else if chord.mods.contains(KeyModifiers::ALT) {
+            "Alt-"
+        } else {
+            ""
+        };
+        Some(format!("{prefix}{base}"))
+    }
+
+    /// Spelling ⟷ bound key consistency: a standard chord's spelling is exactly what
+    /// [`derived_spelling`] computes from its `code`/`mods`, so the spelling names the key it
+    /// binds (not just the right modifier prefix). Decorative-glyph and composite chords are
+    /// exempt by construction (`derived_spelling` returns `None` for them).
+    #[test]
+    fn standard_chord_spelling_is_derivable_from_its_key() {
+        let chords = CATALOG
+            .iter()
+            .map(|b| b.chord)
+            .chain(RESERVED.iter().copied());
+        for chord in chords {
+            if let Some(expected) = derived_spelling(chord) {
+                assert_eq!(
+                    chord.spelling, expected,
+                    "spelling must name the key it binds ({:?})",
+                    chord.code
+                );
+            }
         }
     }
 

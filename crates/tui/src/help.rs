@@ -47,7 +47,7 @@ fn group_keys(group: Group) -> String {
     keymap::CATALOG
         .iter()
         .filter(|binding| binding.group == Some(group))
-        .map(Binding::label)
+        .map(Binding::overlay_label)
         .collect::<Vec<_>>()
         .join(keymap::SEP)
 }
@@ -66,14 +66,18 @@ pub fn line_count() -> u16 {
 /// content clips and `scroll` brings the rest into view (the app clamps `scroll` to
 /// [`line_count`]).
 pub fn render(frame: &mut Frame, area: Rect, scroll: u16) {
+    let rows = rows();
+    let line_total = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1);
     // Wide enough for the longest binding row, but never wider than the terminal.
     let width = area.width.min(80);
     // Room for every group plus the two border rows; clamped to the terminal so a short screen
     // gets a full-height panel it can scroll rather than an over-tall one.
-    let height = area.height.min(line_count().saturating_add(2));
+    let height = area.height.min(line_total.saturating_add(2));
     let panel = centered(width, height, area);
 
-    let mut lines: Vec<Line<'static>> = rows()
+    let mut lines: Vec<Line<'static>> = rows
         .into_iter()
         .map(|(label, keys)| {
             if label.is_empty() && keys.is_empty() {
@@ -135,6 +139,27 @@ mod tests {
                 assert!(
                     rendered.contains(&label),
                     "overlay is missing catalog binding {label:?}"
+                );
+            }
+        }
+    }
+
+    /// A binding's [`overlay_note`](keymap::Binding::overlay_note) qualifier renders in the panel,
+    /// not just its bare label — so `Enter close` keeps its `(when done)` context the overlay has
+    /// always shown (guarding against dropping it back to the bare footer label).
+    #[test]
+    fn overlay_notes_render_in_the_panel() {
+        let rendered = rows()
+            .into_iter()
+            .map(|(_, keys)| keys)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for binding in keymap::CATALOG {
+            if binding.group.is_some() {
+                let label = binding.overlay_label();
+                assert!(
+                    rendered.contains(&label),
+                    "overlay is missing binding with note {label:?}"
                 );
             }
         }

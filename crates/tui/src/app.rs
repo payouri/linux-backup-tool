@@ -272,7 +272,7 @@ impl App {
         // cancel (the run is abandoned as the app tears down — `core` is synchronous with no
         // cooperative cancellation, so aborting the process is the honest cancel here). Handled
         // before the help overlay so it aborts even with the overlay open.
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if crate::keymap::CTRL_C.matches(&key) {
             self.should_quit = true;
             return self;
         }
@@ -486,9 +486,11 @@ impl App {
 /// typed digit must reach the field; `Esc` closes the field first while typing, else steps back.
 /// Everything else — typing, the candidate list, `Tab`/`→`/`Enter` — is the screen's.
 fn where_key_targets_screen(key: KeyEvent, typing: bool) -> bool {
+    if crate::keymap::CTRL_LEFT.matches(&key) || crate::keymap::CTRL_RIGHT.matches(&key) {
+        return false;
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Left | KeyCode::Right if ctrl => false,
         KeyCode::Char(c) if !ctrl && WizardStep::from_digit(c).is_some() => typing,
         KeyCode::Esc => typing,
         _ => true,
@@ -501,8 +503,7 @@ fn where_key_targets_screen(key: KeyEvent, typing: bool) -> bool {
 /// everything else — typing, the candidate list, `Tab`/`→`/`Enter`, `Esc` (which closes the
 /// field), and a typed `1`–`4` digit — is the field's.
 fn what_field_targets_screen(key: KeyEvent) -> bool {
-    !(key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Left | KeyCode::Right))
+    !(crate::keymap::CTRL_LEFT.matches(&key) || crate::keymap::CTRL_RIGHT.matches(&key))
 }
 
 /// Seeds a wizard from a Smart-default Selection and the context's Output location. This is
