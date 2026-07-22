@@ -28,6 +28,8 @@ use linux_backup_core::crypto;
 use linux_backup_core::model::SelectionModel;
 use secrecy::SecretString;
 
+use crate::encryption_screen::{Commit, EncryptionScreen, ModalOutcome};
+
 /// The four fixed wizard steps, in graph order (ADR-0007 D1). Order is conveyed by position
 /// (the stepper is not numbered, #50), so the discriminant order is the render order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +142,8 @@ pub enum GateReason {
     /// Encryption is incomplete: a Sensitive Selection has no passphrase and Auto-insist has
     /// not been disabled.
     EnterPassphrase,
+    /// Encryption forward refused because the passphrase and confirm fields differ (#61).
+    PassphrasesDoNotMatch,
     /// WHERE is incomplete: no Output location has been chosen.
     MissingBackupLocation,
 }
@@ -151,6 +155,7 @@ impl GateReason {
         match self {
             Self::NothingSelected => "Nothing selected",
             Self::EnterPassphrase => "Enter a passphrase",
+            Self::PassphrasesDoNotMatch => "Passphrases do not match",
             Self::MissingBackupLocation => "Missing backup location",
         }
     }
@@ -363,6 +368,10 @@ pub struct Wizard {
     state: WizardState,
     current: WizardStep,
     gate_banner: Option<GateReason>,
+    /// The encryption step's view state (input buffers, focus, the plaintext modal). Persists
+    /// for the session so a backward jump to encryption re-renders the earlier field contents.
+    /// Boxed to keep it off the [`crate::app::View`] enum's inline footprint.
+    encryption_screen: Box<EncryptionScreen>,
 }
 
 impl Wizard {
@@ -373,6 +382,7 @@ impl Wizard {
             state,
             current: WizardStep::What,
             gate_banner: None,
+            encryption_screen: Box::new(EncryptionScreen::default()),
         }
     }
 
@@ -380,6 +390,12 @@ impl Wizard {
     #[must_use]
     pub fn state(&self) -> &WizardState {
         &self.state
+    }
+
+    /// The encryption step's view state, for its render (build #69).
+    #[must_use]
+    pub fn encryption_screen(&self) -> &EncryptionScreen {
+        &self.encryption_screen
     }
 
     /// The step the wizard is currently on.
@@ -425,6 +441,12 @@ impl Wizard {
     pub fn handle_key(mut self, key: KeyEvent) -> Self {
         self.gate_banner = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // On the encryption step the screen body owns the plain keys (typing into the fields,
+        // the modal), so route there; the global step chords stay live inside it (build #69).
+        if self.current == WizardStep::Encryption {
+            self.handle_encryption_key(key, ctrl);
+            return self;
+        }
         match key.code {
             // Esc means back/close, never quit (ADR-0005 D-keymap): step back one, inert at
             // WHAT where there is nothing to close to.
@@ -469,6 +491,85 @@ impl Wizard {
     fn jump_to(&mut self, target: WizardStep) {
         if self.state.is_reachable(target) {
             self.current = target;
+        }
+    }
+
+    /// Folds one key while the encryption step is current (build #69). Global chords keep their
+    /// meaning (`Ctrl-→` forward, `Ctrl-←`/`Esc` back); everything else goes to the screen body.
+    /// A plain key the body doesn't consume falls back to the `1`–`4` step-jump, so a digit is
+    /// suppressed exactly while a text field has focus (#51).
+    fn handle_encryption_key(&mut self, key: KeyEvent, ctrl: bool) {
+        // The plaintext modal is captive: every key routes to it while it is open.
+        if self.encryption_screen.is_modal_open() {
+            if self.encryption_screen.handle_modal_key(key) == ModalOutcome::ConfirmPlaintext {
+                // Disabling Auto-insist for a Sensitive Selection: a plaintext decision covering
+                // the named set (ADR-0007's second-confirmation escape).
+                self.state.choose_plaintext();
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.step_back(),
+            KeyCode::Right if ctrl => self.encryption_forward(),
+            KeyCode::Left if ctrl => self.step_back(),
+            // Swallow the other global chords (e.g. Ctrl-A/Ctrl-D) so they never type a char.
+            _ if ctrl => {}
+            _ => {
+                let sensitive = self.state.is_sensitive();
+                let consumed = self.encryption_screen.handle_plain_key(key, sensitive);
+                if !consumed
+                    && let KeyCode::Char(c) = key.code
+                    && let Some(target) = WizardStep::from_digit(c)
+                {
+                    self.jump_to(target);
+                }
+            }
+        }
+    }
+
+    /// The encryption step's gated forward move (build #69). Commits a typed passphrase (the
+    /// safe harbor) or records the plaintext decision, then advances; a bad passphrase raises
+    /// the specific gate banner (#61) instead.
+    fn encryption_forward(&mut self) {
+        let sensitive = self.state.is_sensitive();
+        if sensitive {
+            match self.encryption_screen.commit() {
+                Commit::Passphrase(secret) => {
+                    self.state.set_passphrase(secret);
+                    self.advance_from_encryption();
+                }
+                // An empty field is fine only if a decision already exists — a passphrase set
+                // earlier, or plaintext confirmed through the modal (both make it complete).
+                Commit::Empty => {
+                    if self.state.encryption_complete() {
+                        self.advance_from_encryption();
+                    } else {
+                        self.gate_banner = Some(GateReason::EnterPassphrase);
+                    }
+                }
+                Commit::Mismatch => self.gate_banner = Some(GateReason::PassphrasesDoNotMatch),
+            }
+        } else if self.encryption_screen.encrypt_opt_in() {
+            match self.encryption_screen.commit() {
+                Commit::Passphrase(secret) => {
+                    self.state.set_passphrase(secret);
+                    self.advance_from_encryption();
+                }
+                Commit::Empty => self.gate_banner = Some(GateReason::EnterPassphrase),
+                Commit::Mismatch => self.gate_banner = Some(GateReason::PassphrasesDoNotMatch),
+            }
+        } else {
+            // Offered mode, staying plaintext: record the decision (resets any prior passphrase)
+            // and advance. Non-Sensitive, so the baseline covers the empty Sensitive set.
+            self.state.choose_plaintext();
+            self.advance_from_encryption();
+        }
+    }
+
+    /// Advances off the encryption step to WHERE once a decision exists.
+    fn advance_from_encryption(&mut self) {
+        if let Some(next) = WizardStep::Encryption.next() {
+            self.current = next;
         }
     }
 }

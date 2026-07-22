@@ -88,6 +88,11 @@ pub struct App {
     /// (the reducer stays pure — it records the request, it doesn't touch a thread). `None`
     /// whenever no launch is pending.
     pending_backup: Option<BackupRequest>,
+    /// The view-only passphrase-reveal flag `F2` toggles (#51). It lives here, around the
+    /// model, and is read only by the encryption body's render — the passphrase itself stays a
+    /// `secrecy::SecretString`; reveal formats `expose_secret()` for one frame and retains
+    /// nothing, so this bool is the whole of what a reveal persists.
+    reveal: bool,
 }
 
 impl App {
@@ -106,6 +111,7 @@ impl App {
             run_context,
             should_quit: false,
             pending_backup: None,
+            reveal: false,
         }
     }
 
@@ -173,6 +179,12 @@ impl App {
             self.should_quit = true;
             return self;
         }
+        // F2 is the passphrase-reveal chord (#51): a view-only toggle handled here so it stays
+        // live regardless of which field owns plain keys, and never reaches the reducer as text.
+        if key.code == KeyCode::F(2) {
+            self.reveal = !self.reveal;
+            return self;
+        }
         match self.view {
             // Plain `Enter` on REVIEW launches the backup (#39: not `Ctrl-Enter`, which some
             // terminals swallow); any other key drives the wizard.
@@ -234,7 +246,9 @@ impl App {
             return;
         }
         match &self.view {
-            View::Wizard(wizard) => render_wizard(frame, area, wizard, tier, &self.run_context),
+            View::Wizard(wizard) => {
+                render_wizard(frame, area, wizard, tier, &self.run_context, self.reveal);
+            }
             View::Run(run) => crate::run_screen::render(frame, area, run, tier),
             View::Placeholder(screen) => render_placeholder(frame, area, *screen),
         }
@@ -290,6 +304,7 @@ fn render_wizard(
     wizard: &Wizard,
     tier: ReflowTier,
     ctx: &RunContext,
+    reveal: bool,
 ) {
     let banner_rows = u16::from(wizard.gate_banner().is_some());
     let chunks = Layout::vertical([
@@ -304,7 +319,7 @@ fn render_wizard(
     if banner_rows > 0 {
         render_gate_banner(frame, chunks[1], wizard);
     }
-    render_body(frame, chunks[2], wizard, ctx);
+    render_body(frame, chunks[2], wizard, ctx, reveal);
     render_footer(frame, chunks[3], wizard, tier);
 }
 
@@ -400,10 +415,14 @@ fn render_gate_banner(frame: &mut Frame, area: Rect, wizard: &Wizard) {
     frame.render_widget(banner, area);
 }
 
-/// The body region — the only part that swaps between steps. REVIEW renders its summary here
-/// (this build); the WHAT/encryption/WHERE bodies land in sibling builds #68–#70/#72 and stay
-/// placeholders until then.
-fn render_body(frame: &mut Frame, area: Rect, wizard: &Wizard, ctx: &RunContext) {
+/// The body region — the only part that swaps between steps. The encryption body (build #69)
+/// and the REVIEW summary (build #71) render here; the remaining bodies (WHAT / WHERE) stay
+/// placeholders until their builds (#68/#70/#72).
+fn render_body(frame: &mut Frame, area: Rect, wizard: &Wizard, ctx: &RunContext, reveal: bool) {
+    if wizard.current() == WizardStep::Encryption {
+        crate::encryption_screen::render(frame, area, wizard, reveal);
+        return;
+    }
     if wizard.current() == WizardStep::Review {
         frame.render_widget(Paragraph::new(review_lines(wizard.state(), ctx)), area);
         return;
@@ -544,7 +563,7 @@ mod tests {
     use crossterm::event::KeyEventKind;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
     use linux_backup_core::model::{Entry, EntryRoot, EntryType};
@@ -590,6 +609,7 @@ mod tests {
             run_context: test_context(),
             should_quit: false,
             pending_backup: None,
+            reveal: false,
         }
     }
 
@@ -872,6 +892,159 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("where")),
             "expected the mode label, got: {lines:?}"
+        );
+    }
+
+    /// A `KeyEvent` for driving the wizard reducer through `App::update`.
+    fn kev(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new_with_kind(
+            code,
+            modifiers,
+            KeyEventKind::Press,
+        ))
+    }
+
+    /// Types `text` into the focused field by folding one plain-char key per character.
+    fn type_into(app: App, text: &str) -> App {
+        text.chars().fold(app, |a, c| {
+            a.update(kev(KeyCode::Char(c), KeyModifiers::NONE))
+        })
+    }
+
+    /// A non-Sensitive wizard advanced onto the encryption step with the opt-in encrypt path
+    /// selected and its passphrase field focused — the offered-mode entry point.
+    fn offered_encryption_typing() -> App {
+        app_with_wizard(non_sensitive_wizard())
+            .update(kev(KeyCode::Right, KeyModifiers::CONTROL)) // WHAT → Encryption
+            .update(kev(KeyCode::Right, KeyModifiers::NONE)) // radio → Encrypt with a passphrase
+            .update(kev(KeyCode::Tab, KeyModifiers::NONE)) // focus the passphrase field
+    }
+
+    #[test]
+    fn encryption_offered_screen_masks_the_passphrase_then_reveals_it_on_f2() {
+        let app = type_into(offered_encryption_typing(), "hunter2");
+        let masked = rendered_lines(&app, 80, 24);
+        assert!(
+            masked.iter().any(|l| l.contains("•••••••")),
+            "expected a masked passphrase, got: {masked:?}"
+        );
+        assert!(
+            !masked.iter().any(|l| l.contains("hunter2")),
+            "the plaintext passphrase must not appear while masked, got: {masked:?}"
+        );
+
+        // F2 reveals the passphrase for the frame; the same masked render returns once hidden.
+        let revealed = app.update(kev(KeyCode::F(2), KeyModifiers::NONE));
+        let revealed_lines = rendered_lines(&revealed, 80, 24);
+        assert!(
+            revealed_lines.iter().any(|l| l.contains("hunter2")),
+            "expected the revealed passphrase, got: {revealed_lines:?}"
+        );
+
+        // Toggling reveal off again masks identically — the SecretString was never consumed or
+        // cleared by a reveal, so no plaintext copy is retained across frames.
+        let hidden_again = revealed.update(kev(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(rendered_lines(&hidden_again, 80, 24), masked);
+    }
+
+    #[test]
+    fn encryption_screen_shows_the_live_match_indicator() {
+        // Matching passphrase + confirm → the match indicator.
+        let app = type_into(offered_encryption_typing(), "hunter2");
+        let app = app.update(kev(KeyCode::Tab, KeyModifiers::NONE)); // focus Confirm
+        let app = type_into(app, "hunter2");
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("passphrases match")),
+            "expected the match indicator, got: {lines:?}"
+        );
+
+        // A differing confirm → the mismatch indicator.
+        let mismatch = type_into(offered_encryption_typing(), "hunter2");
+        let mismatch = mismatch.update(kev(KeyCode::Tab, KeyModifiers::NONE));
+        let mismatch = type_into(mismatch, "hunterX");
+        let lines = rendered_lines(&mismatch, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("do not match")),
+            "expected the mismatch indicator, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn encryption_screen_renders_the_invalidation_banner() {
+        // A completed plaintext decision undone by newly-added Sensitive content.
+        let mut state = WizardState::new(
+            SelectionModel::new(vec![entry("Shell", false, ".zshrc")]),
+            Some(PathBuf::from("/home/tester")),
+        );
+        state.selection_mut().add_custom_path(
+            Path::new("/home/tester/.ssh/id_ed25519"),
+            Path::new("/home/tester"),
+        );
+        // Jump to the collapsed-to encryption step and render its body.
+        let app =
+            app_with_wizard(Wizard::new(state)).update(kev(KeyCode::Char('2'), KeyModifiers::NONE));
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("Sensitive content added")),
+            "expected the invalidation banner, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn encryption_screen_required_mode_names_sensitive_categories() {
+        let app =
+            app_with_wizard(sensitive_wizard()).update(kev(KeyCode::Right, KeyModifiers::CONTROL));
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("Sensitive Categories")),
+            "expected the required-mode Sensitive Categories line, got: {lines:?}"
+        );
+        // The prose may wrap across rows, so assert against the joined (unpadded) body text.
+        let prose = lines
+            .iter()
+            .map(|l| l.trim_end())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            prose.contains("whole Archive will be encrypted"),
+            "expected the required-mode prose, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn plaintext_modal_renders_over_the_encryption_body() {
+        // Sensitive → required; Tab to the disable button and open the modal.
+        let app = app_with_wizard(sensitive_wizard())
+            .update(kev(KeyCode::Right, KeyModifiers::CONTROL)) // → Encryption
+            .update(kev(KeyCode::Tab, KeyModifiers::NONE)) // Passphrase → Confirm
+            .update(kev(KeyCode::Tab, KeyModifiers::NONE)) // Confirm → Disable
+            .update(kev(KeyCode::Enter, KeyModifiers::NONE)); // open modal
+        let lines = rendered_lines(&app, 80, 24);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Write credentials in plaintext?"),
+            "expected the modal title, got: {lines:?}"
+        );
+        assert!(
+            joined.contains("PLAINTEXT"),
+            "expected the confirmation prompt, got: {lines:?}"
+        );
+        assert!(
+            joined.contains("[ Cancel ]") && joined.contains("[ Confirm ]"),
+            "expected both modal buttons, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn encryption_forward_gates_on_a_matched_passphrase() {
+        // Opt-in encrypt, type a passphrase without confirming → forward refused, do-not-match.
+        let app = type_into(offered_encryption_typing(), "hunter2")
+            .update(kev(KeyCode::Right, KeyModifiers::CONTROL));
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("Passphrases do not match")),
+            "expected the mismatch gate banner, got: {lines:?}"
         );
     }
 }

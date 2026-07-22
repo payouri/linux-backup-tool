@@ -22,6 +22,7 @@
 
 mod app;
 mod cli;
+mod encryption_screen;
 mod reflow;
 mod run_screen;
 mod runtime;
