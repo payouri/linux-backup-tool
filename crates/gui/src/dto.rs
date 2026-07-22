@@ -2,7 +2,30 @@
 //! accessors via `From` (ADR-0008 Decision 2). `core` gains zero net-new `serde` derives —
 //! serialization lives entirely here, in `gui`.
 
-use linux_backup_core::SelectionModel;
+use linux_backup_core::{DirectoryState, SelectionModel};
+
+/// The wire-safe mirror of [`DirectoryState`] (ADR-0006's tri-state, issue #100's per-node
+/// state). `lowercase` on the wire (`"all"`/`"partial"`/`"none"`) to read as a plain TS
+/// string-literal union on the frontend, matching [`TreeNodeKindDto`]'s own casing choice.
+///
+/// [`TreeNodeKindDto`]: crate::tree::TreeNodeKindDto
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DirectoryStateDto {
+    All,
+    Partial,
+    None,
+}
+
+impl From<DirectoryState> for DirectoryStateDto {
+    fn from(state: DirectoryState) -> Self {
+        match state {
+            DirectoryState::All => Self::All,
+            DirectoryState::Partial => Self::Partial,
+            DirectoryState::None => Self::None,
+        }
+    }
+}
 
 /// The response to the lazy `["selection-summary"]` query (ADR-0008 Decision 2 "Views
 /// out"): counts, total size, emptiness, whether Auto-insist requires encryption, and any
@@ -38,8 +61,25 @@ mod tests {
     use std::path::PathBuf;
 
     use linux_backup_core::model::{Entry, EntryRoot, EntryType, SelectionModel};
+    use linux_backup_core::DirectoryState;
 
-    use super::SelectionSummaryDto;
+    use super::{DirectoryStateDto, SelectionSummaryDto};
+
+    #[test]
+    fn directory_state_dto_mirrors_each_core_variant() {
+        assert_eq!(
+            DirectoryStateDto::from(DirectoryState::All),
+            DirectoryStateDto::All
+        );
+        assert_eq!(
+            DirectoryStateDto::from(DirectoryState::Partial),
+            DirectoryStateDto::Partial
+        );
+        assert_eq!(
+            DirectoryStateDto::from(DirectoryState::None),
+            DirectoryStateDto::None
+        );
+    }
 
     fn entry(category: &'static str, sensitive: bool, name: &str) -> Entry {
         Entry {

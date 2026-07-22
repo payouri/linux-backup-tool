@@ -35,6 +35,11 @@ impl From<&CoreError> for SerializableCoreError {
 fn kind_tag(error: &CoreError) -> &'static str {
     match error {
         CoreError::NotImplemented(_) => "not_implemented",
+        // A cancelled backup is rendered neutrally, never as a failure (ADR-0008 Decision 3:
+        // `RunOutcome::Cancelled`, not `Failed`) — this tag exists only so
+        // `SerializableCoreError::from` stays exhaustive over `CoreError` should a caller
+        // ever flatten a `Cancelled` through the generic error path instead of the
+        // `RunOutcome` mapping.
         CoreError::Cancelled => "cancelled",
         CoreError::BackupDirExists(_) => "backup_dir_exists",
         CoreError::EmptySelection => "empty_selection",

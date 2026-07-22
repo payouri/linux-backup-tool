@@ -13,22 +13,26 @@ mod dto;
 mod error;
 mod run_context;
 mod state;
+mod tree;
 
-pub use dto::SelectionSummaryDto;
+pub use dto::{DirectoryStateDto, SelectionSummaryDto};
 pub use error::SerializableCoreError;
+pub use tree::{category_children, category_nodes, TreeNodeDto, TreeNodeKindDto};
 
-use linux_backup_core::{scan, RunContext, SelectionModel};
+use linux_backup_core::scan::CategoryScan;
+use linux_backup_core::{scan, SelectionModel};
 
-use state::SelectionState;
+use state::{RunContextState, ScanCacheState, SelectionState};
 
-/// Builds the initial `SelectionModel` a fresh GUI window opens on: a full taxonomy scan
-/// over the injected `RunContext` filtered to each Category's Smart default — the exact
-/// derivation `tui`'s `seed_wizard` (`crates/tui/src/app.rs`) performs for the ratatui
-/// wizard, so both surfaces open on the same Selection for identical inputs (spec #97,
-/// story 4).
-fn seed_selection(ctx: &RunContext) -> SelectionModel {
-    let scanned = scan::scan_taxonomy(ctx);
-    SelectionModel::from_smart_defaults(&scanned)
+/// Builds the initial `SelectionModel` a fresh GUI window opens on: `scanned` filtered to
+/// each Category's Smart default — the exact derivation `tui`'s `seed_wizard`
+/// (`crates/tui/src/app.rs`) performs for the ratatui wizard, so both surfaces open on the
+/// same Selection for identical inputs (spec #97, story 4). Takes the already-scanned
+/// taxonomy rather than a `RunContext` so `run` below scans the filesystem exactly once and
+/// shares that one result with both the seeded Selection and the cached
+/// [`state::ScanCacheState`] the `tree`/`select_category` commands read from thereafter.
+fn seed_selection(scanned: &[CategoryScan]) -> SelectionModel {
+    SelectionModel::from_smart_defaults(scanned)
 }
 
 /// Builds and runs the Tauri application. Kept out of `main.rs` so the walking skeleton's
@@ -41,7 +45,8 @@ fn seed_selection(ctx: &RunContext) -> SelectionModel {
 /// [`run_context::build_run_context`]) or if the Tauri runtime itself fails to start.
 pub fn run() -> anyhow::Result<()> {
     let ctx = run_context::build_run_context()?;
-    let selection = seed_selection(&ctx);
+    let scanned = scan::scan_taxonomy(&ctx);
+    let selection = seed_selection(&scanned);
 
     // `tauri::generate_context!()` expands to `tauri`-crate-owned codegen that unwraps while
     // parsing the `tauri.conf.json` this crate's `build.rs` (`tauri-build`) already
@@ -53,7 +58,19 @@ pub fn run() -> anyhow::Result<()> {
 
     tauri::Builder::default()
         .manage(SelectionState::new(selection))
-        .invoke_handler(tauri::generate_handler![commands::selection_summary])
+        .manage(RunContextState(ctx))
+        .manage(ScanCacheState(scanned))
+        .invoke_handler(tauri::generate_handler![
+            commands::selection_summary,
+            commands::tree,
+            commands::select_category,
+            commands::deselect_category,
+            commands::add_custom_path,
+            commands::deselect_entry,
+            commands::reselect_entry,
+            commands::deselect_root,
+            commands::reselect_root,
+        ])
         .run(context)
         .map_err(|err| anyhow::anyhow!("error while running the Tauri application: {err}"))
 }
