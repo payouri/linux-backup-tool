@@ -18,46 +18,45 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-/// The grouped binding lines, in the prototype's order (#51 §4) extended with the modal and RUN
-/// context groups so the overlay is exhaustive. `(label, keys)` per row; a blank `label` is a
-/// spacer.
-const GROUPS: &[(&str, &str)] = &[
-    ("Move", "↑↓ · PgUp/PgDn · Home/End · type to jump"),
-    (
-        "Panes",
-        "Tab / Shift-Tab focus · →/Enter into dir · ←/Backspace up",
-    ),
-    (
-        "Path field",
-        "Tab/→/End accept candidate · ↑↓ pick sibling · Enter commit",
-    ),
-    (
-        "Select",
-        "Space toggle (dir = whole subtree) · Ctrl-A all · Ctrl-D none",
-    ),
-    (
-        "Steps",
-        "Ctrl-→ next · Ctrl-← back · 1-4 jump · REVIEW: Enter start",
-    ),
-    ("Reveal", "F2 passphrase · F3 hidden files"),
-    ("Global", "F1 keys · Esc back/close · Ctrl-C quit/abort"),
-    (
-        "Modals",
-        "←/→ choose · Enter activate · Esc cancel · type PLAINTEXT",
-    ),
-    ("RUN", "Ctrl-C cancel · Enter close (when done)"),
-    ("", ""),
-    (
-        "Reserved",
-        "never bound by the tool: Ctrl-Z · Ctrl-S · Ctrl-Q · Ctrl-\\",
-    ),
-];
+use crate::keymap::{self, Binding, Group};
+
+/// The overlay's `(heading, keys)` rows, derived from the keymap catalog (#74) so the reference
+/// is never a hand-maintained second copy of the footer's labels. Each group's bindings are the
+/// catalog entries flagged with that group, joined with the catalog separator; a blank row spaces
+/// the reserved group off, which prints [`keymap::RESERVED`] behind a prose lead-in.
+fn rows() -> Vec<(&'static str, String)> {
+    let mut rows: Vec<(&'static str, String)> = keymap::OVERLAY_GROUPS
+        .iter()
+        .map(|&group| (group.heading(), group_keys(group)))
+        .collect();
+    rows.push(("", String::new()));
+    let reserved = keymap::RESERVED
+        .iter()
+        .map(|chord| chord.spelling)
+        .collect::<Vec<_>>()
+        .join(keymap::SEP);
+    rows.push((
+        Group::Reserved.heading(),
+        format!("never bound by the tool: {reserved}"),
+    ));
+    rows
+}
+
+/// The joined key labels for one overlay group, in catalog order.
+fn group_keys(group: Group) -> String {
+    keymap::CATALOG
+        .iter()
+        .filter(|binding| binding.group == Some(group))
+        .map(Binding::label)
+        .collect::<Vec<_>>()
+        .join(keymap::SEP)
+}
 
 /// How many bindings the overlay lists (used by the app to clamp the scroll offset).
 #[must_use]
 pub fn line_count() -> u16 {
-    // The groups plus the trailing "close" hint line.
-    u16::try_from(GROUPS.len())
+    // The group rows plus the trailing "close" hint line.
+    u16::try_from(rows().len())
         .unwrap_or(u16::MAX)
         .saturating_add(1)
 }
@@ -74,8 +73,8 @@ pub fn render(frame: &mut Frame, area: Rect, scroll: u16) {
     let height = area.height.min(line_count().saturating_add(2));
     let panel = centered(width, height, area);
 
-    let mut lines: Vec<Line<'static>> = GROUPS
-        .iter()
+    let mut lines: Vec<Line<'static>> = rows()
+        .into_iter()
         .map(|(label, keys)| {
             if label.is_empty() && keys.is_empty() {
                 Line::default()
@@ -87,7 +86,7 @@ pub fn render(frame: &mut Frame, area: Rect, scroll: u16) {
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(*keys),
+                    Span::raw(keys),
                 ])
             }
         })
@@ -114,4 +113,49 @@ fn centered(width: u16, height: u16, area: Rect) -> Rect {
         .flex(Flex::Center)
         .areas(horizontal);
     vertical
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drift guard (overlay half of #74): every catalog binding flagged in-overlay renders in the
+    /// `?` panel, under its group's row. A binding added to the catalog with a group but missed by
+    /// the overlay render fails here.
+    #[test]
+    fn every_overlay_binding_renders_in_the_panel() {
+        let rendered = rows()
+            .into_iter()
+            .map(|(_, keys)| keys)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for binding in keymap::CATALOG {
+            if binding.group.is_some() {
+                let label = binding.label();
+                assert!(
+                    rendered.contains(&label),
+                    "overlay is missing catalog binding {label:?}"
+                );
+            }
+        }
+    }
+
+    /// Reserved single-source (overlay half of #74): every [`keymap::RESERVED`] chord is printed in
+    /// the panel, from the same set the swallow guard reads.
+    #[test]
+    fn reserved_chords_render_in_the_panel() {
+        let rendered = rows()
+            .into_iter()
+            .map(|(heading, keys)| format!("{heading} {keys}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(Group::Reserved.heading()));
+        for chord in keymap::RESERVED {
+            assert!(
+                rendered.contains(chord.spelling),
+                "overlay is missing reserved chord {:?}",
+                chord.spelling
+            );
+        }
+    }
 }

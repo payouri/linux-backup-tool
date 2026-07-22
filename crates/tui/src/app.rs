@@ -284,10 +284,9 @@ impl App {
             return self;
         }
         // The terminal-reserved chords are never bound (#51): swallow them everywhere so no
-        // screen can act on one. `Ctrl-C` (the sole honored control chord) is handled above.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('z' | 's' | 'q' | '\\'))
-        {
+        // screen can act on one, matching the catalog's reserved set rather than restating it
+        // (#74). `Ctrl-C` (the sole honored control chord) is handled above.
+        if crate::keymap::is_reserved(&key) {
             return self;
         }
         // `F1` opens the exhaustive help overlay from anywhere (#51 Global / #77). It rides an
@@ -784,7 +783,7 @@ fn review_lines(state: &WizardState, ctx: &RunContext, glyphs: Glyphs) -> Vec<Li
         Line::from("(To change anything, press 1–4 to jump back to a step.)"),
         Line::default(),
         Line::from(Span::styled(
-            "Enter start backup",
+            crate::keymap::START_BACKUP.label(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -836,35 +835,14 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// The fixed footer hints, degrading down the reflow ladder but always keeping `F1 keys` (#50).
+/// Every label comes from the keymap catalog (#74) — the footer never spells a chord itself.
 fn render_footer(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTier) {
     // REVIEW is terminal — the forward action is launching the run, so its footer leads with
     // `Enter start backup` rather than the `Ctrl-→ next` the earlier steps show (#61).
-    if wizard.current() == WizardStep::Review {
-        let hints = match tier {
-            ReflowTier::Comfortable | ReflowTier::Default => {
-                "Enter start backup · Ctrl-← back · 1-4 jump · F1 keys"
-            }
-            ReflowTier::Tight => "Enter start backup · Ctrl-← back · F1 keys",
-            ReflowTier::Minimum | ReflowTier::Refuse => "Enter start backup · F1 keys",
-        };
-        frame.render_widget(
-            Paragraph::new(hints).style(Style::default().add_modifier(Modifier::DIM)),
-            area,
-        );
-        return;
-    }
-    let forward_hint = if wizard.state().step_complete(wizard.current()) {
-        "Ctrl-→ next"
+    let hints = if wizard.current() == WizardStep::Review {
+        crate::keymap::wizard_review_footer(tier)
     } else {
-        // The forward chord dims when the current step is incomplete (#61).
-        "Ctrl-→ next (locked)"
-    };
-    let hints = match tier {
-        ReflowTier::Comfortable | ReflowTier::Default => {
-            format!("{forward_hint} · Ctrl-← back · 1-4 jump · Esc back · F1 keys")
-        }
-        ReflowTier::Tight => format!("{forward_hint} · Ctrl-← back · F1 keys"),
-        ReflowTier::Minimum | ReflowTier::Refuse => format!("{forward_hint} · F1 keys"),
+        crate::keymap::wizard_step_footer(wizard.state().step_complete(wizard.current()), tier)
     };
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().add_modifier(Modifier::DIM)),

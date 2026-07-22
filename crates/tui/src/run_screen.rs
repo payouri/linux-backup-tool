@@ -321,11 +321,12 @@ pub fn render(
 
 /// The footer hint: `Ctrl-C cancel` while running (the user needs only that Ctrl-C cancels),
 /// `Enter close` once terminal (#61 copy). Both keep the `F1 keys` pointer to the exhaustive
-/// overlay that the footer always carries on every screen (#51).
-fn footer_hint(activity: &RunActivity) -> &'static str {
+/// overlay that the footer always carries on every screen (#51). Labels come from the keymap
+/// catalog (#74).
+fn footer_hint(activity: &RunActivity) -> String {
     match activity {
-        RunActivity::Running(_) => "Ctrl-C cancel · F1 keys",
-        _ => "Enter close · F1 keys",
+        RunActivity::Running(_) => crate::keymap::running_footer(),
+        _ => crate::keymap::close_footer(),
     }
 }
 

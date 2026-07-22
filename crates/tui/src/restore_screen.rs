@@ -51,6 +51,7 @@ use ratatui::Frame;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::glyphs::Glyphs;
+use crate::keymap;
 use crate::reflow::ReflowTier;
 
 /// A passphrase being typed: the canonical store is a [`SecretString`], never a retained plain
@@ -916,22 +917,16 @@ fn verify_detail_lines(verify: &VerifyReport, bullet: &str, capacity: usize) -> 
     problems
 }
 
-/// The footer hint fragments per stage (lowercase, terse — #61), always keeping `F1 keys`.
+/// The footer hint per stage (lowercase, terse — #61), always keeping `F1 keys`. Every label
+/// comes from the keymap catalog (#74) — the footer never spells a chord itself.
 fn footer_hints(flow: &RestoreFlow, _tier: ReflowTier) -> String {
     match &flow.stage {
-        Stage::Confirm { .. } => "←→ choose · Enter confirm · Esc cancel · F1 keys".to_owned(),
-        Stage::Unlock(unlock) => {
-            let reveal = if unlock.reveal {
-                "F2 hide"
-            } else {
-                "F2 reveal"
-            };
-            format!("Enter unlock · {reveal} · Esc cancel · F1 keys")
-        }
-        Stage::Running(_) => "Ctrl-C cancel · F1 keys".to_owned(),
-        Stage::Report(Report::Partial { .. }) => "↑/↓ scroll · Enter close · F1 keys".to_owned(),
-        Stage::Report(_) => "Enter close · F1 keys".to_owned(),
-        Stage::Exit => "F1 keys".to_owned(),
+        Stage::Confirm { .. } => keymap::restore_confirm_footer(),
+        Stage::Unlock(unlock) => keymap::restore_unlock_footer(unlock.reveal),
+        Stage::Running(_) => keymap::running_footer(),
+        Stage::Report(Report::Partial { .. }) => keymap::report_footer(true),
+        Stage::Report(_) => keymap::report_footer(false),
+        Stage::Exit => keymap::help_only_footer(),
     }
 }
 
