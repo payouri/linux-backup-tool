@@ -1,4 +1,5 @@
-//! The RUN screen: the one polling screen, its worker-thread bridge, and its widget state.
+//! The RUN screen: one of the two polling screen (the other being the running restore screen),
+//! its worker-thread bridge, and its widget state.
 //!
 //! Per ADR-0005 D4 / spec #62, `core::backup` runs unchanged on a `std::thread` worker; a
 //! tui-side [`ChannelProgress`] forwards its `on_phase`/`on_entry` callbacks over a
