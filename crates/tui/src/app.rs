@@ -165,7 +165,12 @@ impl App {
     /// report for an invalid dir.
     #[must_use]
     pub fn new_restore(args: RestoreArgs, run_context: RunContext, glyphs: Glyphs) -> Self {
-        let flow = RestoreFlow::new(args.backup_dir, run_context.clone());
+        let flow = RestoreFlow::new(
+            args.backup_dir,
+            run_context.clone(),
+            args.verify,
+            args.overwrite,
+        );
         Self {
             view: View::Restore(flow),
             // Restore never enters the wizard, so its WHERE body is inert and no backup launch

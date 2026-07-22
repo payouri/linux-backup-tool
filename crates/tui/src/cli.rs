@@ -16,10 +16,13 @@ pub struct RestoreArgs {
     pub backup_dir: PathBuf,
     /// Story 57: opt-in checksum re-verification pass after restore.
     pub verify: bool,
-    /// `--overwrite`: overwrite colliding restore targets non-interactively, for scripted/AFK
-    /// runs (issue #37). Defaults to `false`, in which case a collision instead triggers the
-    /// restore flow's overwrite-confirm screen before anything is clobbered — declining leaves
-    /// the existing file untouched. Either way `core::restore` never silently overwrites.
+    /// `--overwrite`: pre-consent to overwriting on the command line, for scripted/AFK runs
+    /// (issue #37). The interactive overwrite-confirm screen *is* the whole-run overwrite
+    /// consent (#76), so passing this flag skips it — an encrypted Backup still opens on the
+    /// passphrase-unlock screen (the passphrase is required regardless), a plaintext one launches
+    /// the run straight away. Defaults to `false`, in which case the flow opens on the
+    /// overwrite-confirm screen as usual. Either way `core::restore` never silently overwrites:
+    /// the consent is explicit, given either up front here or on that screen.
     pub overwrite: bool,
 }
 

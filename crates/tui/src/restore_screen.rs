@@ -23,6 +23,11 @@
 //! - **Best-effort partial report** (ADR-0002): success, or the failed Entries as
 //!   `• <path> — <os error>`, scrolled and truncated with `… (+N more)` when they overflow.
 //!
+//! Two CLI flags shape the flow's entry and exit (#76): `--overwrite` pre-consents to the
+//! overwrite-confirm on the command line, so the flow skips that screen (an encrypted Backup
+//! still opens on unlock); `--verify` (story 57 / #29) runs `core`'s post-restore checksum pass
+//! on the worker after a successful restore and surfaces its [`VerifyReport`] in the result.
+//!
 //! Like the RUN screen (ADR-0005 D4), the restore runs on a `std::thread` worker and its
 //! [`Progress`] is bridged over a `std::sync::mpsc` channel — no async, no `tokio`. The launch
 //! transition is the one impure step in the reducer (it spawns the worker); every other
@@ -34,7 +39,9 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use linux_backup_core::progress::{Phase, Progress};
-use linux_backup_core::restore::{self, CollisionPolicy, RestoreFailure, RestoreOutcome};
+use linux_backup_core::restore::{
+    self, CollisionPolicy, RestoreFailure, RestoreOutcome, VerifyReport,
+};
 use linux_backup_core::{fs_probe, CoreError, RunContext};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -144,17 +151,24 @@ struct Running {
     attempt: usize,
 }
 
-/// The terminal restore result.
+/// The terminal restore result. `verify` is `Some` only when the run was launched with
+/// `--verify` (story 57 / #29): the post-restore checksum pass re-hashed every Manifest-recorded
+/// file and its [`VerifyReport`] is surfaced alongside the restore result. `None` means the pass
+/// never ran (the flag was off), which is distinct from a clean pass that found no problems.
 #[derive(Debug)]
 enum Report {
     /// Every Entry landed.
-    Success { restored: usize },
+    Success {
+        restored: usize,
+        verify: Option<VerifyReport>,
+    },
     /// Best-effort partial: some Entries landed, some failed. `scroll` is the index of the
     /// first failure shown, so a long list scrolls and truncates with `… (+N more)`.
     Partial {
         restored: usize,
         failures: Vec<RestoreFailure>,
         scroll: usize,
+        verify: Option<VerifyReport>,
     },
     /// The run never produced a per-file report — a wrong-shaped Backup dir, a checksum
     /// mismatch, a decryption failure on a plaintext Backup, or a worker that stopped
@@ -185,8 +199,12 @@ enum Msg {
         done: usize,
         total: usize,
     },
+    /// A completed restore, with the opt-in [`VerifyReport`] when `--verify` ran (else `None`).
     /// Boxed to keep the `Msg` enum small — [`RestoreOutcome`] is by far its largest variant.
-    Done(Box<RestoreOutcome>),
+    Done {
+        outcome: Box<RestoreOutcome>,
+        verify: Option<VerifyReport>,
+    },
     Failed(CoreError),
 }
 
@@ -213,6 +231,9 @@ pub struct RestoreFlow {
     backup_dir: PathBuf,
     ctx: RunContext,
     encrypted: bool,
+    /// Whether `--verify` was passed: runs `core`'s post-restore checksum pass and surfaces its
+    /// [`VerifyReport`] in the result screen (story 57 / #29). Immutable for the run's lifetime.
+    verify: bool,
     stage: Stage,
 }
 
@@ -220,8 +241,15 @@ impl RestoreFlow {
     /// Builds the flow for `backup_dir`, probing (via `core`, ADR-0005 D6) whether the dir is
     /// valid and whether the Backup is encrypted. An invalid dir opens straight on a fatal
     /// report rather than a confirm the user could never satisfy.
+    ///
+    /// `overwrite` (the `--overwrite` flag, #37) is a pre-consent given on the command line: it
+    /// skips the interactive overwrite-confirm screen — that screen *is* the whole-run consent
+    /// (#76), so having granted it up front there is nothing left to ask. An encrypted Backup
+    /// still opens on the unlock screen (the passphrase is required regardless of consent); a
+    /// plaintext one launches the run immediately. Without the flag the flow opens on the
+    /// confirm screen as before.
     #[must_use]
-    pub fn new(backup_dir: PathBuf, ctx: RunContext) -> Self {
+    pub fn new(backup_dir: PathBuf, ctx: RunContext, verify: bool, overwrite: bool) -> Self {
         if !fs_probe::is_dir(&backup_dir) {
             let message = format!(
                 "Backup dir {} does not exist or is not a directory.",
@@ -231,17 +259,24 @@ impl RestoreFlow {
                 backup_dir,
                 ctx,
                 encrypted: false,
+                verify,
                 stage: Stage::Report(Report::Fatal { message }),
             };
         }
         let encrypted = fs_probe::is_encrypted_backup(&backup_dir);
+        let stage = if overwrite {
+            launch_after_consent(encrypted, &backup_dir, &ctx, verify)
+        } else {
+            Stage::Confirm {
+                cancel_focused: true,
+            }
+        };
         Self {
             backup_dir,
             ctx,
             encrypted,
-            stage: Stage::Confirm {
-                cancel_focused: true,
-            },
+            verify,
+            stage,
         }
     }
 
@@ -266,13 +301,14 @@ impl RestoreFlow {
             backup_dir,
             ctx,
             encrypted,
+            verify,
             stage,
         } = self;
         let stage = match stage {
             Stage::Confirm { cancel_focused } => {
-                on_confirm_key(cancel_focused, key, &backup_dir, &ctx, encrypted)
+                on_confirm_key(cancel_focused, key, &backup_dir, &ctx, encrypted, verify)
             }
-            Stage::Unlock(unlock) => on_unlock_key(unlock, key, &backup_dir, &ctx),
+            Stage::Unlock(unlock) => on_unlock_key(unlock, key, &backup_dir, &ctx, verify),
             Stage::Report(report) => on_report_key(report, key),
             // Running ignores keys (Ctrl-C is handled by the app as the abort/quit); Exit is
             // terminal.
@@ -282,6 +318,7 @@ impl RestoreFlow {
             backup_dir,
             ctx,
             encrypted,
+            verify,
             stage,
         }
     }
@@ -295,6 +332,7 @@ impl RestoreFlow {
             backup_dir,
             ctx,
             encrypted,
+            verify,
             stage,
         } = self;
         let stage = match stage {
@@ -305,8 +343,26 @@ impl RestoreFlow {
             backup_dir,
             ctx,
             encrypted,
+            verify,
             stage,
         }
+    }
+}
+
+/// The transition once the whole-run overwrite consent is in hand — whether cleared on the
+/// confirm screen or pre-granted with `--overwrite` (#76). An encrypted Backup still needs its
+/// passphrase, so it lands on unlock; a plaintext one launches the worker straight away
+/// (ADR-0005 D4). The single home for that decision, shared by `new` and `on_confirm_key`.
+fn launch_after_consent(
+    encrypted: bool,
+    backup_dir: &Path,
+    ctx: &RunContext,
+    verify: bool,
+) -> Stage {
+    if encrypted {
+        Stage::Unlock(Unlock::new())
+    } else {
+        Stage::Running(spawn(backup_dir, ctx, None, 1, verify))
     }
 }
 
@@ -319,6 +375,7 @@ fn on_confirm_key(
     backup_dir: &Path,
     ctx: &RunContext,
     encrypted: bool,
+    verify: bool,
 ) -> Stage {
     match key.code {
         KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => Stage::Confirm {
@@ -327,10 +384,8 @@ fn on_confirm_key(
         KeyCode::Enter => {
             if cancel_focused {
                 Stage::Exit
-            } else if encrypted {
-                Stage::Unlock(Unlock::new())
             } else {
-                Stage::Running(spawn(backup_dir, ctx, None, 1))
+                launch_after_consent(encrypted, backup_dir, ctx, verify)
             }
         }
         // Esc cancels the dialog — identical to activating Cancel (#61 `Esc cancel`; the keymap's
@@ -344,7 +399,13 @@ fn on_confirm_key(
 /// Passphrase-unlock key handling. Typing edits the [`SecretInput`] (clearing the stale
 /// wrong-passphrase indicator); `F2` toggles reveal; `Enter` on a non-empty field launches the
 /// run with the passphrase. An empty `Enter` is a no-op — there is nothing to try yet.
-fn on_unlock_key(mut unlock: Unlock, key: KeyEvent, backup_dir: &Path, ctx: &RunContext) -> Stage {
+fn on_unlock_key(
+    mut unlock: Unlock,
+    key: KeyEvent,
+    backup_dir: &Path,
+    ctx: &RunContext,
+    verify: bool,
+) -> Stage {
     match key.code {
         KeyCode::F(2) => {
             unlock.reveal = !unlock.reveal;
@@ -370,6 +431,7 @@ fn on_unlock_key(mut unlock: Unlock, key: KeyEvent, backup_dir: &Path, ctx: &Run
                     ctx,
                     Some(unlock.input.into_secret()),
                     attempt,
+                    verify,
                 ))
             }
         }
@@ -386,6 +448,7 @@ fn on_report_key(report: Report, key: KeyEvent) -> Stage {
         restored,
         failures,
         scroll,
+        verify,
     } = report
     else {
         return match key.code {
@@ -407,6 +470,7 @@ fn on_report_key(report: Report, key: KeyEvent) -> Stage {
         restored,
         failures,
         scroll,
+        verify,
     })
 }
 
@@ -419,6 +483,7 @@ fn spawn(
     ctx: &RunContext,
     passphrase: Option<SecretString>,
     attempt: usize,
+    verify: bool,
 ) -> Running {
     let (tx, rx) = mpsc::channel();
     let backup_dir = backup_dir.to_path_buf();
@@ -433,7 +498,7 @@ fn spawn(
             &mut progress,
         );
         let msg = match result {
-            Ok(outcome) => Msg::Done(Box::new(outcome)),
+            Ok(outcome) => done_message(outcome, &ctx, verify),
             Err(err) => Msg::Failed(err),
         };
         let _ = progress.tx.send(msg);
@@ -444,6 +509,19 @@ fn spawn(
         done: 0,
         total: 0,
         attempt,
+    }
+}
+
+/// Builds the terminal worker message from a completed restore. When `--verify` ran, the opt-in
+/// checksum pass re-hashes what just landed against the Manifest the restore read back — a
+/// read-only FS pass (ADR-0005 D6), never against the ambient system — and its [`VerifyReport`]
+/// rides along; otherwise the field is `None`. Split out from [`spawn`]'s worker closure so the
+/// flag→`verify()` wiring is unit-testable without a real worker thread (#76).
+fn done_message(outcome: RestoreOutcome, ctx: &RunContext, verify: bool) -> Msg {
+    let report = verify.then(|| restore::verify(ctx, &outcome.manifest));
+    Msg::Done {
+        outcome: Box::new(outcome),
+        verify: report,
     }
 }
 
@@ -481,7 +559,7 @@ fn fold_msg(mut running: Running, msg: Msg, encrypted: bool) -> Stage {
             running.total = total;
             Stage::Running(running)
         }
-        Msg::Done(outcome) => report_from_outcome(*outcome),
+        Msg::Done { outcome, verify } => report_from_outcome(*outcome, verify),
         Msg::Failed(err) => {
             if encrypted && matches!(err, CoreError::DecryptionFailed(_)) {
                 Stage::Unlock(Unlock::retry(running.attempt + 1))
@@ -497,15 +575,16 @@ fn fold_msg(mut running: Running, msg: Msg, encrypted: bool) -> Stage {
 /// Splits a completed [`RestoreOutcome`] into a success or a best-effort partial report
 /// (ADR-0002). A declined collision cannot occur here (the worker runs `Overwrite`), so the
 /// only non-empty list to surface is `failures`.
-fn report_from_outcome(outcome: RestoreOutcome) -> Stage {
+fn report_from_outcome(outcome: RestoreOutcome, verify: Option<VerifyReport>) -> Stage {
     let restored = outcome.restored_paths.len();
     if outcome.failures.is_empty() {
-        Stage::Report(Report::Success { restored })
+        Stage::Report(Report::Success { restored, verify })
     } else {
         Stage::Report(Report::Partial {
             restored,
             failures: outcome.failures,
             scroll: 0,
+            verify,
         })
     }
 }
@@ -706,22 +785,35 @@ fn render_running(frame: &mut Frame, area: Rect, running: &Running) {
 
 fn render_report(frame: &mut Frame, area: Rect, report: &Report, home: &Path, glyphs: Glyphs) {
     let lines = match report {
-        Report::Success { restored } => vec![
-            Line::from(Span::styled(
-                format!("{} Restore complete", glyphs.check),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(format!(
-                "{restored} Entries restored under {}",
-                home.display()
-            )),
-        ],
+        Report::Success { restored, verify } => {
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!("{} Restore complete", glyphs.check),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!(
+                    "{restored} Entries restored under {}",
+                    home.display()
+                )),
+            ];
+            if let Some(verify) = verify {
+                lines.push(verify_summary_line(verify, glyphs));
+                // Reserve the two heading rows plus the summary and a trailing hint row; on a
+                // clean pass there are no detail lines and nothing is pushed.
+                let capacity = usize::from(area.height).saturating_sub(4);
+                for text in verify_detail_lines(verify, glyphs.bullet, capacity) {
+                    lines.push(Line::from(text));
+                }
+            }
+            lines
+        }
         Report::Partial {
             restored,
             failures,
             scroll,
+            verify,
         } => {
             let total = restored + failures.len();
             let mut lines = vec![
@@ -740,8 +832,16 @@ fn render_report(frame: &mut Frame, area: Rect, report: &Report, home: &Path, gl
                     home.display()
                 )),
             ];
-            // Reserve the two heading rows above plus a trailing hint row.
-            let capacity = usize::from(area.height).saturating_sub(3);
+            // The scrollable failure list is the focus of a partial report, so verify contributes
+            // only its one-line summary here (its detail would fight the failures for the scroll
+            // region); the counts still tell the user whether what landed hashes clean.
+            let mut heading_rows = 2;
+            if let Some(verify) = verify {
+                lines.push(verify_summary_line(verify, glyphs));
+                heading_rows += 1;
+            }
+            // Reserve the heading rows above plus a trailing hint row.
+            let capacity = usize::from(area.height).saturating_sub(heading_rows + 1);
             for text in partial_lines(failures, *scroll, capacity, glyphs.bullet) {
                 lines.push(Line::from(text));
             }
@@ -756,6 +856,64 @@ fn render_report(frame: &mut Frame, area: Rect, report: &Report, home: &Path, gl
         ],
     };
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Left), area);
+}
+
+/// The one-line verify summary (story 57 / #29): a clean pass reports how many files matched;
+/// a dirty pass reports the mismatched/missing counts. Both surface even on an otherwise-clean
+/// restore, since a checksum mismatch means what landed no longer matches what was captured.
+fn verify_summary_line(verify: &VerifyReport, glyphs: Glyphs) -> Line<'static> {
+    if verify.is_clean() {
+        Line::from(Span::styled(
+            format!(
+                "{} Verified — {} files match their checksums",
+                glyphs.check,
+                verify.matched.len()
+            ),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} Verify — {} mismatched, {} missing",
+                glyphs.warn,
+                verify.mismatched.len(),
+                verify.missing.len()
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    }
+}
+
+/// The per-path verify problems (mismatched, then missing), bounded to `capacity` rows with a
+/// trailing `… (+N more)` when they overflow — the same bounded shape as [`partial_lines`]. A
+/// clean pass has nothing to list and returns empty.
+fn verify_detail_lines(verify: &VerifyReport, bullet: &str, capacity: usize) -> Vec<String> {
+    let mut problems: Vec<String> = verify
+        .mismatched
+        .iter()
+        .map(|m| format!("{bullet} {} — checksum mismatch", m.path))
+        .collect();
+    problems.extend(
+        verify
+            .missing
+            .iter()
+            .map(|path| format!("{bullet} {path} — missing")),
+    );
+    if capacity == 0 || problems.is_empty() {
+        return Vec::new();
+    }
+    if problems.len() <= capacity {
+        return problems;
+    }
+    let shown = capacity - 1;
+    let more = problems.len() - shown;
+    problems.truncate(shown);
+    problems.push(format!("… (+{more} more)"));
+    problems
 }
 
 /// The footer hint fragments per stage (lowercase, terse — #61), always keeping `? keys`.
@@ -810,6 +968,7 @@ mod tests {
             backup_dir: PathBuf::from("/backups/test"),
             ctx: test_context(),
             encrypted,
+            verify: false,
             stage,
         }
     }
@@ -999,16 +1158,16 @@ mod tests {
 
     #[test]
     fn done_with_no_failures_is_a_success_report() {
-        let stage = report_from_outcome(outcome_with(vec![PathBuf::from("/a")], Vec::new()));
+        let stage = report_from_outcome(outcome_with(vec![PathBuf::from("/a")], Vec::new()), None);
         assert!(matches!(
             stage,
-            Stage::Report(Report::Success { restored: 1 })
+            Stage::Report(Report::Success { restored: 1, .. })
         ));
     }
 
     #[test]
     fn done_with_failures_is_a_partial_report() {
-        let stage = report_from_outcome(outcome_with(vec![PathBuf::from("/a")], failures(2)));
+        let stage = report_from_outcome(outcome_with(vec![PathBuf::from("/a")], failures(2)), None);
         assert!(matches!(
             stage,
             Stage::Report(Report::Partial { restored: 1, .. })
@@ -1021,6 +1180,7 @@ mod tests {
             restored: 0,
             failures: failures(3),
             scroll: 0,
+            verify: None,
         };
         // Up at the top stays at the top.
         let stage = on_report_key(report, key(KeyCode::Up));
@@ -1032,6 +1192,7 @@ mod tests {
             restored: 0,
             failures: failures(3),
             scroll: 0,
+            verify: None,
         });
         for _ in 0..10 {
             let Stage::Report(report) = stage else {
@@ -1061,8 +1222,109 @@ mod tests {
 
     #[test]
     fn report_enter_closes_the_flow() {
-        let flow = flow_in(Stage::Report(Report::Success { restored: 3 }), false);
+        let flow = flow_in(
+            Stage::Report(Report::Success {
+                restored: 3,
+                verify: None,
+            }),
+            false,
+        );
         assert!(flow.handle_key(key(KeyCode::Enter)).wants_exit());
+    }
+
+    // --- --overwrite skip-confirm + --verify wiring (#76) -----------------------------------
+
+    #[test]
+    fn overwrite_flag_skips_confirm_and_launches_a_plaintext_run() {
+        // A plaintext Backup dir (no `.age` Manifest): `--overwrite` is the up-front consent, so
+        // the flow opens straight on the run rather than the overwrite-confirm screen.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let flow = RestoreFlow::new(dir.path().to_path_buf(), test_context(), false, true);
+        assert!(flow.is_running());
+    }
+
+    #[test]
+    fn overwrite_flag_on_an_encrypted_backup_still_opens_unlock() {
+        // Even with the overwrite consent given up front, an encrypted Backup still needs its
+        // passphrase — the unlock screen is not the collision consent and is never skipped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("manifest.json.age"), b"ciphertext")
+            .expect("write encrypted-Backup marker");
+        let flow = RestoreFlow::new(dir.path().to_path_buf(), test_context(), false, true);
+        assert!(matches!(flow.stage, Stage::Unlock(_)));
+    }
+
+    #[test]
+    fn without_overwrite_the_flow_opens_on_the_confirm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let flow = RestoreFlow::new(dir.path().to_path_buf(), test_context(), false, false);
+        assert!(matches!(flow.stage, Stage::Confirm { .. }));
+    }
+
+    #[test]
+    fn verify_report_flows_into_the_success_report() {
+        let stage = report_from_outcome(
+            outcome_with(vec![PathBuf::from("/a")], Vec::new()),
+            Some(clean_verify(3)),
+        );
+        assert!(matches!(
+            stage,
+            Stage::Report(Report::Success {
+                verify: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn no_verify_flag_leaves_the_report_verify_none() {
+        let stage = report_from_outcome(outcome_with(vec![PathBuf::from("/a")], Vec::new()), None);
+        assert!(matches!(
+            stage,
+            Stage::Report(Report::Success { verify: None, .. })
+        ));
+    }
+
+    #[test]
+    fn done_message_runs_the_verify_pass_only_when_the_flag_is_set() {
+        // The wiring proof (#76 / #29): a checksum entry pointing at a path with nothing at its
+        // resolved restore target means the pass, *if it runs*, must flag it missing. So a
+        // non-empty report is proof `restore::verify` actually ran against the outcome's Manifest
+        // — while `--verify` off must attach no report at all.
+        let mut outcome = outcome_with(vec![PathBuf::from("/a")], Vec::new());
+        outcome
+            .manifest
+            .checksums
+            .insert("home/ghost.txt".to_owned(), "deadbeef".to_owned());
+        let ctx = test_context();
+
+        let Msg::Done { verify, .. } = done_message(outcome.clone(), &ctx, true) else {
+            panic!("expected a Done message");
+        };
+        let report = verify.expect("--verify must attach a report");
+        assert!(
+            report.missing.iter().any(|p| p == "home/ghost.txt"),
+            "the pass must have run against the outcome's manifest, got: {report:?}"
+        );
+
+        let Msg::Done { verify, .. } = done_message(outcome, &ctx, false) else {
+            panic!("expected a Done message");
+        };
+        assert!(verify.is_none(), "no --verify means no pass and no report");
+    }
+
+    #[test]
+    fn verify_detail_lines_truncate_overflow_with_a_more_line() {
+        let verify = dirty_verify(10, 0);
+        let lines = verify_detail_lines(&verify, "•", 4);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].contains("checksum mismatch"));
+        assert_eq!(lines[3], "… (+7 more)");
+    }
+
+    #[test]
+    fn verify_detail_lines_are_empty_on_a_clean_pass() {
+        assert!(verify_detail_lines(&clean_verify(5), "•", 8).is_empty());
     }
 
     // --- render (TestBackend) --------------------------------------------------------------
@@ -1114,7 +1376,13 @@ mod tests {
 
     #[test]
     fn renders_success_report() {
-        let flow = flow_in(Stage::Report(Report::Success { restored: 42 }), false);
+        let flow = flow_in(
+            Stage::Report(Report::Success {
+                restored: 42,
+                verify: None,
+            }),
+            false,
+        );
         let lines = rendered_lines(&flow, 60, 12);
         assert!(lines.iter().any(|l| l.contains("Restore complete")));
         assert!(lines
@@ -1129,6 +1397,7 @@ mod tests {
                 restored: 1,
                 failures: failures(20),
                 scroll: 0,
+                verify: None,
             }),
             false,
         );
@@ -1145,7 +1414,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn renders_clean_verify_summary_on_a_success_report() {
+        let flow = flow_in(
+            Stage::Report(Report::Success {
+                restored: 3,
+                verify: Some(clean_verify(3)),
+            }),
+            false,
+        );
+        let lines = rendered_lines(&flow, 70, 12);
+        assert!(
+            lines.iter().any(|l| l.contains("Verified — 3 files match")),
+            "expected the clean verify summary, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn renders_dirty_verify_summary_and_detail_on_a_success_report() {
+        let flow = flow_in(
+            Stage::Report(Report::Success {
+                restored: 1,
+                verify: Some(dirty_verify(1, 1)),
+            }),
+            false,
+        );
+        let lines = rendered_lines(&flow, 70, 12);
+        assert!(
+            lines.iter().any(|l| l.contains("1 mismatched, 1 missing")),
+            "expected the dirty verify summary, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("mismatch-0 — checksum mismatch")),
+            "expected a mismatched detail line, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("missing-0 — missing")),
+            "expected a missing detail line, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn renders_the_verify_summary_line_on_a_partial_report() {
+        let flow = flow_in(
+            Stage::Report(Report::Partial {
+                restored: 1,
+                failures: failures(2),
+                scroll: 0,
+                verify: Some(clean_verify(1)),
+            }),
+            false,
+        );
+        let lines = rendered_lines(&flow, 70, 14);
+        assert!(
+            lines.iter().any(|l| l.contains("Verified — 1 files match")),
+            "expected the verify summary on a partial report, got: {lines:?}"
+        );
+    }
+
     // --- test helpers ----------------------------------------------------------------------
+
+    /// A clean [`VerifyReport`]: `matched` files, no problems.
+    fn clean_verify(matched: usize) -> VerifyReport {
+        VerifyReport {
+            matched: (0..matched).map(|i| format!("home/file-{i}")).collect(),
+            mismatched: Vec::new(),
+            missing: Vec::new(),
+        }
+    }
+
+    /// A dirty [`VerifyReport`] with `mismatched` checksum mismatches and `missing` vanished
+    /// targets, paths numbered so detail lines are assertable.
+    fn dirty_verify(mismatched: usize, missing: usize) -> VerifyReport {
+        use linux_backup_core::restore::VerifyMismatch;
+        VerifyReport {
+            matched: Vec::new(),
+            mismatched: (0..mismatched)
+                .map(|i| VerifyMismatch {
+                    path: format!("home/mismatch-{i}"),
+                    expected_sha256: "expected".to_owned(),
+                    actual_sha256: "actual".to_owned(),
+                })
+                .collect(),
+            missing: (0..missing).map(|i| format!("home/missing-{i}")).collect(),
+        }
+    }
 
     /// A `Running` state whose worker never sends anything — enough to exercise `fold_msg`
     /// without a real restore. The dropped sender is fine: `fold_msg` reads only the message
