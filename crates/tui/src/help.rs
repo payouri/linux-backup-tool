@@ -1,10 +1,12 @@
-//! The `?` help overlay: the single exhaustive keybinding reference (#51 / #61).
+//! The `F1` help overlay: the single exhaustive keybinding reference (#51 / #61 / #77).
 //!
 //! Every binding the tool has — the cross-screen keymap plus the modal and RUN context keys —
 //! lives here in one panel, so the footer only ever needs to carry a context subset and always
-//! keep `? keys` pointing at this. It opens at **every** terminal size (the app renders it even
+//! keep `F1 keys` pointing at this. It opens at **every** terminal size (the app renders it even
 //! below the reflow ladder's Refuse cutoff, where nothing else draws) and closes on `Esc` or a
-//! second `?`; a short terminal scrolls the panel rather than dropping bindings.
+//! second `F1`; a short terminal scrolls the panel rather than dropping bindings. It rides `F1`,
+//! not the plain `?` the map first used, so a focused text field keeps `?` as a literal character
+//! (an `age` passphrase may contain one, #77).
 //!
 //! Arrows and the `·` separators are left Unicode per the #61 fallback map (only decorative
 //! glyphs remap), so the reference reads the same in both glyph sets and needs no glyph set
@@ -34,7 +36,7 @@ const GROUPS: &[(&str, &str)] = &[
         "Ctrl-→ next · Ctrl-← back · 1-4 jump · REVIEW: Enter start",
     ),
     ("Reveal", "F2 passphrase · F3 hidden files"),
-    ("Global", "? keys · Esc back/close · Ctrl-C quit/abort"),
+    ("Global", "F1 keys · Esc back/close · Ctrl-C quit/abort"),
     (
         "Modals",
         "←/→ choose · Enter activate · Esc cancel · type PLAINTEXT",
@@ -87,7 +89,7 @@ pub fn render(frame: &mut Frame, area: Rect, scroll: u16) {
         })
         .collect();
     lines.push(Line::from(Span::styled(
-        "Esc or ? to close",
+        "Esc or F1 to close",
         Style::default().add_modifier(Modifier::DIM),
     )));
 

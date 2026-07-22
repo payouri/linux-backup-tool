@@ -110,9 +110,9 @@ pub struct App {
     /// nothing, so this bool is the whole of what a reveal persists. The restore flow keeps its
     /// own per-unlock reveal, so this covers the wizard's encryption step only.
     reveal: bool,
-    /// Whether the `?` help overlay is open (#51). A view-only flag, like `reveal`: while set,
-    /// the overlay captures input (`Esc`/`?` close, `↑`/`↓` scroll) and every screen renders it
-    /// on top — at any terminal size, even below the reflow ladder's Refuse cutoff.
+    /// Whether the `F1` help overlay is open (#51/#77). A view-only flag, like `reveal`: while
+    /// set, the overlay captures input (`Esc`/`F1` close, `↑`/`↓` scroll) and every screen renders
+    /// it on top — at any terminal size, even below the reflow ladder's Refuse cutoff.
     help_open: bool,
     /// The help overlay's scroll offset, so a short terminal can page a panel taller than it.
     help_scroll: u16,
@@ -276,7 +276,7 @@ impl App {
             self.should_quit = true;
             return self;
         }
-        // While the `?` overlay is open it is captive (#51): `Esc`/`?` close it, `↑`/`↓` (and the
+        // While the `F1` overlay is open it is captive (#51): `Esc`/`F1` close it, `↑`/`↓` (and the
         // page/Home/End keys) scroll it, and every other key is swallowed so nothing behind it
         // acts. Handled before the rest of the keymap so no chord leaks through to a screen.
         if self.help_open {
@@ -290,9 +290,11 @@ impl App {
         {
             return self;
         }
-        // `?` opens the exhaustive help overlay from anywhere (#51 Global) — a plain key that,
-        // unlike the widget-owned plain keys, is claimed globally so it is always reachable.
-        if key.code == KeyCode::Char('?') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+        // `F1` opens the exhaustive help overlay from anywhere (#51 Global / #77). It rides an
+        // Fn key, not the plain `?` the original keymap used, so it stays live inside a focused
+        // text field — a plain `?` now belongs to the focused widget and is typed as a literal
+        // character (an `age` passphrase may contain one, #77), never intercepted here.
+        if key.code == KeyCode::F(1) {
             self.help_open = true;
             self.help_scroll = 0;
             return self;
@@ -386,13 +388,13 @@ impl App {
         self
     }
 
-    /// Folds one key while the `?` overlay is open (#51). `Esc`/`?` close it; the movement keys
-    /// scroll it so a panel taller than the terminal is fully reachable; everything else is
+    /// Folds one key while the `F1` overlay is open (#51/#77). `Esc`/`F1` close it; the movement
+    /// keys scroll it so a panel taller than the terminal is fully reachable; everything else is
     /// swallowed (the overlay is captive). Scroll is clamped to the binding count so paging past
     /// the end can't scroll the content out of view.
     fn handle_help_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('?') => {
+            KeyCode::Esc | KeyCode::F(1) => {
                 self.help_open = false;
                 self.help_scroll = 0;
             }
@@ -825,17 +827,17 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// The fixed footer hints, degrading down the reflow ladder but always keeping `? keys` (#50).
+/// The fixed footer hints, degrading down the reflow ladder but always keeping `F1 keys` (#50).
 fn render_footer(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTier) {
     // REVIEW is terminal — the forward action is launching the run, so its footer leads with
     // `Enter start backup` rather than the `Ctrl-→ next` the earlier steps show (#61).
     if wizard.current() == WizardStep::Review {
         let hints = match tier {
             ReflowTier::Comfortable | ReflowTier::Default => {
-                "Enter start backup · Ctrl-← back · 1-4 jump · ? keys"
+                "Enter start backup · Ctrl-← back · 1-4 jump · F1 keys"
             }
-            ReflowTier::Tight => "Enter start backup · Ctrl-← back · ? keys",
-            ReflowTier::Minimum | ReflowTier::Refuse => "Enter start backup · ? keys",
+            ReflowTier::Tight => "Enter start backup · Ctrl-← back · F1 keys",
+            ReflowTier::Minimum | ReflowTier::Refuse => "Enter start backup · F1 keys",
         };
         frame.render_widget(
             Paragraph::new(hints).style(Style::default().add_modifier(Modifier::DIM)),
@@ -851,10 +853,10 @@ fn render_footer(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTie
     };
     let hints = match tier {
         ReflowTier::Comfortable | ReflowTier::Default => {
-            format!("{forward_hint} · Ctrl-← back · 1-4 jump · Esc back · ? keys")
+            format!("{forward_hint} · Ctrl-← back · 1-4 jump · Esc back · F1 keys")
         }
-        ReflowTier::Tight => format!("{forward_hint} · Ctrl-← back · ? keys"),
-        ReflowTier::Minimum | ReflowTier::Refuse => format!("{forward_hint} · ? keys"),
+        ReflowTier::Tight => format!("{forward_hint} · Ctrl-← back · F1 keys"),
+        ReflowTier::Minimum | ReflowTier::Refuse => format!("{forward_hint} · F1 keys"),
     };
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().add_modifier(Modifier::DIM)),
@@ -1099,8 +1101,8 @@ mod tests {
             let app = app_with_wizard(non_sensitive_wizard());
             let lines = rendered_lines(&app, 80, height);
             assert!(
-                lines.iter().any(|l| l.contains("? keys")),
-                "footer lost `? keys` at height {height}, got: {lines:?}"
+                lines.iter().any(|l| l.contains("F1 keys")),
+                "footer lost `F1 keys` at height {height}, got: {lines:?}"
             );
         }
     }
@@ -1348,6 +1350,43 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_types_into_the_passphrase_field_instead_of_opening_help() {
+        // `?` is no longer a global help key (that rode away to `F1`, #77), so it reaches the
+        // focused passphrase field as a literal character — the whole point, since an `age`
+        // passphrase may contain one and was previously impossible to set or unlock.
+        let app = type_into(offered_encryption_typing(), "pa?ss");
+        assert!(!app.help_open, "`?` must not open the overlay while typing");
+        assert_eq!(current_step(&app), WizardStep::Encryption);
+        let revealed = app.update(kev(KeyCode::F(2), KeyModifiers::NONE));
+        let lines = rendered_lines(&revealed, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("pa?ss")),
+            "the `?` must be stored in the passphrase, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn question_mark_types_into_the_what_custom_path_field_instead_of_opening_help() {
+        // The other lock-out field #77 names — the WHAT Custom-path add field — routes through a
+        // different `App::update` branch than the passphrase, so it needs its own reducer guard:
+        // a re-added global `?` intercept would fail this test where a widget-handler test can't.
+        let app = app_with_wizard(non_sensitive_wizard())
+            .update(kev(KeyCode::Down, KeyModifiers::NONE)) // onto the Custom paths row
+            .update(kev(KeyCode::Right, KeyModifiers::NONE)); // open the add field
+        let app = type_into(app, "a?b");
+        assert!(
+            !app.help_open,
+            "`?` must not open the overlay while typing a path"
+        );
+        assert_eq!(current_step(&app), WizardStep::What);
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("a?b")),
+            "the `?` must be stored in the Custom-path buffer, got: {lines:?}"
+        );
+    }
+
+    #[test]
     fn encryption_offered_screen_masks_the_passphrase_then_reveals_it_on_f2() {
         let app = type_into(offered_encryption_typing(), "hunter2");
         let masked = rendered_lines(&app, 80, 24);
@@ -1502,11 +1541,11 @@ mod tests {
     }
 
     #[test]
-    fn help_overlay_opens_on_question_mark_and_closes_on_esc_or_question_mark() {
+    fn help_overlay_opens_on_f1_and_closes_on_esc_or_f1() {
         let app = app_with_wizard(non_sensitive_wizard());
         assert!(!app.help_open);
-        // `?` opens the exhaustive reference; the panel and its reserved-chords group render.
-        let app = app.update(key(KeyCode::Char('?'), KeyModifiers::NONE));
+        // `F1` opens the exhaustive reference; the panel and its reserved-chords group render.
+        let app = app.update(key(KeyCode::F(1), KeyModifiers::NONE));
         assert!(app.help_open);
         let lines = rendered_lines(&app, 80, 24);
         assert!(
@@ -1517,12 +1556,12 @@ mod tests {
             lines.iter().any(|l| l.contains("Reserved")),
             "the overlay must list the reserved chords, got: {lines:?}"
         );
-        // A second `?` closes it.
-        let app = app.update(key(KeyCode::Char('?'), KeyModifiers::NONE));
+        // A second `F1` closes it.
+        let app = app.update(key(KeyCode::F(1), KeyModifiers::NONE));
         assert!(!app.help_open);
         // `Esc` also closes it, and (per the keymap) still never quits.
         let app = app
-            .update(key(KeyCode::Char('?'), KeyModifiers::NONE))
+            .update(key(KeyCode::F(1), KeyModifiers::NONE))
             .update(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.help_open);
         assert!(!app.should_quit());
@@ -1534,7 +1573,7 @@ mod tests {
         // Refuse cutoff, where the base render is only the too-small notice (#51).
         for (w, h) in [(80u16, 24u16), (40, 10), (30, 6)] {
             let app = app_with_wizard(non_sensitive_wizard())
-                .update(key(KeyCode::Char('?'), KeyModifiers::NONE));
+                .update(key(KeyCode::F(1), KeyModifiers::NONE));
             let lines = rendered_lines(&app, w, h);
             assert!(
                 lines

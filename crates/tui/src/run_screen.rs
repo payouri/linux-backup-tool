@@ -320,12 +320,12 @@ pub fn render(
 }
 
 /// The footer hint: `Ctrl-C cancel` while running (the user needs only that Ctrl-C cancels),
-/// `Enter close` once terminal (#61 copy). Both keep the `? keys` pointer to the exhaustive
+/// `Enter close` once terminal (#61 copy). Both keep the `F1 keys` pointer to the exhaustive
 /// overlay that the footer always carries on every screen (#51).
 fn footer_hint(activity: &RunActivity) -> &'static str {
     match activity {
-        RunActivity::Running(_) => "Ctrl-C cancel · ? keys",
-        _ => "Enter close · ? keys",
+        RunActivity::Running(_) => "Ctrl-C cancel · F1 keys",
+        _ => "Enter close · F1 keys",
     }
 }
 
@@ -716,8 +716,8 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("not encrypted")));
         assert!(lines.iter().any(|l| l.contains("done")));
         assert!(lines.iter().any(|l| l.contains("Enter close")));
-        // The footer always keeps the `? keys` pointer, on the RUN screen like every other (#51).
-        assert!(lines.iter().any(|l| l.contains("? keys")));
+        // The footer always keeps the `F1 keys` pointer, on the RUN screen like every other (#51).
+        assert!(lines.iter().any(|l| l.contains("F1 keys")));
     }
 
     #[test]

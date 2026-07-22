@@ -648,6 +648,21 @@ mod tests {
     }
 
     #[test]
+    fn passphrase_field_accepts_a_literal_question_mark() {
+        // `?` used to be swallowed globally for the help overlay, locking anyone with a `?` in
+        // their `age` passphrase out of both setting and unlocking it. It is a plain character to
+        // the focused field now; the overlay rides `F1` instead (#77).
+        let mut screen = EncryptionScreen::default();
+        type_str(&mut screen, true, "pa?ss?");
+        assert_eq!(screen.passphrase.expose_secret(), "pa?ss?");
+        // The confirm field shares the handler, so it must accept `?` too — otherwise a matching
+        // passphrase could never be confirmed.
+        assert!(screen.handle_plain_key(key(KeyCode::Tab), true));
+        type_str(&mut screen, true, "pa?ss?");
+        assert_eq!(screen.confirm.expose_secret(), "pa?ss?");
+    }
+
+    #[test]
     fn match_indicator_is_silent_until_both_fields_have_content() {
         let mut screen = EncryptionScreen::default();
         assert_eq!(screen.match_state(), MatchState::Silent);

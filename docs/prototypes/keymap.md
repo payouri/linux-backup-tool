@@ -77,7 +77,7 @@ Same action → same chord on every screen. Context columns note where a key's m
 
 | Key      | Action                                                                          |
 |----------|--------------------------------------------------------------------------------|
-| `?`      | Toggle the help overlay (all bindings; §4).                                     |
+| `F1`     | Toggle the help overlay (all bindings; §4). Was `?` in the original prototype; moved to `F1` in #77 so a focused text field keeps `?` as a literal character (an `age` passphrase may contain one). The ASCII mockups below still show the pre-#77 `?`. |
 | `Esc`    | Close an overlay/modal; else back out one context level (drilled → climb; at root → focus Categories). Never quits the app on its own. |
 | `Ctrl-C` | Quit / abort. In the wizard: exit, nothing written. During **RUN**: cancel and remove the partial Backup dir (fail-fast, ADR-0002). |
 
@@ -168,8 +168,8 @@ full reference. Footer content degrades on the #50 reflow ladder; `?` is always 
 │ ↑↓ · Space · Ctrl-→ next · ? keys                                            │
 ```
 
-**`?` help overlay** — a centered panel grouping every binding; `Esc`/`?` closes. Scrolls if the
-terminal is short; at Minimum size it fills the screen.
+**`F1` help overlay** (`?` in the mockup below, pre-#77) — a centered panel grouping every binding;
+`Esc`/`F1` closes. Scrolls if the terminal is short; at Minimum size it fills the screen.
 ```
 ┌─ Keys ──────────────────────────────────────────────────────────────────────┐
 │  Move        ↑↓ · PgUp/PgDn · Home/End · type to jump                        │

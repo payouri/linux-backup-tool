@@ -513,6 +513,17 @@ mod tests {
     }
 
     #[test]
+    fn custom_path_field_accepts_a_literal_question_mark() {
+        // `?` is a plain character to the focused field now (help rides `F1`, #77), so it edits
+        // the path buffer like any other char rather than being swallowed for the overlay.
+        let mut step = typing_step(Path::new("/home/tester"));
+        for c in "a?b".chars() {
+            step.handle_key(key(KeyCode::Char(c)), &no_env);
+        }
+        assert_eq!(step.buffer, "a?b");
+    }
+
+    #[test]
     fn tab_completes_the_longest_common_prefix_when_ambiguous() {
         let tmp = tempfile::tempdir().expect("tempdir");
         for dir in ["Documents", "Downloads", "Docker"] {

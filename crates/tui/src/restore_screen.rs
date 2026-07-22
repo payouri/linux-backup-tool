@@ -916,22 +916,22 @@ fn verify_detail_lines(verify: &VerifyReport, bullet: &str, capacity: usize) -> 
     problems
 }
 
-/// The footer hint fragments per stage (lowercase, terse — #61), always keeping `? keys`.
+/// The footer hint fragments per stage (lowercase, terse — #61), always keeping `F1 keys`.
 fn footer_hints(flow: &RestoreFlow, _tier: ReflowTier) -> String {
     match &flow.stage {
-        Stage::Confirm { .. } => "←→ choose · Enter confirm · Esc cancel · ? keys".to_owned(),
+        Stage::Confirm { .. } => "←→ choose · Enter confirm · Esc cancel · F1 keys".to_owned(),
         Stage::Unlock(unlock) => {
             let reveal = if unlock.reveal {
                 "F2 hide"
             } else {
                 "F2 reveal"
             };
-            format!("Enter unlock · {reveal} · Esc cancel · ? keys")
+            format!("Enter unlock · {reveal} · Esc cancel · F1 keys")
         }
-        Stage::Running(_) => "Ctrl-C cancel · ? keys".to_owned(),
-        Stage::Report(Report::Partial { .. }) => "↑/↓ scroll · Enter close · ? keys".to_owned(),
-        Stage::Report(_) => "Enter close · ? keys".to_owned(),
-        Stage::Exit => "? keys".to_owned(),
+        Stage::Running(_) => "Ctrl-C cancel · F1 keys".to_owned(),
+        Stage::Report(Report::Partial { .. }) => "↑/↓ scroll · Enter close · F1 keys".to_owned(),
+        Stage::Report(_) => "Enter close · F1 keys".to_owned(),
+        Stage::Exit => "F1 keys".to_owned(),
     }
 }
 
@@ -1090,6 +1090,21 @@ mod tests {
         };
         assert_eq!(unlock.input.char_count(), 2);
         assert!(!unlock.wrong, "typing should clear the stale indicator");
+    }
+
+    #[test]
+    fn unlock_field_accepts_a_literal_question_mark() {
+        // The other half of the #77 lock-out: an `age` passphrase containing `?` must be
+        // *enterable* on restore, not just settable. `?` is a plain character to the unlock
+        // field now (help rides `F1`), so it lands in the secret like any other char.
+        let flow = flow_in(Stage::Unlock(Unlock::new()), true)
+            .handle_key(key(KeyCode::Char('p')))
+            .handle_key(key(KeyCode::Char('?')))
+            .handle_key(key(KeyCode::Char('w')));
+        let Stage::Unlock(unlock) = &flow.stage else {
+            panic!("expected unlock stage");
+        };
+        assert_eq!(unlock.input.exposed(), "p?w");
     }
 
     #[test]
