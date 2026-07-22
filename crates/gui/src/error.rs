@@ -35,6 +35,7 @@ impl From<&CoreError> for SerializableCoreError {
 fn kind_tag(error: &CoreError) -> &'static str {
     match error {
         CoreError::NotImplemented(_) => "not_implemented",
+        CoreError::Cancelled => "cancelled",
         CoreError::BackupDirExists(_) => "backup_dir_exists",
         CoreError::EmptySelection => "empty_selection",
         CoreError::LocationNotWritable(_) => "location_not_writable",
@@ -101,5 +102,15 @@ mod tests {
             serializable.message,
             "I/O error at /etc/shadow: permission denied"
         );
+    }
+
+    #[test]
+    fn cancelled_flattens_to_its_kind_and_message() {
+        let error = CoreError::Cancelled;
+
+        let serializable = SerializableCoreError::from(&error);
+
+        assert_eq!(serializable.kind, "cancelled");
+        assert_eq!(serializable.message, "run cancelled");
     }
 }
