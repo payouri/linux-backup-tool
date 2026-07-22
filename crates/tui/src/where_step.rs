@@ -8,13 +8,12 @@
 //! facts, so the literal `~`/`$VAR` stays in the buffer and expansion happens here at the `tui`
 //! boundary through the injected `getenv` resolver (ADR-0004), never inside `core`.
 //!
-//! ## Controls (#52 / #51 keymap)
+//! ## Controls (#52 / #51 / #84 keymap)
 //!
 //! The step has two focus modes. In `Picking` the pick-list rows drive `↑`/`↓`, and `Enter`/`→`
 //! either binds a location row or opens the custom-path field (its trailing row). In `Typing`
-//! the field is focused: characters edit the buffer, `Tab` completes the longest common prefix
-//! (or descends into an unambiguous single directory, one path segment at a time, stopping at
-//! each directory's trailing `/`), `→`/`End` accept the whole ghost suggestion, `↑`/`↓` move the
+//! the field is focused: characters edit the buffer, `Tab`/`→`/`End` all accept the highlighted
+//! candidate (menu-complete, #84 — press `↓` first to pick a different sibling), `↑`/`↓` move the
 //! candidate cursor, `Enter` accepts the highlighted candidate or — once the buffer already
 //! names it — commits the location, and `Esc` closes the field back to the pick-list.
 //!
@@ -189,8 +188,7 @@ impl WhereStep {
     fn handle_typing(&mut self, key: KeyEvent, getenv: Getenv) {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Picking,
-            KeyCode::Tab => self.complete_tab(getenv),
-            KeyCode::Right | KeyCode::End => self.accept_ghost(getenv),
+            KeyCode::Tab | KeyCode::Right | KeyCode::End => self.accept_ghost(getenv),
             KeyCode::Up => self.ac_selected = self.ac_selected.saturating_sub(1),
             KeyCode::Down => {
                 let view = self.autocomplete(getenv);
@@ -232,16 +230,9 @@ impl WhereStep {
         }
     }
 
-    /// `Tab`: complete the longest common prefix, or descend into an unambiguous single
-    /// directory — component-by-component, stopping at each directory's trailing `/` (#52).
-    fn complete_tab(&mut self, getenv: Getenv) {
-        let view = self.autocomplete(getenv);
-        path_autocomplete::complete_tab(&mut self.buffer, &view);
-        self.ac_selected = 0;
-    }
-
-    /// `→`/`End`: accept the whole ghost — the highlighted candidate, eagerly (fish-style), with
-    /// a trailing `/` when it's a directory so the next segment can follow.
+    /// `Tab`/`→`/`End`: accept the whole ghost — the highlighted candidate, eagerly (fish-style,
+    /// menu-complete, #84), with a trailing `/` when it's a directory so the next segment can
+    /// follow.
     fn accept_ghost(&mut self, getenv: Getenv) {
         let view = self.autocomplete(getenv);
         path_autocomplete::accept_ghost(&mut self.buffer, &view);
@@ -378,7 +369,11 @@ impl WhereStep {
             }
             lines.push(Line::from(field));
 
-            lines.extend(path_autocomplete::candidate_lines(&view, glyphs));
+            lines.extend(path_autocomplete::candidate_lines(
+                &view,
+                glyphs,
+                area.height as usize,
+            ));
         } else {
             lines.push(Line::from(format!("{custom_marker} Type a path…")));
         }
@@ -524,26 +519,40 @@ mod tests {
     }
 
     #[test]
-    fn tab_completes_the_longest_common_prefix_when_ambiguous() {
+    fn tab_accepts_the_highlighted_candidate_even_when_ambiguous() {
         let tmp = tempfile::tempdir().expect("tempdir");
         for dir in ["Documents", "Downloads", "Docker"] {
             fs::create_dir(tmp.path().join(dir)).expect("create dir");
         }
         let mut step = typing_step(tmp.path());
         step.buffer = "~/D".to_string();
-        step.complete_tab(&no_env);
-        // Extends to the common prefix "Do", stopping short of any single leaf (still ambiguous).
-        assert_eq!(step.buffer, "~/Do");
+        // A prior LCP `complete_tab` would stop at "~/Do" (silent no-op past there). `Tab` now
+        // menu-completes: it accepts the highlighted candidate outright (#84) — "Docker" sorts
+        // first (dirs-first, alphabetical) so it is the one highlighted.
+        step.handle_key(key(KeyCode::Tab), &no_env);
+        assert_eq!(step.buffer, "~/Docker/");
     }
 
     #[test]
-    fn tab_descends_into_an_unambiguous_single_directory_and_stops_at_the_slash() {
+    fn down_then_tab_accepts_the_next_sibling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for dir in ["Documents", "Downloads", "Docker"] {
+            fs::create_dir(tmp.path().join(dir)).expect("create dir");
+        }
+        let mut step = typing_step(tmp.path());
+        step.buffer = "~/D".to_string();
+        step.handle_key(key(KeyCode::Down), &no_env); // Docker -> Documents
+        step.handle_key(key(KeyCode::Tab), &no_env);
+        assert_eq!(step.buffer, "~/Documents/");
+    }
+
+    #[test]
+    fn tab_accepts_an_unambiguous_single_directory_with_its_trailing_slash() {
         let tmp = tempfile::tempdir().expect("tempdir");
         fs::create_dir(tmp.path().join("projects")).expect("create dir");
         let mut step = typing_step(tmp.path());
         step.buffer = "~/pro".to_string();
-        step.complete_tab(&no_env);
-        // Component-by-component: the single dir is completed with its trailing `/` and Tab stops.
+        step.handle_key(key(KeyCode::Tab), &no_env);
         assert_eq!(step.buffer, "~/projects/");
     }
 
@@ -695,7 +704,7 @@ mod tests {
         let mut step = typing_step(tmp.path());
         // The literal `$BASE` stays in the buffer; expansion is internal at the boundary.
         step.buffer = "$BASE/tar".to_string();
-        step.complete_tab(&getenv);
+        step.handle_key(key(KeyCode::Tab), &getenv);
         assert_eq!(step.buffer, "$BASE/target/");
     }
 
@@ -774,15 +783,33 @@ mod tests {
     #[test]
     fn render_shows_more_footer_when_candidates_overflow_the_cap() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        for i in 0..path_autocomplete::CANDIDATE_CAP + 5 {
+        for i in 0..path_autocomplete::MAX_CANDIDATE_CAP + 5 {
             fs::create_dir(tmp.path().join(format!("dir{i:02}"))).expect("create dir");
         }
         let mut step = typing_step(tmp.path());
         step.buffer = "~/".to_string();
+        // Tall enough that ⅔ of the body would exceed the ceiling — the ceiling wins (#84).
         let lines = render_lines(&step, 0, 70, 20);
         assert!(
             lines.iter().any(|l| l.contains("more — keep typing")),
             "expected the +M more footer, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn render_candidate_cap_shrinks_for_a_short_pane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for i in 0..12 {
+            fs::create_dir(tmp.path().join(format!("dir{i:02}"))).expect("create dir");
+        }
+        let mut step = typing_step(tmp.path());
+        step.buffer = "~/".to_string();
+        // A 14-row pane's ⅔ cap (9) is below `MAX_CANDIDATE_CAP`, so the footer must reflect the
+        // narrower adaptive cap rather than the absolute ceiling (#84).
+        let lines = render_lines(&step, 0, 70, 14);
+        assert!(
+            lines.iter().any(|l| l.contains("+3 more — keep typing")),
+            "expected the adaptive-cap footer to read +3 more, got: {lines:?}"
         );
     }
 

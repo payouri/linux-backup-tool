@@ -1,4 +1,4 @@
-//! The `F1` help overlay: the single exhaustive keybinding reference (#51 / #61 / #77).
+//! The `F1` help overlay: the single exhaustive keybinding reference (#51 / #61 / #77 / #84).
 //!
 //! Every binding the tool has — the cross-screen keymap plus the modal and RUN context keys —
 //! lives here in one panel, so the footer only ever needs to carry a context subset and always
@@ -26,6 +26,10 @@ const GROUPS: &[(&str, &str)] = &[
     (
         "Panes",
         "Tab / Shift-Tab focus · →/Enter into dir · ←/Backspace up",
+    ),
+    (
+        "Path field",
+        "Tab/→/End accept candidate · ↑↓ pick sibling · Enter commit",
     ),
     (
         "Select",
@@ -78,7 +82,7 @@ pub fn render(frame: &mut Frame, area: Rect, scroll: u16) {
             } else {
                 Line::from(vec![
                     Span::styled(
-                        format!("{label:<9}"),
+                        format!("{label:<11}"),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),

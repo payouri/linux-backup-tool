@@ -7,7 +7,9 @@
 //! any depth. `Space` toggles the focused node — a directory toggles its whole subtree
 //! (prefix-wins, no carve-outs) — and `Ctrl-A`/`Ctrl-D` select/deselect the whole focused
 //! scope. Below [`TWO_PANE_MIN_WIDTH`] the split collapses to a single active column that
-//! `Tab` swaps.
+//! `Tab` swaps. That focus-toggle meaning is only for the two-pane view: while the Custom-path
+//! add field is open, `Tab` instead accepts the highlighted autocomplete candidate (#84, see
+//! [`WhatScreen::handle_field_key`]).
 //!
 //! The navigable tree is **presentation grouping of the already-scanned flat Entries** — this
 //! module derives it live from the [`SelectionModel`], never storing a tri-state tree (ADR-0006
@@ -294,11 +296,12 @@ impl WhatScreen {
     }
 
     /// Folds one key into the open Custom-path add field (#75), mirroring the WHERE field's
-    /// autocomplete controls: `Tab` LCP-completes, `→`/`End` accept the ghost, `↑`/`↓` move the
-    /// candidate cursor, `Enter` accepts a partial or commits the named path, `Esc` closes the
-    /// field, and characters/`Backspace` edit the buffer. `App` routes here (with the run facts
-    /// and env resolver the wizard reducer doesn't carry, ADR-0004) only while [`Self::is_typing`]
-    /// holds; the step-motion chords stay with the wizard.
+    /// autocomplete controls: `Tab`/`→`/`End` all accept the highlighted candidate (menu-complete,
+    /// #84 — `↓` first to pick a different sibling), `↑`/`↓` move the candidate cursor, `Enter`
+    /// accepts a partial or commits the named path, `Esc` closes the field, and
+    /// characters/`Backspace` edit the buffer. `App` routes here (with the run facts and env
+    /// resolver the wizard reducer doesn't carry, ADR-0004) only while [`Self::is_typing`] holds;
+    /// the step-motion chords stay with the wizard.
     pub fn handle_field_key(
         &mut self,
         key: KeyEvent,
@@ -313,14 +316,7 @@ impl WhatScreen {
         match key.code {
             KeyCode::Esc => self.custom_input = None,
             KeyCode::Enter => self.commit_custom_path(state, home, privilege, getenv),
-            KeyCode::Tab => {
-                let view = self.custom_autocomplete(home, privilege, getenv);
-                if let Some(input) = self.custom_input.as_mut() {
-                    path_autocomplete::complete_tab(&mut input.buffer, &view);
-                    input.ac_selected = 0;
-                }
-            }
-            KeyCode::Right | KeyCode::End => {
+            KeyCode::Tab | KeyCode::Right | KeyCode::End => {
                 let view = self.custom_autocomplete(home, privilege, getenv);
                 if let Some(input) = self.custom_input.as_mut() {
                     path_autocomplete::accept_ghost(&mut input.buffer, &view);
@@ -848,7 +844,11 @@ fn render_custom_field(
     field.push(Span::raw(" ]"));
     lines.push(Line::from(field));
 
-    lines.extend(path_autocomplete::candidate_lines(&view, glyphs));
+    lines.extend(path_autocomplete::candidate_lines(
+        &view,
+        glyphs,
+        inner.height as usize,
+    ));
 
     lines.push(Line::styled(
         path_autocomplete::scope_hint(privilege).to_string(),
@@ -1565,6 +1565,34 @@ mod tests {
         assert_eq!(
             screen.custom_input.as_ref().expect("field open").buffer,
             "~/projects/"
+        );
+    }
+
+    #[test]
+    fn tab_accepts_the_highlighted_candidate_even_when_ambiguous() {
+        // Same #84 menu-complete behaviour as the WHERE field, over the WHAT Custom-path field
+        // (the shared engine's second caller): `Tab` no longer stops at the longest common prefix.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        for dir in ["Documents", "Downloads", "Docker"] {
+            std::fs::create_dir(home.join(dir)).expect("fixture dir");
+        }
+        let mut state = WizardState::new(SelectionModel::new(vec![]), Some(home.to_path_buf()));
+        let mut screen = WhatScreen::new(state.selection());
+        screen.custom_input = Some(CustomInput {
+            buffer: "~/D".to_string(),
+            ..Default::default()
+        });
+        screen.handle_field_key(
+            key(KeyCode::Tab),
+            &mut state,
+            home,
+            Privilege::NonRoot,
+            &no_env,
+        );
+        assert_eq!(
+            screen.custom_input.as_ref().expect("field open").buffer,
+            "~/Docker/"
         );
     }
 

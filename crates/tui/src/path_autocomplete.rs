@@ -1,14 +1,21 @@
-//! The shared fish-style path-autocomplete engine for the custom-path fields (#52 / #75).
+//! The shared fish-style path-autocomplete engine for the custom-path fields (#52 / #75 / #84).
 //!
 //! Both the WHERE Output-location field ([`crate::where_step`]) and the WHAT Custom-path add
 //! field ([`crate::what_screen`]) drive the same completion behaviour — a live candidate list,
-//! inline ghost-text, component-by-component `Tab`, and `→`/`End` accept — over the same policy:
-//! completion is over **existing paths only** (the tool never creates), dotfiles stay hidden
-//! until the current segment starts with `.`, and non-root scope is proactive and lexical
-//! (matching [`catalog::validate_custom_path`]). The two screens differ only in what a *committed*
-//! path must be (WHERE requires a writable directory; WHAT accepts an existing file or directory),
-//! so that acceptance policy stays in each screen while the engine itself lives here once — the
+//! inline ghost-text, and `Tab`/`→`/`End` accept — over the same policy: completion is over
+//! **existing paths only** (the tool never creates), dotfiles stay hidden until the current
+//! segment starts with `.`, and non-root scope is proactive and lexical (matching
+//! [`catalog::validate_custom_path`]). The two screens differ only in what a *committed* path
+//! must be (WHERE requires a writable directory; WHAT accepts an existing file or directory), so
+//! that acceptance policy stays in each screen while the engine itself lives here once — the
 //! second real caller ADR-0001's reasoning was waiting for.
+//!
+//! `Tab` menu-completes: it accepts the highlighted candidate, exactly like `→`/`End` (#84). A
+//! prior LCP `complete_tab` made `Tab` extend only as far as the candidates' common prefix — a
+//! silent no-op once the fragment itself was the longest common prefix (`~/Do` staying `~/Do`
+//! with `Documents`/`Downloads` both live). `↓` then `Tab` picks a sibling before accepting it;
+//! stateful cycling on repeated `Tab` presses is deferred (needs menu state the recompute-on-
+//! demand engine avoids).
 //!
 //! Per ADR-0005 D6 the directory listing goes through [`fs_probe::list_dir`]; per ADR-0004 the
 //! `~`/`$VAR` expansion happens at the `tui` boundary through the injected `getenv` resolver,
@@ -28,16 +35,25 @@ use crate::glyphs::Glyphs;
 /// `core` never reads the environment itself. `main` passes `std::env::var`; tests pass a fake.
 pub(crate) type Getenv<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-/// How many candidate rows a field shows before folding the remainder into a `+M more` footer
-/// (#52's type-to-narrow, no giant scroll). Kept small so a list fits without a scrollbar.
-pub(crate) const CANDIDATE_CAP: usize = 8;
+/// The absolute ceiling on candidate rows ever kept or shown, regardless of terminal size (#84):
+/// past this, type-to-narrow — not a taller list — is expected to do the work. `compute` truncates
+/// to this once per keystroke; [`candidate_cap`] then narrows further for a short pane.
+pub(crate) const MAX_CANDIDATE_CAP: usize = 10;
+
+/// The adaptive display cap for a pane `body_rows` tall: two thirds of the available rows, up to
+/// [`MAX_CANDIDATE_CAP`] (#84). Display-only — `compute` already did the full listing, filtering,
+/// and sorting up to [`MAX_CANDIDATE_CAP`], so narrowing the *shown* slice at render time adds no
+/// new per-keystroke cost.
+pub(crate) fn candidate_cap(body_rows: usize) -> usize {
+    (body_rows * 2 / 3).min(MAX_CANDIDATE_CAP)
+}
 
 /// The computed autocomplete listing for a buffer — recomputed on demand (in both the reducer
 /// and the render) rather than cached, so it always reflects the live buffer and disk.
 pub(crate) struct Autocomplete {
     pub candidates: Vec<DirEntry>,
     pub selected: usize,
-    /// Total matches before the [`CANDIDATE_CAP`] truncation, for the `+M more` footer.
+    /// Total matches before the [`MAX_CANDIDATE_CAP`] truncation, for the `+M more` footer.
     pub total: usize,
     /// Non-root typed a path outside `$HOME` — no candidates are offered (proactive scope, #52).
     pub out_of_scope: bool,
@@ -110,7 +126,7 @@ pub(crate) fn compute(
     });
 
     let total = matched.len();
-    matched.truncate(CANDIDATE_CAP);
+    matched.truncate(MAX_CANDIDATE_CAP);
     let selected = ac_selected.min(matched.len().saturating_sub(1));
     Autocomplete {
         candidates: matched,
@@ -136,36 +152,9 @@ pub(crate) fn ghost(buffer: &str, view: &Autocomplete) -> String {
     ghost
 }
 
-/// `Tab`: complete the longest common prefix, or descend into an unambiguous single directory —
-/// component-by-component, stopping at each directory's trailing `/` (#52). Mutates `buffer`; the
-/// caller resets the candidate cursor.
-pub(crate) fn complete_tab(buffer: &mut String, view: &Autocomplete) {
-    if view.candidates.is_empty() {
-        return;
-    }
-    let next = {
-        let (dir_part, fragment) = split_buffer(buffer);
-        if view.candidates.len() == 1 {
-            Some(extend(dir_part, &view.candidates[0]))
-        } else {
-            let lcp = longest_common_prefix(&view.candidates);
-            // Only extend when the common prefix reaches past what's already typed — otherwise
-            // Tab is a no-op on an already-ambiguous fragment (the prototype's `~/Do →Tab→ ~/Do`).
-            if lcp.chars().count() > fragment.chars().count() {
-                Some(format!("{dir_part}{lcp}"))
-            } else {
-                None
-            }
-        }
-    };
-    if let Some(next) = next {
-        *buffer = next;
-    }
-}
-
-/// `→`/`End`: accept the whole ghost — the highlighted candidate, eagerly (fish-style), with a
-/// trailing `/` when it's a directory so the next segment can follow. Mutates `buffer`; the
-/// caller resets the candidate cursor.
+/// `Tab`/`→`/`End`: accept the whole ghost — the highlighted candidate, eagerly (fish-style, menu-
+/// complete), with a trailing `/` when it's a directory so the next segment can follow (#84: all
+/// three keys are one binding). Mutates `buffer`; the caller resets the candidate cursor.
 pub(crate) fn accept_ghost(buffer: &mut String, view: &Autocomplete) {
     let Some(candidate) = view.candidates.get(view.selected) else {
         return;
@@ -196,25 +185,6 @@ fn extend(dir_part: &str, candidate: &DirEntry) -> String {
     out
 }
 
-/// The longest common prefix of the candidates' names — how far `Tab` can extend a fragment
-/// without guessing between them.
-fn longest_common_prefix(candidates: &[DirEntry]) -> String {
-    let mut names = candidates.iter().map(|c| c.name.to_string_lossy());
-    let Some(first) = names.next() else {
-        return String::new();
-    };
-    let mut prefix: Vec<char> = first.chars().collect();
-    for name in names {
-        let common = prefix
-            .iter()
-            .zip(name.chars())
-            .take_while(|(a, b)| **a == *b)
-            .count();
-        prefix.truncate(common);
-    }
-    prefix.into_iter().collect()
-}
-
 /// The standing scope hint under a custom-path field: root ranges the whole filesystem, non-root
 /// stays under `~` (#52). Shared verbatim by both fields ([`crate::where_step`], [`crate::what_screen`]).
 pub(crate) fn scope_hint(privilege: Privilege) -> &'static str {
@@ -226,10 +196,15 @@ pub(crate) fn scope_hint(privilege: Privilege) -> &'static str {
 
 /// The candidate-list body both custom-path fields draw: the out-of-scope warning for a non-root
 /// path outside `~`, or the dirs-first candidate rows (symlink-marked, the highlighted row
-/// cursored) with a `+M more` footer when the list overflows [`CANDIDATE_CAP`]. The caller owns
-/// the surrounding frame (title, field line, per-screen warnings, scope hint); this is only the
-/// common list the two screens render identically.
-pub(crate) fn candidate_lines(view: &Autocomplete, glyphs: Glyphs) -> Vec<Line<'static>> {
+/// cursored) with a `+M more` footer when the list overflows the [`candidate_cap`] for a
+/// `body_rows`-tall pane (#84). The caller owns the surrounding frame (title, field line,
+/// per-screen warnings, scope hint); this is only the common list the two screens render
+/// identically.
+pub(crate) fn candidate_lines(
+    view: &Autocomplete,
+    glyphs: Glyphs,
+    body_rows: usize,
+) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let warn = Style::default().fg(Color::Yellow);
 
@@ -243,8 +218,9 @@ pub(crate) fn candidate_lines(view: &Autocomplete, glyphs: Glyphs) -> Vec<Line<'
         )];
     }
 
+    let shown = view.candidates.len().min(candidate_cap(body_rows));
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (idx, candidate) in view.candidates.iter().enumerate() {
+    for (idx, candidate) in view.candidates.iter().take(shown).enumerate() {
         let name = candidate.name.to_string_lossy();
         let slash = if candidate.is_dir { "/" } else { "" };
         let kind = if candidate.is_dir { "dir" } else { "file" };
@@ -256,7 +232,7 @@ pub(crate) fn candidate_lines(view: &Autocomplete, glyphs: Glyphs) -> Vec<Line<'
         let cursor = if idx == view.selected { "  ←" } else { "" };
         lines.push(Line::from(format!("  {name}{slash}  {kind}{link}{cursor}")));
     }
-    let hidden = view.total.saturating_sub(view.candidates.len());
+    let hidden = view.total.saturating_sub(shown);
     if hidden > 0 {
         lines.push(Line::styled(
             format!("  +{hidden} more — keep typing to narrow"),
@@ -264,4 +240,28 @@ pub(crate) fn candidate_lines(view: &Autocomplete, glyphs: Glyphs) -> Vec<Line<'
         ));
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_cap_scales_with_two_thirds_of_body_rows() {
+        assert_eq!(candidate_cap(9), 6);
+        assert_eq!(candidate_cap(12), 8);
+    }
+
+    #[test]
+    fn candidate_cap_never_exceeds_the_absolute_ceiling() {
+        // A tall pane (e.g. `Comfortable` reflow) still stops at `MAX_CANDIDATE_CAP` — past it,
+        // type-to-narrow does the work rather than an ever-taller list (#84).
+        assert_eq!(candidate_cap(100), MAX_CANDIDATE_CAP);
+    }
+
+    #[test]
+    fn candidate_cap_shrinks_to_zero_in_a_body_with_no_room() {
+        assert_eq!(candidate_cap(0), 0);
+        assert_eq!(candidate_cap(1), 0);
+    }
 }
