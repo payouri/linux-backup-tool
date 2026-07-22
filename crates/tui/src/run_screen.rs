@@ -29,12 +29,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::glyphs::Glyphs;
 use crate::reflow::{ReflowTier, MIN_BODY_ROWS};
-
-/// The indeterminate-phase spinner frames (Unicode braille; the no-emoji fallback is build
-/// #72). Advanced once per poll tick so a long Compressing/Encrypting/Finalizing phase reads
-/// as alive rather than hung.
-const SPINNER: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠇'];
 
 /// The self-contained backup inputs the runtime hands to the worker thread. Everything is
 /// owned (cloned out of the wizard at launch) so the worker outlives the wizard view it came
@@ -294,7 +290,13 @@ fn mode_label(activity: &RunActivity) -> &'static str {
 /// Draws the RUN screen into the app frame: the mode label, the body (progress, or the
 /// success/failure summary), and the one-line footer. The `Refuse` cutoff is handled upstream
 /// in [`crate::app::App::render`], so this only ever draws a laid-out frame.
-pub fn render(frame: &mut Frame, area: Rect, screen: &RunScreen, _tier: ReflowTier) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    screen: &RunScreen,
+    _tier: ReflowTier,
+    glyphs: Glyphs,
+) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(MIN_BODY_ROWS),
@@ -307,7 +309,7 @@ pub fn render(frame: &mut Frame, area: Rect, screen: &RunScreen, _tier: ReflowTi
             .style(Style::default().add_modifier(Modifier::DIM)),
         chunks[0],
     );
-    frame.render_widget(Paragraph::new(body_lines(screen)), chunks[1]);
+    frame.render_widget(Paragraph::new(body_lines(screen, glyphs)), chunks[1]);
     frame.render_widget(
         Paragraph::new(footer_hint(&screen.activity))
             .alignment(Alignment::Center)
@@ -317,30 +319,31 @@ pub fn render(frame: &mut Frame, area: Rect, screen: &RunScreen, _tier: ReflowTi
 }
 
 /// The footer hint: `Ctrl-C cancel` while running (the user needs only that Ctrl-C cancels),
-/// `Enter close` once terminal (#61 copy).
+/// `Enter close` once terminal (#61 copy). Both keep the `? keys` pointer to the exhaustive
+/// overlay that the footer always carries on every screen (#51).
 fn footer_hint(activity: &RunActivity) -> &'static str {
     match activity {
-        RunActivity::Running(_) => "Ctrl-C cancel",
-        _ => "Enter close",
+        RunActivity::Running(_) => "Ctrl-C cancel · ? keys",
+        _ => "Enter close · ? keys",
     }
 }
 
 /// The body content for the current activity.
-fn body_lines(screen: &RunScreen) -> Vec<Line<'static>> {
+fn body_lines(screen: &RunScreen, glyphs: Glyphs) -> Vec<Line<'static>> {
     match &screen.activity {
-        RunActivity::Running(progress) => running_lines(&screen.plan, progress),
-        RunActivity::Done(outcome) => success_lines(&screen.plan, outcome),
-        RunActivity::Failed(failure) => failure_lines(failure),
+        RunActivity::Running(progress) => running_lines(&screen.plan, progress, glyphs),
+        RunActivity::Done(outcome) => success_lines(&screen.plan, outcome, glyphs),
+        RunActivity::Failed(failure) => failure_lines(failure, glyphs),
     }
 }
 
 /// The in-progress body: heading, the phase row, and either the per-Entry Reading bar or the
 /// indeterminate-phase spinner (#61 copy).
-fn running_lines(plan: &RunPlan, progress: &RunProgress) -> Vec<Line<'static>> {
+fn running_lines(plan: &RunPlan, progress: &RunProgress, glyphs: Glyphs) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from("Backing up…"),
         Line::default(),
-        phase_row(plan.encrypted, progress.phase),
+        phase_row(plan.encrypted, progress.phase, glyphs),
         Line::default(),
     ];
     // The per-Entry bar belongs to Reading (core's `Scanning`); every other phase is
@@ -355,16 +358,17 @@ fn running_lines(plan: &RunPlan, progress: &RunProgress) -> Vec<Line<'static>> {
         };
         lines.push(Line::from(reading_bar(progress.entry_done, total)));
     } else if let Some(phase) = progress.phase {
-        let spin = SPINNER[progress.spinner_tick % SPINNER.len()];
+        let spin = glyphs.spinner[progress.spinner_tick % glyphs.spinner.len()];
         lines.push(Line::from(format!("{spin} {}…", phase_label(phase))));
     }
     lines
 }
 
 /// The phase row `✓ Reading  ● Compressing  · Finalizing` — the display phases in order, each
-/// glyphed by position relative to the current phase (done / current / pending). Encrypting is
-/// omitted entirely for a plaintext run (#65/#61), so it never appears when `!encrypted`.
-fn phase_row(encrypted: bool, current: Option<Phase>) -> Line<'static> {
+/// glyphed by position relative to the current phase (done / current / pending), through the
+/// active glyph set (#73). Encrypting is omitted entirely for a plaintext run (#65/#61), so it
+/// never appears when `!encrypted`.
+fn phase_row(encrypted: bool, current: Option<Phase>, glyphs: Glyphs) -> Line<'static> {
     let current_rank = current.and_then(phase_rank);
     let mut spans: Vec<Span<'static>> = Vec::new();
     for phase in display_phases(encrypted) {
@@ -373,14 +377,16 @@ fn phase_row(encrypted: bool, current: Option<Phase>) -> Line<'static> {
         }
         let rank = phase_rank(phase);
         let (glyph, style) = match (current_rank, rank) {
-            (Some(cur), Some(this)) if this < cur => ('✓', Style::default().fg(Color::Green)),
+            (Some(cur), Some(this)) if this < cur => {
+                (glyphs.check, Style::default().fg(Color::Green))
+            }
             (Some(cur), Some(this)) if this == cur => (
-                '●',
+                glyphs.current,
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            _ => ('·', Style::default().add_modifier(Modifier::DIM)),
+            _ => (glyphs.locked, Style::default().add_modifier(Modifier::DIM)),
         };
         spans.push(Span::styled(
             format!("{glyph} {}", phase_label(phase)),
@@ -443,7 +449,7 @@ fn reading_bar(done: usize, total: usize) -> String {
 /// The success summary (#61 copy): Backup dir, the Entry-count · size · encryption-tag line,
 /// per-manager Package counts, the vanished callout only when count > 0, and the persistent
 /// plaintext-Sensitive warning when Sensitive content shipped unencrypted.
-fn success_lines(plan: &RunPlan, outcome: &BackupOutcome) -> Vec<Line<'static>> {
+fn success_lines(plan: &RunPlan, outcome: &BackupOutcome, glyphs: Glyphs) -> Vec<Line<'static>> {
     let manifest = &outcome.manifest;
     let tag = if plan.encrypted {
         "encrypted"
@@ -452,7 +458,7 @@ fn success_lines(plan: &RunPlan, outcome: &BackupOutcome) -> Vec<Line<'static>> 
     };
     let mut lines = vec![
         Line::from(Span::styled(
-            "✓ Backup complete",
+            format!("{} Backup complete", glyphs.check),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -479,7 +485,8 @@ fn success_lines(plan: &RunPlan, outcome: &BackupOutcome) -> Vec<Line<'static>> 
     if !manifest.vanished.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(
-                "⚠ {} Entries vanished, skipped — recorded in the Manifest",
+                "{} {} Entries vanished, skipped — recorded in the Manifest",
+                glyphs.warn,
                 manifest.vanished.len()
             ),
             Style::default().fg(Color::Yellow),
@@ -489,7 +496,8 @@ fn success_lines(plan: &RunPlan, outcome: &BackupOutcome) -> Vec<Line<'static>> 
     if !plan.plaintext_sensitive_categories.is_empty() {
         lines.push(Line::from(Span::styled(
             format!(
-                "⚠ not encrypted — {} in plaintext",
+                "{} not encrypted — {} in plaintext",
+                glyphs.warn,
                 plan.plaintext_sensitive_categories.join(", ")
             ),
             Style::default()
@@ -504,7 +512,7 @@ fn success_lines(plan: &RunPlan, outcome: &BackupOutcome) -> Vec<Line<'static>> 
 /// The failure screen (#61 copy): the error line, then the ADR-0002 reassurance that a
 /// fail-fast run left nothing behind (or, on an abandoned worker, that completeness can't be
 /// promised).
-fn failure_lines(failure: &RunFailure) -> Vec<Line<'static>> {
+fn failure_lines(failure: &RunFailure, glyphs: Glyphs) -> Vec<Line<'static>> {
     let reassurance = if failure.cleaned_up {
         "Nothing was written — the partial backup was removed."
     } else {
@@ -512,7 +520,7 @@ fn failure_lines(failure: &RunFailure) -> Vec<Line<'static>> {
     };
     vec![
         Line::from(Span::styled(
-            "✗ Backup failed",
+            format!("{} Backup failed", glyphs.cross),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )),
         Line::default(),
@@ -626,7 +634,15 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal
-            .draw(|frame| render(frame, frame.area(), screen, ReflowTier::Default))
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    screen,
+                    ReflowTier::Default,
+                    Glyphs::UNICODE,
+                );
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         (0..height)
@@ -655,7 +671,7 @@ mod tests {
 
     #[test]
     fn plaintext_run_omits_the_encrypting_phase() {
-        let row = phase_row(false, Some(Phase::Compressing));
+        let row = phase_row(false, Some(Phase::Compressing), Glyphs::UNICODE);
         let text: String = row
             .spans
             .iter()
@@ -672,7 +688,7 @@ mod tests {
 
     #[test]
     fn encrypted_run_shows_the_encrypting_phase() {
-        let row = phase_row(true, Some(Phase::Encrypting));
+        let row = phase_row(true, Some(Phase::Encrypting), Glyphs::UNICODE);
         let text: String = row
             .spans
             .iter()
@@ -699,6 +715,8 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("not encrypted")));
         assert!(lines.iter().any(|l| l.contains("done")));
         assert!(lines.iter().any(|l| l.contains("Enter close")));
+        // The footer always keeps the `? keys` pointer, on the RUN screen like every other (#51).
+        assert!(lines.iter().any(|l| l.contains("? keys")));
     }
 
     #[test]

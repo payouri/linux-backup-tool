@@ -26,9 +26,8 @@ ratatui = "0.30"
 # `KeyEvent`/`KeyModifiers`/`KeyEventKind` types the pure `update` reducer matches on. Pinned
 # to 0.29 to resolve one shared `crossterm` instance with ratatui rather than two.
 crossterm = "0.29"
-inquire = "0.9.4"
 # `age::Encryptor::with_user_passphrase` (in `core`) takes a `secrecy::SecretString`; this
-# crate needs the same type to carry the passphrase from `inquire::Password` into
+# crate needs the same type to carry the typed passphrase from the ratatui field into
 # `core::restore::restore` without ever touching it as a plain `String`. Same version core
 # pins, so the two crates share one `secrecy` instance rather than resolving two.
 secrecy = "0.10"
@@ -37,13 +36,6 @@ secrecy = "0.10"
 # dev-dependency for the same probe in a test; `tui`, unlike `core`, carries no
 # `forbid(unsafe_code)`, so it can use it directly rather than shelling out to `id -u`.
 libc = "0.2"
-# The de-facto Rust progress-bar crate (console-rs, the same org behind `dialoguer`;
-# ~350M downloads, actively maintained) — drives story 37's live per-phase RUN bars from
-# `core::progress`'s `on_phase`/`on_entry` callbacks. Chosen over hand-rolling carriage-return
-# terminal control (error-prone, no width/terminal-detection handling) for the one place the
-# alpha needs a real live bar; `inquire` already pulls in `console`'s sibling `crossterm`, so
-# this adds no genuinely new terminal-handling surface.
-indicatif = "0.18"
 
 [dev-dependencies]
 tempfile = "3.15.0"

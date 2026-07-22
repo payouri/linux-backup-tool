@@ -37,6 +37,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::glyphs::Glyphs;
+
 /// How many candidate rows the list shows before folding the remainder into a `+M more` footer
 /// (#52's type-to-narrow, no giant scroll). Kept small so the list fits the reflow ladder's
 /// minimum body without a scrollbar.
@@ -165,11 +167,18 @@ impl WhereStep {
         matches!(self.mode, Mode::Typing)
     }
 
-    /// Flips the reveal-all-dotfiles toggle. Exposed for #73's `F3` binding; nothing in this
-    /// build calls it, so it is `allow(dead_code)` until that wiring lands.
-    #[allow(dead_code)]
+    /// Flips the reveal-all-dotfiles toggle, wired to the `F3` reveal binding (#51/#73). The
+    /// key is claimed globally in [`crate::app`] so it stays live while the custom-path field
+    /// owns the plain keys.
     pub fn toggle_show_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
+    }
+
+    /// Whether dotfiles are currently revealed in the autocomplete — the observable the app's
+    /// `F3` wiring test asserts against.
+    #[cfg(test)]
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
     }
 
     /// Folds one key press into the step. `App` routes only the body keys here — the global
@@ -412,7 +421,14 @@ impl WhereStep {
     /// Draws the WHERE body: the location pick-list, the custom-path field with its live
     /// candidate list and ghost-text, the advisory space warning, and the standing scope hint.
     /// Lines past `area.height` are dropped so the body never overflows the reflow frame.
-    pub fn render(&self, frame: &mut Frame, area: Rect, selection_size: u64, getenv: Getenv) {
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        selection_size: u64,
+        getenv: Getenv,
+        glyphs: Glyphs,
+    ) {
         let dim = Style::default().add_modifier(Modifier::DIM);
         let warn = Style::default().fg(Color::Yellow);
         let ok = Style::default().fg(Color::Green);
@@ -428,7 +444,7 @@ impl WhereStep {
                 .and_then(|a| location::free_space_warning(selection_size, a))
                 .is_some();
             if tight {
-                spans.push(Span::styled("  ⚠ tight", warn));
+                spans.push(Span::styled(format!("  {} tight", glyphs.warn), warn));
             }
             lines.push(Line::from(spans));
         }
@@ -452,14 +468,17 @@ impl WhereStep {
             if !view.out_of_scope && !self.buffer.is_empty() {
                 let expanded = location::expand_path(&self.buffer, &self.home, getenv);
                 if location::ensure_writable(&expanded).is_ok() {
-                    field.push(Span::styled("  ✓ writable", ok));
+                    field.push(Span::styled(format!("  {} writable", glyphs.check), ok));
                 }
             }
             lines.push(Line::from(field));
 
             if view.out_of_scope {
                 lines.push(Line::styled(
-                    "⚠ outside ~ — non-root can only add paths under your home",
+                    format!(
+                        "{} outside ~ — non-root can only add paths under your home",
+                        glyphs.warn
+                    ),
                     warn,
                 ));
             } else {
@@ -490,7 +509,8 @@ impl WhereStep {
         if let Some((warning, label)) = self.active_warning(selection_size) {
             lines.push(Line::styled(
                 format!(
-                    "⚠ {} selection is close to {}'s {} free space.",
+                    "{} {} selection is close to {}'s {} free space.",
+                    glyphs.warn,
                     format_size(warning.selection_size),
                     label,
                     format_size(warning.available_space)
@@ -575,8 +595,7 @@ fn longest_common_prefix(candidates: &[DirEntry]) -> String {
 }
 
 /// Human-readable byte count (`B`/`KB`/`MB`/`GB`, 1024-based). Kept local to this screen module
-/// (as `where_screen`/`select_cmd` each keep their own) rather than coupling the screens while
-/// they land in parallel.
+/// rather than coupling the screens through a shared helper.
 fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -631,7 +650,15 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend terminal");
         terminal
-            .draw(|frame| step.render(frame, frame.area(), selection_size, &no_env))
+            .draw(|frame| {
+                step.render(
+                    frame,
+                    frame.area(),
+                    selection_size,
+                    &no_env,
+                    Glyphs::UNICODE,
+                );
+            })
             .expect("draw into test backend");
         let buffer = terminal.backend().buffer().clone();
         (0..height)

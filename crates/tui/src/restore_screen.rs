@@ -43,6 +43,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::glyphs::Glyphs;
 use crate::reflow::ReflowTier;
 
 /// A passphrase being typed: the canonical store is a [`SecretString`], never a retained plain
@@ -553,7 +554,13 @@ fn mode_label(flow: &RestoreFlow) -> &'static str {
 /// Draws the restore flow into `frame`. The sub-`Refuse` too-small notice is handled by the
 /// app before dispatch, so this always has a frame to draw into. Header (mode label) and footer
 /// (context hints) are fixed; only the body swaps per stage, matching the wizard's stable frame.
-pub(crate) fn render(frame: &mut Frame, area: Rect, flow: &RestoreFlow, tier: ReflowTier) {
+pub(crate) fn render(
+    frame: &mut Frame,
+    area: Rect,
+    flow: &RestoreFlow,
+    tier: ReflowTier,
+    glyphs: Glyphs,
+) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(crate::reflow::MIN_BODY_ROWS),
@@ -565,7 +572,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, flow: &RestoreFlow, tier: Re
         Paragraph::new(mode_label(flow)).style(Style::default().add_modifier(Modifier::BOLD)),
         chunks[0],
     );
-    render_body(frame, chunks[1], flow);
+    render_body(frame, chunks[1], flow, glyphs);
     frame.render_widget(
         Paragraph::new(footer_hints(flow, tier))
             .style(Style::default().add_modifier(Modifier::DIM)),
@@ -573,7 +580,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, flow: &RestoreFlow, tier: Re
     );
 }
 
-fn render_body(frame: &mut Frame, area: Rect, flow: &RestoreFlow) {
+fn render_body(frame: &mut Frame, area: Rect, flow: &RestoreFlow, glyphs: Glyphs) {
     match &flow.stage {
         Stage::Confirm { cancel_focused } => {
             render_confirm(
@@ -585,9 +592,9 @@ fn render_body(frame: &mut Frame, area: Rect, flow: &RestoreFlow) {
                 *cancel_focused,
             );
         }
-        Stage::Unlock(unlock) => render_unlock(frame, area, unlock),
+        Stage::Unlock(unlock) => render_unlock(frame, area, unlock, glyphs),
         Stage::Running(running) => render_running(frame, area, running),
-        Stage::Report(report) => render_report(frame, area, report, &flow.ctx.home),
+        Stage::Report(report) => render_report(frame, area, report, &flow.ctx.home, glyphs),
         // Terminal — the app quits on this frame; nothing meaningful to draw.
         Stage::Exit => {}
     }
@@ -642,7 +649,7 @@ fn focus_button(label: &str, focused: bool) -> Span<'static> {
     }
 }
 
-fn render_unlock(frame: &mut Frame, area: Rect, unlock: &Unlock) {
+fn render_unlock(frame: &mut Frame, area: Rect, unlock: &Unlock, glyphs: Glyphs) {
     let field = if unlock.reveal {
         unlock.input.exposed().to_owned()
     } else {
@@ -655,7 +662,10 @@ fn render_unlock(frame: &mut Frame, area: Rect, unlock: &Unlock) {
     ];
     if unlock.wrong {
         lines.push(Line::from(Span::styled(
-            format!("✗ wrong passphrase — attempt {}", unlock.attempt),
+            format!(
+                "{} wrong passphrase — attempt {}",
+                glyphs.cross, unlock.attempt
+            ),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
@@ -685,11 +695,11 @@ fn render_running(frame: &mut Frame, area: Rect, running: &Running) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_report(frame: &mut Frame, area: Rect, report: &Report, home: &Path) {
+fn render_report(frame: &mut Frame, area: Rect, report: &Report, home: &Path, glyphs: Glyphs) {
     let lines = match report {
         Report::Success { restored } => vec![
             Line::from(Span::styled(
-                "✓ Restore complete",
+                format!("{} Restore complete", glyphs.check),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -707,7 +717,11 @@ fn render_report(frame: &mut Frame, area: Rect, report: &Report, home: &Path) {
             let total = restored + failures.len();
             let mut lines = vec![
                 Line::from(Span::styled(
-                    format!("⚠ Restore finished with {} failures", failures.len()),
+                    format!(
+                        "{} Restore finished with {} failures",
+                        glyphs.warn,
+                        failures.len()
+                    ),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -726,7 +740,7 @@ fn render_report(frame: &mut Frame, area: Rect, report: &Report, home: &Path) {
         }
         Report::Fatal { message } => vec![
             Line::from(Span::styled(
-                "✗ Restore failed",
+                format!("{} Restore failed", glyphs.cross),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             )),
             Line::from(message.clone()),
@@ -804,7 +818,15 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend terminal");
         terminal
-            .draw(|frame| render(frame, frame.area(), flow, ReflowTier::for_height(height)))
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    flow,
+                    ReflowTier::for_height(height),
+                    Glyphs::UNICODE,
+                );
+            })
             .expect("draw into test backend");
         let buffer = terminal.backend().buffer().clone();
         (0..height)

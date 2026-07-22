@@ -18,9 +18,8 @@ pub struct RestoreArgs {
     pub verify: bool,
     /// `--overwrite`: overwrite colliding restore targets non-interactively, for scripted/AFK
     /// runs (issue #37). Defaults to `false`, in which case a collision instead triggers the
-    /// single interactive "confirm once" prompt in `restore_cmd` before anything is clobbered
-    /// — declining leaves the existing file untouched. Either way `core::restore` never
-    /// silently overwrites.
+    /// restore flow's overwrite-confirm screen before anything is clobbered — declining leaves
+    /// the existing file untouched. Either way `core::restore` never silently overwrites.
     pub overwrite: bool,
 }
 

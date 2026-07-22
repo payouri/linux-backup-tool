@@ -117,21 +117,9 @@ pub enum StepStatus {
     /// A step ahead of the frontier, not yet reachable (`·`, dimmed).
     Locked,
     /// The encryption step after a WHAT edit newly exposed Sensitive content a plaintext
-    /// decision didn't cover (`!`, jumpable) — ADR-0007 D5.
+    /// decision didn't cover (`!`, jumpable) — ADR-0007 D5. Its stepper glyph (and every other
+    /// glyph) is resolved through the render's active glyph set in [`crate::app`] / #73.
     Invalidated,
-}
-
-impl StepStatus {
-    /// The leading glyph for this status (Unicode; the no-emoji fallback is build #72).
-    #[must_use]
-    pub fn glyph(self) -> char {
-        match self {
-            Self::Completed => '✓',
-            Self::Current => '●',
-            Self::Locked => '·',
-            Self::Invalidated => '!',
-        }
-    }
 }
 
 /// The reason a forward move was refused, rendered as a centered header banner dismissed on

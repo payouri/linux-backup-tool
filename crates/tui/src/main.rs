@@ -6,11 +6,9 @@
 //! the machine's [`RunContext`], and hand an [`App`] to [`runtime::run`]. No backup/restore
 //! logic lives here.
 //!
-//! This is the Foundation build (#63): the runtime, the pure `update`/render split, and the
-//! `TestBackend` harness are in place, but the screens themselves are placeholders. The
-//! inquire-based command modules below stay compiled — `inquire`/`indicatif` are not removed
-//! until later builds port each screen to ratatui (spec #62's build sequencing) — but `main`
-//! no longer dispatches to them, so they are `allow(dead_code)` until each is retired.
+//! Every screen is now on the ratatui app frame (spec #62's build sequencing complete), so the
+//! interim `inquire`-based command modules and the `inquire`/`indicatif` dependencies they held
+//! alive have been retired from the workspace (#73).
 //!
 //! `main` is one of the two places (tests being the other) AGENTS.md's coding conventions
 //! exempt from the no-`unwrap`/`expect`/`panic!` rule — kept narrow here: the only thing this
@@ -23,6 +21,8 @@
 mod app;
 mod cli;
 mod encryption_screen;
+mod glyphs;
+mod help;
 mod reflow;
 mod restore_screen;
 mod run_screen;
@@ -31,21 +31,6 @@ mod system;
 mod what_screen;
 mod where_step;
 mod wizard;
-
-// Retired screen by screen per spec #62: these inquire-based modules stay compiled (so
-// `inquire`/`indicatif` and their existing tests survive the interim) but are no longer
-// reachable from `main` now that it drives the ratatui runtime. Each is deleted as its
-// ratatui replacement lands.
-#[allow(dead_code)]
-mod backup_cmd;
-#[allow(dead_code)]
-mod encryption_cmd;
-#[allow(dead_code)]
-mod restore_cmd;
-#[allow(dead_code)]
-mod select_cmd;
-#[allow(dead_code)]
-mod where_screen;
 
 use std::process::ExitCode;
 
@@ -66,14 +51,17 @@ fn run() -> anyhow::Result<()> {
     let args = std::env::args().skip(1);
     let command = cli::parse_args(args).map_err(anyhow::Error::msg)?;
     let run_context = system::build_run_context()?;
+    // The no-emoji fallback is an ambient run fact decided once here at the `tui` boundary from
+    // the process locale (ADR-0004: never read inside `core`), then threaded through render.
+    let glyphs = glyphs::Glyphs::detect(|name| std::env::var(name).ok());
 
     // `restore` carries its Backup-dir argument into a dedicated constructor (the flow probes
     // it to pick its opening screen, #72); the argument-less routes just seed their `Screen`.
     let app = match command {
-        cli::Command::Restore(args) => App::new_restore(args, run_context),
-        cli::Command::Backup => App::new(Screen::Backup, run_context),
-        cli::Command::Select => App::new(Screen::Select, run_context),
-        cli::Command::Where => App::new(Screen::Where, run_context),
+        cli::Command::Restore(args) => App::new_restore(args, run_context, glyphs),
+        cli::Command::Backup => App::new(Screen::Backup, run_context, glyphs),
+        cli::Command::Select => App::new(Screen::Select, run_context, glyphs),
+        cli::Command::Where => App::new(Screen::Where, run_context, glyphs),
     };
     runtime::run(app)
 }

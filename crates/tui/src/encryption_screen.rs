@@ -33,6 +33,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::glyphs::Glyphs;
 use crate::wizard::Wizard;
 
 /// The exact word the plaintext modal demands before `[ Confirm ]` enables (#61 copy sheet).
@@ -41,7 +42,9 @@ const PLAINTEXT_WORD: &str = "PLAINTEXT";
 /// The invalidation banner shown in the body while a completed plaintext decision has been
 /// overtaken by newly-added Sensitive content (#61, verbatim). It steers to the safe action;
 /// the plaintext escape stays the un-advertised `disable encryption (plaintext)` button below.
-const INVALIDATION_BANNER: &str = "⚠ Sensitive content added — set a passphrase.";
+/// The leading `⚠` is prepended at render from the active glyph set (#73), so this holds the
+/// message text alone.
+const INVALIDATION_BANNER: &str = "Sensitive content added — set a passphrase.";
 
 /// A focusable control on the encryption body. The valid set depends on the mode (see
 /// [`EncryptionScreen::fields`]): the offered radio only exists when nothing is Sensitive, the
@@ -356,13 +359,23 @@ fn pop_char(secret: &SecretString) -> SecretString {
 /// content is `expose_secret()` formatted for this frame only; otherwise a bullet mask. The
 /// returned line borrows nothing from the secret — the revealed text is an owned `String` that
 /// lives no longer than the frame.
-fn field_line(label: &str, secret: &SecretString, focused: bool, reveal: bool) -> Line<'static> {
+fn field_line(
+    label: &str,
+    secret: &SecretString,
+    focused: bool,
+    reveal: bool,
+    glyphs: Glyphs,
+) -> Line<'static> {
     let content = if reveal {
         secret.expose_secret().to_owned()
     } else {
         "•".repeat(secret.expose_secret().chars().count())
     };
-    let marker = if focused { "▸ " } else { "  " };
+    let marker = if focused {
+        format!("{} ", glyphs.pointer)
+    } else {
+        "  ".to_owned()
+    };
     let label_style = if focused {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
@@ -376,15 +389,15 @@ fn field_line(label: &str, secret: &SecretString, focused: bool, reveal: bool) -
 }
 
 /// The match-indicator line for the current state, or an empty line when silent (#61).
-fn match_line(state: MatchState) -> Line<'static> {
+fn match_line(state: MatchState, glyphs: Glyphs) -> Line<'static> {
     match state {
         MatchState::Silent => Line::from(""),
         MatchState::Match => Line::from(Span::styled(
-            "  ✓ passphrases match",
+            format!("  {} passphrases match", glyphs.check),
             Style::default().fg(Color::Green),
         )),
         MatchState::Mismatch => Line::from(Span::styled(
-            "  ✗ passphrases do not match",
+            format!("  {} passphrases do not match", glyphs.cross),
             Style::default().fg(Color::Red),
         )),
     }
@@ -402,7 +415,7 @@ fn reveal_hint(reveal: bool) -> Span<'static> {
 
 /// Draws the encryption step body, then the plaintext modal on top when it is open. `reveal`
 /// is the view-only `App` flag `F2` toggles.
-pub(crate) fn render(frame: &mut Frame, area: Rect, wizard: &Wizard, reveal: bool) {
+pub(crate) fn render(frame: &mut Frame, area: Rect, wizard: &Wizard, reveal: bool, glyphs: Glyphs) {
     let state = wizard.state();
     let screen = wizard.encryption_screen();
     let sensitive = state.is_sensitive();
@@ -424,7 +437,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, wizard: &Wizard, reveal: boo
 
     if state.encryption_invalidated() {
         lines.push(Line::from(Span::styled(
-            INVALIDATION_BANNER,
+            format!("{} {INVALIDATION_BANNER}", glyphs.warn),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -440,10 +453,14 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, wizard: &Wizard, reveal: boo
             categories.join(", ")
         )));
         lines.push(Line::from(""));
-        push_passphrase_fields(&mut lines, screen, reveal);
+        push_passphrase_fields(&mut lines, screen, reveal, glyphs);
         lines.push(Line::from(""));
         let disable_focused = screen.focus == Field::Disable;
-        let marker = if disable_focused { "▸ " } else { "  " };
+        let marker = if disable_focused {
+            format!("{} ", glyphs.pointer)
+        } else {
+            "  ".to_owned()
+        };
         let style = if disable_focused {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
@@ -463,14 +480,16 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, wizard: &Wizard, reveal: boo
             !screen.encrypt_opt_in,
             radio_focused && !screen.encrypt_opt_in,
             "Leave plaintext  (default)",
+            glyphs,
         ));
         lines.push(radio_line(
             screen.encrypt_opt_in,
             radio_focused && screen.encrypt_opt_in,
             "Encrypt with a passphrase",
+            glyphs,
         ));
         if screen.encrypt_opt_in {
-            push_passphrase_fields(&mut lines, screen, reveal);
+            push_passphrase_fields(&mut lines, screen, reveal, glyphs);
         }
     }
 
@@ -483,12 +502,18 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, wizard: &Wizard, reveal: boo
 }
 
 /// Pushes the passphrase + confirm fields and the match indicator onto `lines`.
-fn push_passphrase_fields(lines: &mut Vec<Line<'static>>, screen: &EncryptionScreen, reveal: bool) {
+fn push_passphrase_fields(
+    lines: &mut Vec<Line<'static>>,
+    screen: &EncryptionScreen,
+    reveal: bool,
+    glyphs: Glyphs,
+) {
     let mut passphrase = field_line(
         "Passphrase",
         &screen.passphrase,
         screen.focus == Field::Passphrase,
         reveal,
+        glyphs,
     );
     passphrase.spans.push(reveal_hint(reveal));
     lines.push(passphrase);
@@ -497,13 +522,18 @@ fn push_passphrase_fields(lines: &mut Vec<Line<'static>>, screen: &EncryptionScr
         &screen.confirm,
         screen.focus == Field::Confirm,
         reveal,
+        glyphs,
     ));
-    lines.push(match_line(screen.match_state()));
+    lines.push(match_line(screen.match_state(), glyphs));
 }
 
 /// One offered-mode radio row: `( )`/`(•)` selection glyph plus the label, marked when focused.
-fn radio_line(selected: bool, focused: bool, label: &str) -> Line<'static> {
-    let marker = if focused { "▸ " } else { "  " };
+fn radio_line(selected: bool, focused: bool, label: &str, glyphs: Glyphs) -> Line<'static> {
+    let marker = if focused {
+        format!("{} ", glyphs.pointer)
+    } else {
+        "  ".to_owned()
+    };
     let glyph = if selected { "(•) " } else { "( ) " };
     let style = if focused {
         Style::default().add_modifier(Modifier::BOLD)

@@ -27,6 +27,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::cli::RestoreArgs;
+use crate::glyphs::Glyphs;
 use crate::reflow::ReflowTier;
 use crate::restore_screen::{self, RestoreFlow};
 use crate::run_screen::{BackupRequest, RunMessage, RunPlan, RunScreen};
@@ -106,8 +107,18 @@ pub struct App {
     /// The view-only passphrase-reveal flag `F2` toggles (#51). It lives here, around the
     /// model, and is read only by the encryption body's render — the passphrase itself stays a
     /// `secrecy::SecretString`; reveal formats `expose_secret()` for one frame and retains
-    /// nothing, so this bool is the whole of what a reveal persists.
+    /// nothing, so this bool is the whole of what a reveal persists. The restore flow keeps its
+    /// own per-unlock reveal, so this covers the wizard's encryption step only.
     reveal: bool,
+    /// Whether the `?` help overlay is open (#51). A view-only flag, like `reveal`: while set,
+    /// the overlay captures input (`Esc`/`?` close, `↑`/`↓` scroll) and every screen renders it
+    /// on top — at any terminal size, even below the reflow ladder's Refuse cutoff.
+    help_open: bool,
+    /// The help overlay's scroll offset, so a short terminal can page a panel taller than it.
+    help_scroll: u16,
+    /// The no-emoji fallback glyph set, decided once at startup from the locale (module
+    /// [`crate::glyphs`]) and threaded into every render — the ambient-run-fact end of ADR-0004.
+    glyphs: Glyphs,
 }
 
 impl App {
@@ -116,7 +127,7 @@ impl App {
     /// injected context) and pre-fills WHERE with the context's Output location, so the shell
     /// opens on a populated wizard rather than an empty one.
     #[must_use]
-    pub fn new(screen: Screen, run_context: RunContext) -> Self {
+    pub fn new(screen: Screen, run_context: RunContext, glyphs: Glyphs) -> Self {
         // Only the wizard shows a WHERE body; the other routes get an inert step that probes no
         // hardware (they are separate invocations of the tool).
         let where_step = match screen {
@@ -141,6 +152,9 @@ impl App {
             should_quit: false,
             pending_backup: None,
             reveal: false,
+            help_open: false,
+            help_scroll: 0,
+            glyphs,
         }
     }
 
@@ -150,17 +164,21 @@ impl App {
     /// whether to open on the overwrite-confirm, an encrypted-Backup unlock path, or a fatal
     /// report for an invalid dir.
     #[must_use]
-    pub fn new_restore(args: RestoreArgs, run_context: RunContext) -> Self {
+    pub fn new_restore(args: RestoreArgs, run_context: RunContext, glyphs: Glyphs) -> Self {
         let flow = RestoreFlow::new(args.backup_dir, run_context.clone());
         Self {
             view: View::Restore(flow),
             // Restore never enters the wizard, so its WHERE body is inert and no backup launch
-            // is ever pending; F2 reveal is a wizard-only chord.
+            // is ever pending; its F2 reveal lives inside the flow's unlock stage, so the
+            // wizard-only `App::reveal` stays false here.
             where_step: WhereStep::empty(),
             run_context,
             should_quit: false,
             pending_backup: None,
             reveal: false,
+            help_open: false,
+            help_scroll: 0,
+            glyphs,
         }
     }
 
@@ -247,15 +265,45 @@ impl App {
         };
         // `Ctrl-C` is the sole quit everywhere, and during a running backup/restore it *is* the
         // cancel (the run is abandoned as the app tears down — `core` is synchronous with no
-        // cooperative cancellation, so aborting the process is the honest cancel here).
+        // cooperative cancellation, so aborting the process is the honest cancel here). Handled
+        // before the help overlay so it aborts even with the overlay open.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return self;
         }
+        // While the `?` overlay is open it is captive (#51): `Esc`/`?` close it, `↑`/`↓` (and the
+        // page/Home/End keys) scroll it, and every other key is swallowed so nothing behind it
+        // acts. Handled before the rest of the keymap so no chord leaks through to a screen.
+        if self.help_open {
+            self.handle_help_key(key);
+            return self;
+        }
+        // The terminal-reserved chords are never bound (#51): swallow them everywhere so no
+        // screen can act on one. `Ctrl-C` (the sole honored control chord) is handled above.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('z' | 's' | 'q' | '\\'))
+        {
+            return self;
+        }
+        // `?` opens the exhaustive help overlay from anywhere (#51 Global) — a plain key that,
+        // unlike the widget-owned plain keys, is claimed globally so it is always reachable.
+        if key.code == KeyCode::Char('?') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.help_open = true;
+            self.help_scroll = 0;
+            return self;
+        }
         // F2 is the passphrase-reveal chord (#51): a view-only toggle handled here so it stays
         // live regardless of which field owns plain keys, and never reaches the reducer as text.
-        if key.code == KeyCode::F(2) {
+        // The restore flow keeps its own per-unlock reveal, so F2 is left to fall through to it.
+        if key.code == KeyCode::F(2) && !matches!(self.view, View::Restore(_)) {
             self.reveal = !self.reveal;
+            return self;
+        }
+        // F3 toggles hidden-file visibility in the WHERE autocomplete (#51 Reveal). It lives on
+        // `App` beside `reveal` because the WHERE step's view state does too; on the non-wizard
+        // routes the step is inert, so the toggle is a harmless no-op there.
+        if key.code == KeyCode::F(3) {
+            self.where_step.toggle_show_hidden();
             return self;
         }
         match self.view {
@@ -312,6 +360,29 @@ impl App {
         self
     }
 
+    /// Folds one key while the `?` overlay is open (#51). `Esc`/`?` close it; the movement keys
+    /// scroll it so a panel taller than the terminal is fully reachable; everything else is
+    /// swallowed (the overlay is captive). Scroll is clamped to the binding count so paging past
+    /// the end can't scroll the content out of view.
+    fn handle_help_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('?') => {
+                self.help_open = false;
+                self.help_scroll = 0;
+            }
+            KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+            KeyCode::Down => {
+                self.help_scroll = self
+                    .help_scroll
+                    .saturating_add(1)
+                    .min(crate::help::line_count());
+            }
+            KeyCode::PageUp | KeyCode::Home => self.help_scroll = 0,
+            KeyCode::PageDown | KeyCode::End => self.help_scroll = crate::help::line_count(),
+            _ => {}
+        }
+    }
+
     /// Transitions from REVIEW into the RUN screen and records the launch request the runtime
     /// drains to start the worker. The Selection, encryption choice, and Output location are
     /// cloned out of the wizard here so the worker owns self-contained inputs; the context's
@@ -343,25 +414,33 @@ impl App {
     pub fn render(&self, frame: &mut Frame) {
         let area = frame.area();
         let tier = ReflowTier::for_height(area.height);
-        if !tier.renders_frame() {
-            render_too_small(frame, area);
-            return;
-        }
-        match &self.view {
-            View::Wizard(wizard) => {
-                render_wizard(
-                    frame,
-                    area,
-                    wizard,
-                    &self.where_step,
-                    tier,
-                    &self.run_context,
-                    self.reveal,
-                );
+        if tier.renders_frame() {
+            match &self.view {
+                View::Wizard(wizard) => {
+                    render_wizard(
+                        frame,
+                        area,
+                        wizard,
+                        &self.where_step,
+                        tier,
+                        &self.run_context,
+                        self.reveal,
+                        self.glyphs,
+                    );
+                }
+                View::Run(run) => crate::run_screen::render(frame, area, run, tier, self.glyphs),
+                View::Restore(flow) => {
+                    restore_screen::render(frame, area, flow, tier, self.glyphs);
+                }
+                View::Placeholder(screen) => render_placeholder(frame, area, *screen),
             }
-            View::Run(run) => crate::run_screen::render(frame, area, run, tier),
-            View::Restore(flow) => restore_screen::render(frame, area, flow, tier),
-            View::Placeholder(screen) => render_placeholder(frame, area, *screen),
+        } else {
+            render_too_small(frame, area);
+        }
+        // The overlay draws last, on top of whatever the base render produced — including the
+        // sub-Refuse too-small notice, so `?` help is reachable at any terminal size (#51).
+        if self.help_open {
+            crate::help::render(frame, area, self.help_scroll);
         }
     }
 }
@@ -424,6 +503,10 @@ fn render_placeholder(frame: &mut Frame, area: Rect, screen: Screen) {
 /// optional gate banner, the body region, and the footer hints. Only the body swaps between
 /// steps — the header and footer keep their rows, so the frame never jumps on step change
 /// (ADR-0007 D6).
+// The eight inputs are the frame's irreducible render facts (state, layout tier, the injected
+// context, and the two view-only flags reveal/glyphs); bundling them into a struct would only
+// move the argument list, not shorten what the frame legitimately depends on.
+#[allow(clippy::too_many_arguments)]
 fn render_wizard(
     frame: &mut Frame,
     area: Rect,
@@ -432,6 +515,7 @@ fn render_wizard(
     tier: ReflowTier,
     ctx: &RunContext,
     reveal: bool,
+    glyphs: Glyphs,
 ) {
     let banner_rows = u16::from(wizard.gate_banner().is_some());
     let chunks = Layout::vertical([
@@ -442,26 +526,37 @@ fn render_wizard(
     ])
     .split(area);
 
-    render_header(frame, chunks[0], wizard, tier);
+    render_header(frame, chunks[0], wizard, tier, glyphs);
     if banner_rows > 0 {
         render_gate_banner(frame, chunks[1], wizard);
     }
-    render_body(frame, chunks[2], wizard, where_step, ctx, reveal);
+    render_body(frame, chunks[2], wizard, where_step, ctx, reveal, glyphs);
     render_footer(frame, chunks[3], wizard, tier);
 }
 
 /// The fixed header: the stepper row, plus the context/status line beneath it at Comfortable.
-fn render_header(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTier) {
+fn render_header(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTier, glyphs: Glyphs) {
     if tier.shows_context_line() && area.height >= 2 {
         let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
-        frame.render_widget(Paragraph::new(stepper_line(wizard, tier)), rows[0]);
+        frame.render_widget(Paragraph::new(stepper_line(wizard, tier, glyphs)), rows[0]);
         frame.render_widget(
             Paragraph::new(context_line(wizard))
                 .style(Style::default().add_modifier(Modifier::DIM)),
             rows[1],
         );
     } else {
-        frame.render_widget(Paragraph::new(stepper_line(wizard, tier)), area);
+        frame.render_widget(Paragraph::new(stepper_line(wizard, tier, glyphs)), area);
+    }
+}
+
+/// The stepper glyph for a step status in the active glyph set (#50/#61). The invalidated `!`
+/// is already ASCII, so it is fixed; the rest come from the set.
+fn status_glyph(status: StepStatus, glyphs: Glyphs) -> &'static str {
+    match status {
+        StepStatus::Completed => glyphs.check,
+        StepStatus::Current => glyphs.current,
+        StepStatus::Locked => glyphs.locked,
+        StepStatus::Invalidated => "!",
     }
 }
 
@@ -469,7 +564,7 @@ fn render_header(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTie
 /// form (Tight and below) shows the glyphs plus only the current step's title. The current
 /// step's title is marked by color/contrast (not the glyph alone), a Sensitive Selection adds
 /// a lock to the Encryption label, and an invalidated encryption step is yellow.
-fn stepper_line(wizard: &Wizard, tier: ReflowTier) -> Line<'static> {
+fn stepper_line(wizard: &Wizard, tier: ReflowTier, glyphs: Glyphs) -> Line<'static> {
     let sensitive = wizard.state().is_sensitive();
     if tier.compact_stepper() {
         let mut spans: Vec<Span<'static>> = Vec::new();
@@ -477,10 +572,12 @@ fn stepper_line(wizard: &Wizard, tier: ReflowTier) -> Line<'static> {
             if !spans.is_empty() {
                 spans.push(Span::raw(" "));
             }
-            spans.push(Span::raw(wizard.step_status(step).glyph().to_string()));
+            spans.push(Span::raw(status_glyph(wizard.step_status(step), glyphs)));
         }
+        // The `·` here is a separator between the glyphs and the current title, so it stays
+        // Unicode in both sets (#61: only the semantic `·` glyph remaps).
         spans.push(Span::raw("  ·  "));
-        spans.push(step_title_span(wizard, wizard.current(), sensitive));
+        spans.push(step_title_span(wizard, wizard.current(), sensitive, glyphs));
         return Line::from(spans);
     }
 
@@ -490,18 +587,24 @@ fn stepper_line(wizard: &Wizard, tier: ReflowTier) -> Line<'static> {
             spans.push(Span::raw("  →  "));
         }
         let status = wizard.step_status(step);
-        spans.push(Span::raw(format!("{} ", status.glyph())));
-        spans.push(step_title_span(wizard, step, sensitive));
+        spans.push(Span::raw(format!("{} ", status_glyph(status, glyphs))));
+        spans.push(step_title_span(wizard, step, sensitive, glyphs));
     }
     Line::from(spans)
 }
 
 /// One step's title span, styled by its stepper status (#50). The lock suffix rides the
 /// Encryption title when the Selection is Sensitive.
-fn step_title_span(wizard: &Wizard, step: WizardStep, sensitive: bool) -> Span<'static> {
+fn step_title_span(
+    wizard: &Wizard,
+    step: WizardStep,
+    sensitive: bool,
+    glyphs: Glyphs,
+) -> Span<'static> {
     let mut title = step.title().to_string();
     if step == WizardStep::Encryption && sensitive {
-        title.push_str(" 🔒");
+        title.push(' ');
+        title.push_str(glyphs.lock);
     }
     let style = match wizard.step_status(step) {
         StepStatus::Current => Style::default()
@@ -553,26 +656,34 @@ fn render_body(
     where_step: &WhereStep,
     ctx: &RunContext,
     reveal: bool,
+    glyphs: Glyphs,
 ) {
     if wizard.current() == WizardStep::What {
-        crate::what_screen::render(frame, area, wizard.what(), wizard.state());
+        crate::what_screen::render(frame, area, wizard.what(), wizard.state(), glyphs);
         return;
     }
     if wizard.current() == WizardStep::Encryption {
-        crate::encryption_screen::render(frame, area, wizard, reveal);
+        crate::encryption_screen::render(frame, area, wizard, reveal, glyphs);
         return;
     }
     if wizard.current() == WizardStep::Where {
         // The selection's uncompressed size feeds the advisory space warning only; it never
         // gates (#61). Read it here (a `core` probe) rather than in the reducer.
         let selection_size = wizard.state().selection().total_size();
-        where_step.render(frame, area, selection_size, &|name| {
-            std::env::var(name).ok()
-        });
+        where_step.render(
+            frame,
+            area,
+            selection_size,
+            &|name| std::env::var(name).ok(),
+            glyphs,
+        );
         return;
     }
     if wizard.current() == WizardStep::Review {
-        frame.render_widget(Paragraph::new(review_lines(wizard.state(), ctx)), area);
+        frame.render_widget(
+            Paragraph::new(review_lines(wizard.state(), ctx, glyphs)),
+            area,
+        );
         return;
     }
     let body = format!(
@@ -585,7 +696,7 @@ fn render_body(
 /// The REVIEW summary (#61 copy): what will be backed up, where, and the encryption state —
 /// everything chosen, summarized before anything is written. The Backup dir is computed from
 /// the same `ctx` `core::backup` will use, so what REVIEW shows is exactly where the run lands.
-fn review_lines(state: &WizardState, ctx: &RunContext) -> Vec<Line<'static>> {
+fn review_lines(state: &WizardState, ctx: &RunContext, glyphs: Glyphs) -> Vec<Line<'static>> {
     let selection = state.selection();
     let mut categories: BTreeMap<&'static str, usize> = BTreeMap::new();
     for entry in selection.entries() {
@@ -613,7 +724,7 @@ fn review_lines(state: &WizardState, ctx: &RunContext) -> Vec<Line<'static>> {
         Line::from(format!("   {breakdown}")),
         Line::from(format!("Output      {}", location.display())),
         Line::from(format!("Backup dir  {}", backup_dir.display())),
-        encryption_review_line(state),
+        encryption_review_line(state, glyphs),
         Line::default(),
         Line::from("(To change anything, press 1–4 to jump back to a step.)"),
         Line::default(),
@@ -628,7 +739,7 @@ fn review_lines(state: &WizardState, ctx: &RunContext) -> Vec<Line<'static>> {
 
 /// The REVIEW encryption line's three #61 states: encrypted, plaintext with nothing Sensitive,
 /// or plaintext shipping Sensitive content anyway (named, warned).
-fn encryption_review_line(state: &WizardState) -> Line<'static> {
+fn encryption_review_line(state: &WizardState, glyphs: Glyphs) -> Line<'static> {
     if state.encryption().is_encrypted() {
         return Line::from("Encryption  encrypted with a passphrase");
     }
@@ -638,7 +749,8 @@ fn encryption_review_line(state: &WizardState) -> Line<'static> {
     } else {
         Line::from(Span::styled(
             format!(
-                "Encryption  ⚠ not encrypted — {} in plaintext",
+                "Encryption  {} not encrypted — {} in plaintext",
+                glyphs.warn,
                 sensitive_categories.join(", ")
             ),
             Style::default()
@@ -759,6 +871,9 @@ mod tests {
             should_quit: false,
             pending_backup: None,
             reveal: false,
+            help_open: false,
+            help_scroll: 0,
+            glyphs: Glyphs::UNICODE,
         }
     }
 
@@ -817,7 +932,7 @@ mod tests {
         let app = app.update(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.should_quit());
         // And on a placeholder screen.
-        let app = App::new(Screen::Select, test_context());
+        let app = App::new(Screen::Select, test_context(), Glyphs::UNICODE);
         let app = app.update(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.should_quit());
     }
@@ -1119,7 +1234,7 @@ mod tests {
             verify: false,
             overwrite: false,
         };
-        let app = App::new_restore(args, test_context());
+        let app = App::new_restore(args, test_context(), Glyphs::UNICODE);
         let lines = rendered_lines(&app, 70, 16);
         assert!(
             lines
@@ -1140,7 +1255,7 @@ mod tests {
             verify: false,
             overwrite: false,
         };
-        let app = App::new_restore(args, test_context());
+        let app = App::new_restore(args, test_context(), Glyphs::UNICODE);
         let app = app.update(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit());
     }
@@ -1154,7 +1269,7 @@ mod tests {
 
     #[test]
     fn placeholder_screen_renders_its_mode_label() {
-        let app = App::new(Screen::Where, test_context());
+        let app = App::new(Screen::Where, test_context(), Glyphs::UNICODE);
         let lines = rendered_lines(&app, 40, 12);
         assert!(
             lines.iter().any(|l| l.contains("where")),
@@ -1312,6 +1427,139 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("Passphrases do not match")),
             "expected the mismatch gate banner, got: {lines:?}"
+        );
+    }
+
+    // --- Build 11 keymap wiring (#73) ---------------------------------------------------------
+
+    /// The current wizard step, for asserting a key did (or didn't) move the frontier.
+    fn current_step(app: &App) -> WizardStep {
+        match &app.view {
+            View::Wizard(wizard) => wizard.current(),
+            other => panic!("expected a wizard view, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reserved_control_chords_are_never_bound() {
+        // Ctrl-Z/S/Q/\ are terminal-reserved (#51): the reducer swallows them everywhere, so
+        // none quits and none moves the wizard off its opening step.
+        for c in ['z', 's', 'q', '\\'] {
+            let app = app_with_wizard(non_sensitive_wizard())
+                .update(key(KeyCode::Char(c), KeyModifiers::CONTROL));
+            assert!(!app.should_quit(), "Ctrl-{c} must not quit");
+            assert_eq!(
+                current_step(&app),
+                WizardStep::What,
+                "Ctrl-{c} must be inert"
+            );
+        }
+    }
+
+    #[test]
+    fn help_overlay_opens_on_question_mark_and_closes_on_esc_or_question_mark() {
+        let app = app_with_wizard(non_sensitive_wizard());
+        assert!(!app.help_open);
+        // `?` opens the exhaustive reference; the panel and its reserved-chords group render.
+        let app = app.update(key(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(app.help_open);
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("Keys")),
+            "expected the overlay title, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Reserved")),
+            "the overlay must list the reserved chords, got: {lines:?}"
+        );
+        // A second `?` closes it.
+        let app = app.update(key(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(!app.help_open);
+        // `Esc` also closes it, and (per the keymap) still never quits.
+        let app = app
+            .update(key(KeyCode::Char('?'), KeyModifiers::NONE))
+            .update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.help_open);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn help_overlay_opens_at_any_size_including_below_refuse() {
+        // The overlay is reachable at every terminal size — even below the reflow ladder's
+        // Refuse cutoff, where the base render is only the too-small notice (#51).
+        for (w, h) in [(80u16, 24u16), (40, 10), (30, 6)] {
+            let app = app_with_wizard(non_sensitive_wizard())
+                .update(key(KeyCode::Char('?'), KeyModifiers::NONE));
+            let lines = rendered_lines(&app, w, h);
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("Keys") || l.contains("Move")),
+                "help overlay must render at {w}x{h}, got: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn f3_toggles_hidden_file_visibility() {
+        // `F3` flips the WHERE autocomplete's show-hidden toggle, and stays live regardless of
+        // which widget owns the plain keys (#51).
+        let app = app_with_wizard(non_sensitive_wizard());
+        assert!(!app.where_step.show_hidden());
+        let app = app.update(key(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(app.where_step.show_hidden());
+        let app = app.update(key(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(!app.where_step.show_hidden());
+    }
+
+    #[test]
+    fn digits_reach_a_focused_field_and_do_not_jump_steps() {
+        // Forced consequence #1 (#51): a typed digit is inserted into the focused passphrase
+        // field rather than jumping steps, so the wizard stays on the encryption step.
+        let app = type_into(offered_encryption_typing(), "12");
+        assert_eq!(current_step(&app), WizardStep::Encryption);
+        let lines = rendered_lines(&app, 80, 24);
+        assert!(
+            lines.iter().any(|l| l.contains("••")),
+            "the digits must mask into the field, got: {lines:?}"
+        );
+        // Contrast: with no field focused (REVIEW), the same digit is the fast step jump.
+        let jumped =
+            app_with_wizard(wizard_on_review()).update(key(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(current_step(&jumped), WizardStep::What);
+    }
+
+    #[test]
+    fn ctrl_left_moves_a_step_back_even_with_a_field_focused() {
+        // Forced consequence #2 (#51): `Ctrl-←` overrides word-left inside a text field — on the
+        // encryption step with the passphrase field focused it steps back to WHAT.
+        let app = type_into(offered_encryption_typing(), "hunter2")
+            .update(kev(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(current_step(&app), WizardStep::What);
+    }
+
+    #[test]
+    fn no_emoji_fallback_swaps_glyphs_across_the_render() {
+        // The stepper's semantic glyphs come from the active set (#51/#61): the Unicode set
+        // draws `●`/`·`/`🔒`; the ASCII fallback maps them to `>`/`.`/`[!]` and shows no emoji.
+        let mut app = app_with_wizard(sensitive_wizard());
+        let unicode = rendered_lines(&app, 80, 24);
+        assert!(
+            unicode[0].contains('●') && unicode[0].contains('🔒'),
+            "expected Unicode stepper glyphs, got: {:?}",
+            unicode[0]
+        );
+        app.glyphs = Glyphs::ASCII;
+        let ascii = rendered_lines(&app, 80, 24);
+        assert!(
+            !ascii[0].contains('●') && !ascii[0].contains('🔒'),
+            "the ASCII fallback must drop the emoji glyphs, got: {:?}",
+            ascii[0]
+        );
+        assert!(
+            ascii[0].contains('>') && ascii[0].contains("[!]"),
+            "expected the ASCII fallback glyphs, got: {:?}",
+            ascii[0]
         );
     }
 }

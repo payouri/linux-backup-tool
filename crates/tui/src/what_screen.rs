@@ -34,6 +34,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::glyphs::Glyphs;
 use crate::wizard::WizardState;
 
 /// Below this width the two-pane split can't hold, so the WHAT screen collapses to a single
@@ -534,16 +535,29 @@ fn pane_style(focused: bool) -> Style {
 
 /// Draws the WHAT step body: two panes side by side, or — below [`TWO_PANE_MIN_WIDTH`] — the
 /// single active column the focused pane fills.
-pub fn render(frame: &mut Frame, area: Rect, screen: &WhatScreen, state: &WizardState) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    screen: &WhatScreen,
+    state: &WizardState,
+    glyphs: Glyphs,
+) {
     let selection = state.selection();
     let categories = category_rows(screen, selection);
     let rows = screen.explorer_rows(state);
-    let breadcrumb = breadcrumb_line(screen.current_category(), &screen.breadcrumb);
+    let breadcrumb = breadcrumb_line(screen.current_category(), &screen.breadcrumb, glyphs);
 
     if area.width < TWO_PANE_MIN_WIDTH {
         match screen.focus {
             Pane::Categories => {
-                render_categories(frame, area, &categories, screen.category_cursor, true);
+                render_categories(
+                    frame,
+                    area,
+                    &categories,
+                    screen.category_cursor,
+                    true,
+                    glyphs,
+                );
             }
             Pane::Explorer => render_explorer(
                 frame,
@@ -552,6 +566,7 @@ pub fn render(frame: &mut Frame, area: Rect, screen: &WhatScreen, state: &Wizard
                 &breadcrumb,
                 screen.explorer_cursor,
                 true,
+                glyphs,
             ),
         }
         return;
@@ -565,6 +580,7 @@ pub fn render(frame: &mut Frame, area: Rect, screen: &WhatScreen, state: &Wizard
         &categories,
         screen.category_cursor,
         screen.focus == Pane::Categories,
+        glyphs,
     );
     render_explorer(
         frame,
@@ -573,14 +589,17 @@ pub fn render(frame: &mut Frame, area: Rect, screen: &WhatScreen, state: &Wizard
         &breadcrumb,
         screen.explorer_cursor,
         screen.focus == Pane::Explorer,
+        glyphs,
     );
 }
 
 /// The breadcrumb pinned above the explorer: the Category root plus every descended component.
-fn breadcrumb_line(category: Option<&str>, crumbs: &[OsString]) -> String {
+fn breadcrumb_line(category: Option<&str>, crumbs: &[OsString], glyphs: Glyphs) -> String {
     let mut line = category.unwrap_or("").to_string();
     for crumb in crumbs {
-        line.push_str(" ▸ ");
+        line.push(' ');
+        line.push_str(glyphs.pointer);
+        line.push(' ');
         line.push_str(crumb.to_string_lossy().as_ref());
     }
     line
@@ -592,6 +611,7 @@ fn render_categories(
     categories: &[CategoryRow],
     cursor: usize,
     focused: bool,
+    glyphs: Glyphs,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -605,14 +625,18 @@ fn render_categories(
         .enumerate()
         .map(|(index, row)| {
             let marker = if focused && index == cursor {
-                "▸"
+                glyphs.pointer
             } else {
                 " "
             };
             let box_glyph = checkbox(row.state);
             let name = row.name;
             let count = row.selected;
-            let lock = if row.sensitive { " 🔒" } else { "" };
+            let lock = if row.sensitive {
+                format!(" {}", glyphs.lock)
+            } else {
+                String::new()
+            };
             Line::from(format!("{marker}{box_glyph} {name}  {count}{lock}"))
         })
         .collect();
@@ -629,6 +653,7 @@ fn render_explorer(
     breadcrumb: &str,
     cursor: usize,
     focused: bool,
+    glyphs: Glyphs,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -651,7 +676,7 @@ fn render_explorer(
         .enumerate()
         .map(|(index, row)| {
             let marker = if focused && index == cursor {
-                "▸"
+                glyphs.pointer
             } else {
                 " "
             };
@@ -930,7 +955,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend");
         terminal
-            .draw(|frame| render(frame, frame.area(), screen, state))
+            .draw(|frame| render(frame, frame.area(), screen, state, Glyphs::UNICODE))
             .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         (0..height)
