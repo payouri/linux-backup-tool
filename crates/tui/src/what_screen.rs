@@ -26,12 +26,13 @@
 //! the only I/O is the per-file size probe, which goes through `core`'s `fs_probe` rather than
 //! touching the disk directly (ADR-0005 D6).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use linux_backup_core::model::{DirectoryState, EntryType, SelectionModel};
+use linux_backup_core::model::{DirectoryState, Entry, EntryType, SelectionModel};
 use linux_backup_core::{catalog, fs_probe, location, Privilege};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -85,6 +86,9 @@ pub struct WhatScreen {
     /// The live Custom-path add field (#75). `None` when closed; `Some` while the user is typing
     /// a path into the fish-style autocomplete opened from the Custom-paths row.
     custom_input: Option<CustomInput>,
+    /// Memoized `absolute_path -> on-disk size` (#83) — see [`cached_subtree_size`]'s doc for
+    /// why this needs interior mutability (`render` only ever holds `&WhatScreen`).
+    size_cache: RefCell<HashMap<PathBuf, u64>>,
 }
 
 /// The view state of the Custom-path add field — the buffer plus its autocomplete cursor and
@@ -286,7 +290,14 @@ impl WhatScreen {
     /// Selection (no stored tree).
     fn explorer_rows(&self, state: &WizardState) -> Vec<ExplorerRow> {
         self.current_category()
-            .map(|category| explorer_rows(state.selection(), category, &self.breadcrumb))
+            .map(|category| {
+                explorer_rows(
+                    state.selection(),
+                    category,
+                    &self.breadcrumb,
+                    &self.size_cache,
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -607,48 +618,109 @@ impl ExplorerRow {
 
 /// Accumulates, per immediate child component under the current prefix, whether it has deeper
 /// Entries (a real directory) and — if an Entry sits exactly at it — that Entry's own facts.
+/// `any_active`/`any_withheld` are folded in alongside the grouping itself (#83) so a row's
+/// [`DirectoryState`] falls out of the same pass that groups it, rather than a second per-row
+/// query against the model — mirrors `directory_state`'s own `(any_active, any_withheld)` read.
+///
+/// The tri-state flags are set **across every Category** under the node (matching
+/// `directory_state`, which is Category-agnostic), while `in_category` / the kind fields stay
+/// scoped to the explorer's focused Category: a directory node — e.g. the top-level `.config` or
+/// `.local` row shared by KDE Plasma, Program configs, and Cloud creds — toggles its whole
+/// Subtree regardless of Category (`deselect_root` is Category-agnostic too), so its checkbox
+/// must reflect every Entry it would touch, not just the focused Category's share. A row is only
+/// emitted when `in_category` (the focused Category has at least one Entry under it).
 #[derive(Default)]
 struct ChildAccumulator {
     has_children: bool,
     grandchildren: BTreeSet<OsString>,
     exact: Option<(PathBuf, EntryType)>,
+    in_category: bool,
+    any_active: bool,
+    any_withheld: bool,
 }
 
-/// Groups the Category's flat Entries into the rows of the directory at `breadcrumb` — the
+impl ChildAccumulator {
+    fn state(&self) -> DirectoryState {
+        match (self.any_active, self.any_withheld) {
+            (true, false) => DirectoryState::All,
+            (true, true) => DirectoryState::Partial,
+            (false, _) => DirectoryState::None,
+        }
+    }
+}
+
+/// Folds one Entry, known to be under `prefix`, into its row's [`ChildAccumulator`] — shared by
+/// both the active and withheld passes below, `active` recording which one this Entry came from.
+/// The `any_active`/`any_withheld` tri-state flags accrue from every Category (so a row's state
+/// matches `directory_state`); the row's existence and kind accrue only from `category`.
+fn accumulate_child(
+    groups: &mut BTreeMap<OsString, ChildAccumulator>,
+    prefix: &Path,
+    entry: &Entry,
+    category: &str,
+    active: bool,
+) {
+    let Ok(rest) = entry.relative_path.strip_prefix(prefix) else {
+        return;
+    };
+    let mut components = rest.components();
+    let Some(first) = components.next() else {
+        return; // the directory node itself, not one of its children
+    };
+    let accumulator = groups.entry(first.as_os_str().to_os_string()).or_default();
+    if active {
+        accumulator.any_active = true;
+    } else {
+        accumulator.any_withheld = true;
+    }
+    if entry.category != category {
+        return;
+    }
+    accumulator.in_category = true;
+    if let Some(second) = components.next() {
+        accumulator.has_children = true;
+        accumulator
+            .grandchildren
+            .insert(second.as_os_str().to_os_string());
+    } else {
+        accumulator.exact = Some((entry.absolute_path.clone(), entry.entry_type));
+    }
+}
+
+/// Groups the current breadcrumb's Entries into the rows of the directory at `breadcrumb` — the
 /// presentation tree ADR-0006 has `tui` derive, with no fresh filesystem reads for the grouping
-/// itself (only per-file sizes go through `core`'s probe).
+/// itself (file sizes go through `size_cache`, a memoized wrapper over `core`'s probe, #83).
+///
+/// #83: sourced from [`SelectionModel::active_entries_under`]/`withheld_entries_under` — a
+/// Subtree range scan bounded to `k`, the Entries actually under `breadcrumb` — rather than
+/// `entries_in_category`, which scans every Entry in the Selection regardless of Category or
+/// breadcrumb. Nothing outside `breadcrumb`'s own Subtree is ever visited. This is also what
+/// removes the old per-row `directory_state` call: `ChildAccumulator::state` derives the same
+/// tri-state from the `any_active`/`any_withheld` flags this pass sets — accrued across every
+/// Category under a node (so the derived state matches Category-agnostic `directory_state`
+/// exactly), while a row's existence and kind stay scoped to the focused `category`.
 fn explorer_rows(
     selection: &SelectionModel,
     category: &str,
     breadcrumb: &[OsString],
+    size_cache: &RefCell<HashMap<PathBuf, u64>>,
 ) -> Vec<ExplorerRow> {
     let prefix: PathBuf = breadcrumb.iter().collect();
     let mut groups: BTreeMap<OsString, ChildAccumulator> = BTreeMap::new();
 
-    for entry in selection.entries_in_category(category) {
-        let Ok(rest) = entry.relative_path.strip_prefix(&prefix) else {
-            continue;
-        };
-        let mut components = rest.components();
-        let Some(first) = components.next() else {
-            continue; // the directory node itself, not one of its children
-        };
-        let accumulator = groups.entry(first.as_os_str().to_os_string()).or_default();
-        if let Some(second) = components.next() {
-            accumulator.has_children = true;
-            accumulator
-                .grandchildren
-                .insert(second.as_os_str().to_os_string());
-        } else {
-            accumulator.exact = Some((entry.absolute_path.clone(), entry.entry_type));
-        }
+    for entry in selection.active_entries_under(&prefix) {
+        accumulate_child(&mut groups, &prefix, entry, category, true);
+    }
+    for entry in selection.withheld_entries_under(&prefix) {
+        accumulate_child(&mut groups, &prefix, entry, category, false);
     }
 
     let mut rows: Vec<ExplorerRow> = groups
         .into_iter()
+        .filter(|(_, accumulator)| accumulator.in_category)
         .map(|(component, accumulator)| {
             let node_path = prefix.join(&component);
-            let state = selection.directory_state(&node_path);
+            let state = accumulator.state();
             let name = component.to_string_lossy();
             let (kind, label) = if accumulator.has_children {
                 (
@@ -664,7 +736,7 @@ fn explorer_rows(
                     }
                     Some((absolute, _)) => (
                         NodeKind::File {
-                            size: fs_probe::subtree_size(std::iter::once(absolute.as_path())),
+                            size: cached_subtree_size(size_cache, &absolute),
                         },
                         name.into_owned(),
                     ),
@@ -689,6 +761,23 @@ fn explorer_rows(
             .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
     });
     rows
+}
+
+/// A memoized wrapper over `fs_probe::subtree_size` (#83): a file row's size is `stat`'d once
+/// and reused for the life of the [`WhatScreen`] it belongs to, rather than re-`stat`'d on every
+/// redraw/keypress `explorer_rows` runs for. `render` takes `&WhatScreen` (ADR-0005 D1's pure
+/// render), so the cache needs interior mutability to populate itself from a shared reference.
+/// Keyed by absolute path and never evicted: a file's on-disk size is treated as a stable fact
+/// for the running WHAT step (the wizard doesn't watch the filesystem), and a fresh wizard run
+/// starts from a fresh, empty [`WhatScreen`] (and so a fresh cache) rather than carrying stale
+/// sizes across runs.
+fn cached_subtree_size(cache: &RefCell<HashMap<PathBuf, u64>>, absolute_path: &Path) -> u64 {
+    if let Some(&size) = cache.borrow().get(absolute_path) {
+        return size;
+    }
+    let size = fs_probe::subtree_size(std::iter::once(absolute_path));
+    cache.borrow_mut().insert(absolute_path.to_path_buf(), size);
+    size
 }
 
 /// Flips one explorer node's selection: a directory's whole subtree (prefix-wins), or a single
@@ -1808,5 +1897,120 @@ mod tests {
         );
         assert!(joined.contains("~/Doc"), "the live buffer: {joined}");
         assert!(joined.contains("Documents"), "a candidate row: {joined}");
+    }
+
+    #[test]
+    fn explorer_rows_stays_fast_in_a_wide_directory_with_an_unrelated_huge_sibling() {
+        // Regression guard for #83's real-world trigger: a directory with 20k+ items directly
+        // in it (`~/.local/share/icons/Breeze KDE-Story-Dark/actions`), rendered once every
+        // keypress/redraw. A second, equally huge *sibling* subtree (another icon theme) proves
+        // the render is O(visible), not O(whole Category): the old `entries_in_category` +
+        // `strip_prefix` scan touched every Entry in the Selection regardless of breadcrumb, so
+        // this would have scaled with the sibling's size too, not just the 20,000 rows actually
+        // produced.
+        const WIDE: usize = 20_000;
+        let mut entries: Vec<Entry> = (0..WIDE)
+            .map(|i| {
+                entry(
+                    "KDE Plasma",
+                    EntryType::File,
+                    &format!(".local/share/icons/theme/actions/icon{i}.svg"),
+                )
+            })
+            .collect();
+        entries.extend((0..WIDE).map(|i| {
+            entry(
+                "KDE Plasma",
+                EntryType::File,
+                &format!(".local/share/icons/sibling-theme/icon{i}.svg"),
+            )
+        }));
+        let mut state = state_of(SelectionModel::new(entries));
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+        screen.breadcrumb = vec![
+            OsString::from(".local"),
+            OsString::from("share"),
+            OsString::from("icons"),
+            OsString::from("theme"),
+            OsString::from("actions"),
+        ];
+
+        let started = std::time::Instant::now();
+        let rows = screen.explorer_rows(&state);
+        let elapsed = started.elapsed();
+
+        assert_eq!(rows.len(), WIDE, "one row per file directly in `actions/`");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "explorer_rows took {elapsed:?} for a {WIDE}-item directory with an equally large \
+             unrelated sibling subtree — the O(whole-Category)-per-render regression is back"
+        );
+    }
+
+    #[test]
+    fn explorer_rows_size_cache_avoids_restatting_an_unchanged_file_on_every_render() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file_path = tmp.path().join("kwinrc");
+        std::fs::write(&file_path, b"0123456789").expect("write fixture file");
+        let e = Entry {
+            absolute_path: file_path.clone(),
+            relative_path: PathBuf::from("kwinrc"),
+            root: EntryRoot::Home,
+            entry_type: EntryType::File,
+            category: "KDE Plasma",
+            sensitive: false,
+        };
+        let mut state = state_of(SelectionModel::new(vec![e]));
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+
+        let first = screen.explorer_rows(&state);
+        assert_eq!(first[0].metric(), "10 B");
+
+        // Shrink the file on disk without touching the Selection or the breadcrumb — a render
+        // reusing the cached size (not re-`stat`ing) must keep reporting the original size.
+        std::fs::write(&file_path, b"x").expect("shrink fixture file");
+
+        let second = screen.explorer_rows(&state);
+        assert_eq!(
+            second[0].metric(),
+            "10 B",
+            "the cached size must survive an on-disk change until the cache is rebuilt"
+        );
+    }
+
+    #[test]
+    fn explorer_row_state_matches_directory_state_across_a_shared_cross_category_prefix() {
+        // #83 AC: explorer display is unchanged versus today. A directory node the focused
+        // Category shares with another (`.local`, holding KDE Plasma's `icons/` and Program
+        // configs' `fonts/`) toggles its whole Subtree Category-agnostically, so its checkbox
+        // must reflect every Entry under it — not just the focused Category's share. Here a
+        // Program-configs sibling is withheld while KDE Plasma's own Entries stay active: the
+        // row must read `[~]` (Partial), exactly as the source-of-truth `directory_state` does,
+        // not `[x]` (All) derived from the focused Category alone.
+        let mut selection = SelectionModel::new(vec![
+            entry("KDE Plasma", EntryType::File, ".local/share/icons/a.svg"),
+            entry(
+                "Program configs",
+                EntryType::File,
+                ".local/share/fonts/x.ttf",
+            ),
+        ]);
+        selection.deselect_entry(Path::new(".local/share/fonts/x.ttf"));
+        let cache = RefCell::new(HashMap::new());
+
+        let rows = explorer_rows(&selection, "KDE Plasma", &[], &cache);
+        let dotlocal = rows
+            .iter()
+            .find(|row| row.component == ".local")
+            .expect("the shared `.local` row is present in the KDE Plasma explorer");
+
+        assert_eq!(
+            dotlocal.state,
+            selection.directory_state(Path::new(".local")),
+            "the row's tri-state must equal directory_state's Category-agnostic verdict"
+        );
+        assert_eq!(dotlocal.state, DirectoryState::Partial);
     }
 }

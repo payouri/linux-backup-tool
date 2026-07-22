@@ -44,6 +44,12 @@
 //! toggling a Category with tens of thousands of Entries instant rather than the O(n²) freeze
 //! `select_category`'s doc below already fixed once for the *select* direction; #82 was the
 //! same shape on the *deselect* side; see `prefix_range_end`'s doc for the range-bound trick.
+//!
+//! #83 scope: `active_entries_under`/`withheld_entries_under` expose #82's range machinery
+//! directly to `crates/tui`, so the recursive Drill-down explorer's `explorer_rows` can range-
+//! scan just the current breadcrumb's Subtree (`O(log n + k)` for the `k` Entries under it)
+//! instead of filtering every Entry in the Selection per render — the last O(n)-per-render cost
+//! #82 didn't already reach, because it lived in `tui`, not here.
 
 use std::collections::btree_map::Range;
 use std::collections::{BTreeMap, BTreeSet};
@@ -462,9 +468,12 @@ impl SelectionModel {
     /// paths, so that is the edge, not the norm.
     ///
     /// #82: each check below is an O(log n) sorted-key range existence test
-    /// ([`prefix_range_nonempty`]) rather than an O(n) scan of `entries`/`withheld` — this was
-    /// called once per visible explorer row (`crates/tui`'s `explorer_rows`), so the old O(n)
-    /// cost compounded into O(rows × entries) across one render.
+    /// ([`prefix_range_nonempty`]) rather than an O(n) scan of `entries`/`withheld`. #83:
+    /// `crates/tui`'s `explorer_rows` no longer calls this once per visible row — it derives the
+    /// same tri-state directly while it range-scans the breadcrumb Subtree
+    /// ([`Self::active_entries_under`]/[`Self::withheld_entries_under`]), so this method stays
+    /// the source-of-truth definition (and what the tests below and the round-trip seam pin)
+    /// without being on that hot path at all.
     pub fn directory_state(&self, prefix: &Path) -> DirectoryState {
         let any_active = prefix_range_nonempty(&self.entries, prefix);
         let any_withheld = prefix_range_nonempty(&self.withheld, prefix);
@@ -474,6 +483,31 @@ impl SelectionModel {
             (true, true) => DirectoryState::Partial,
             (false, _) => DirectoryState::None,
         }
+    }
+
+    /// The active Entries (in the Selection) whose `relative_path` falls under `prefix`
+    /// (`prefix` itself included) — a Subtree range scan (#82's range machinery), `O(log n +
+    /// k)` for the `k` Entries actually under `prefix`.
+    ///
+    /// #83: this is what lets the recursive Drill-down explorer's `explorer_rows`
+    /// (`crates/tui`) group the current breadcrumb's rows from just that Subtree, instead of
+    /// filtering every Entry in the whole Selection (`entries_in_category`, `O(n)`) and testing
+    /// each candidate's ancestry — so a render stays `O(k)` in the visible Subtree even when a
+    /// sibling directory (another icon theme, say) or another Category sharing a path ancestor
+    /// (e.g. `.config`) holds tens of thousands of Entries nothing on screen needs to touch.
+    /// `tui` still filters the result by Category itself (an `O(k)` field comparison per
+    /// candidate) since a `BTreeMap` keyed by `relative_path` alone can't range-scan on Category
+    /// too — this method's job is bounding `k` to the breadcrumb's own Subtree, not to one
+    /// Category, which the path-prefix range can't distinguish on its own.
+    pub fn active_entries_under(&self, prefix: &Path) -> impl Iterator<Item = &Entry> {
+        prefix_range(&self.entries, prefix).map(|(_, entry)| entry)
+    }
+
+    /// The withheld counterpart of [`Self::active_entries_under`]: Entries under `prefix`
+    /// currently excluded (per-file or Subtree Drill-down deselection), so the explorer can
+    /// still list them — unchecked, re-selectable — rather than only ever seeing what's active.
+    pub fn withheld_entries_under(&self, prefix: &Path) -> impl Iterator<Item = &Entry> {
+        prefix_range(&self.withheld, prefix).map(|(_, entry)| entry)
     }
 
     /// The relative paths of every currently-deselected Entry — the plain, storable shape
@@ -1538,6 +1572,82 @@ mod tests {
             selection.directory_state(Path::new(".local/share/icons/hicolor/apps/firefox.svg")),
             DirectoryState::None,
             "the deselected file node itself reads None"
+        );
+    }
+
+    #[test]
+    fn active_entries_under_returns_only_the_subtree_not_the_whole_selection() {
+        let selection = deep_icon_selection();
+
+        let apps: BTreeSet<PathBuf> = selection
+            .active_entries_under(Path::new(".local/share/icons/hicolor/apps"))
+            .map(|entry| entry.relative_path.clone())
+            .collect();
+
+        assert_eq!(
+            apps,
+            BTreeSet::from([
+                PathBuf::from(".local/share/icons/hicolor/apps/firefox.svg"),
+                PathBuf::from(".local/share/icons/hicolor/apps/code.svg"),
+            ]),
+            "only the queried Subtree comes back, not sibling icons or the .config Category"
+        );
+    }
+
+    #[test]
+    fn withheld_entries_under_lists_a_deselected_subtree_active_entries_under_does_not() {
+        let mut selection = deep_icon_selection();
+        let apps = Path::new(".local/share/icons/hicolor/apps");
+        selection.deselect_root(apps);
+
+        assert_eq!(selection.active_entries_under(apps).count(), 0);
+        let withheld: BTreeSet<PathBuf> = selection
+            .withheld_entries_under(apps)
+            .map(|entry| entry.relative_path.clone())
+            .collect();
+        assert_eq!(
+            withheld,
+            BTreeSet::from([
+                PathBuf::from(".local/share/icons/hicolor/apps/firefox.svg"),
+                PathBuf::from(".local/share/icons/hicolor/apps/code.svg"),
+            ])
+        );
+    }
+
+    #[test]
+    fn active_entries_under_stays_fast_when_a_sibling_subtree_is_huge() {
+        // Regression guard for #83: a naive `entries_in_category`-style scan touches every
+        // Entry in the Selection regardless of which breadcrumb is being rendered, so a huge
+        // *unrelated* sibling subtree (a second icon theme, say) would still cost the render —
+        // even though nothing under it is on screen. The range scan must stay bounded to the
+        // queried prefix's own size, not the Selection's.
+        let mut entries: Vec<Entry> = (0..30_000)
+            .map(|i| {
+                entry(
+                    catalog::KDE_PLASMA.name,
+                    false,
+                    &format!(".local/share/icons/huge-sibling-theme/icon{i}.svg"),
+                )
+            })
+            .collect();
+        entries.push(entry(
+            catalog::KDE_PLASMA.name,
+            false,
+            ".local/share/icons/small/only.svg",
+        ));
+        let selection = SelectionModel::new(entries);
+
+        let started = std::time::Instant::now();
+        let small: Vec<&Entry> = selection
+            .active_entries_under(Path::new(".local/share/icons/small"))
+            .collect();
+        let elapsed = started.elapsed();
+
+        assert_eq!(small.len(), 1);
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "active_entries_under took {elapsed:?} to fetch one Entry past a 30,000-Entry \
+             sibling subtree — the O(n)-per-query regression is back"
         );
     }
 }
