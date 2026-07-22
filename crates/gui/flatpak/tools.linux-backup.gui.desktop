@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=linux-backup
+GenericName=Environment Backup
+Comment=Back up and restore a Linux user's environment
+Exec=linux-backup-gui
+Icon=tools.linux-backup.gui
+Terminal=false
+Categories=Utility;Archiving;System;
+StartupWMClass=linux-backup-gui

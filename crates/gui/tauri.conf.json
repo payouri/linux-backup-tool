@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": "npm --prefix ui run dev",
+    "beforeBuildCommand": "npm --prefix ui run build"
   },
   "app": {
     "windows": [
@@ -23,6 +23,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": ["appimage"],
+    "category": "Utility",
+    "shortDescription": "Back up and restore a Linux user's environment",
+    "longDescription": "linux-backup captures a Linux user's environment - program configs, SSH keys, KDE Plasma layout, shell setup, user directories, installed-package manifests, and hand-picked custom paths - into one portable, optionally encrypted archive, and restores it back."
   }
 }

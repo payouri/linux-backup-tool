@@ -126,5 +126,7 @@ cargo test --workspace --all-targets
 - [`docs/adr/`](docs/adr/) — architectural decision records.
 - [`docs/research/`](docs/research/) — dated research notes (package inventory, Plasma
   capture, Rust crate choices).
+- [`docs/gui-packaging.md`](docs/gui-packaging.md) — how the `crates/gui` Tauri app ships on
+  Linux (Flatpak canonical, AppImage fallback).
 
 See [`AGENTS.md`](AGENTS.md) for the full contributor guide.

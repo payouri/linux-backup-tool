@@ -1,0 +1,128 @@
+name: Packaging
+
+# Builds the two Linux distributables ADR-0008 Decision 4 / #104 settle on: a Flatpak
+# (canonical) and an AppImage (fallback). Kept in its own workflow, separate from `ci.yml`'s
+# fast Rust gates, because both jobs here are materially heavier (a from-scratch GNOME
+# runtime + vendored-dependency Flatpak build; a full `cargo tauri build`) and their failure
+# mode is "the ship artifact is broken", not "the change is wrong" — the distinction `ci.yml`
+# already draws between `fmt`/`clippy`/`test` and the separate `msrv` job.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [trunk]
+
+concurrency:
+  group: packaging-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  flatpak:
+    name: flatpak
+    runs-on: ubuntu-latest
+    # Pinned to the same GNOME 48 generation the manifest targets
+    # (crates/gui/flatpak/tools.linux-backup.gui.yml) so the image's preinstalled SDK/runtime
+    # never drifts from what the manifest declares. Flathub's own generated images —
+    # https://github.com/flathub-infra/actions-images — exist precisely to skip re-installing
+    # the SDK on every run.
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # The generated `cargo-sources.json` / `node-sources.json` are a lockfile-derived cache
+      # (crates/gui/flatpak/.gitignore) regenerated fresh each run rather than committed, so a
+      # `Cargo.lock`/`package-lock.json` bump can never silently drift out of sync with what
+      # the sandboxed build actually vendors. Generation itself needs the network (fetching
+      # crate/npm-package metadata to resolve tarball URLs + checksums); the network access
+      # that matters for reproducibility is the sandboxed `flatpak-builder` step below, which
+      # gets none.
+      #
+      # Both generators are pinned to this exact `flatpak-builder-tools` commit — that repo
+      # ships no tagged releases, only `master`, so a commit SHA is the closest thing to a
+      # stable ref and (unlike floating on `master`) survives upstream restructuring the way
+      # the `node/` generator's move from a standalone script to a `flatpak_node_generator`
+      # pip package already has once.
+      - name: Install source-generator tooling
+        env:
+          FLATPAK_BUILDER_TOOLS_REF: 737c0085912f9f7dabf9341d4608e2a77a51a73a
+        run: |
+          pip3 install --user aiohttp pyyaml tomlkit
+          curl -sSfL -o /tmp/flatpak-cargo-generator.py \
+            "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${FLATPAK_BUILDER_TOOLS_REF}/cargo/flatpak-cargo-generator.py"
+          pip3 install --user \
+            "git+https://github.com/flatpak/flatpak-builder-tools.git@${FLATPAK_BUILDER_TOOLS_REF}#subdirectory=node"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Generate vendored cargo sources
+        run: |
+          python3 /tmp/flatpak-cargo-generator.py \
+            Cargo.lock -o crates/gui/flatpak/cargo-sources.json
+
+      - name: Generate vendored npm sources
+        run: |
+          flatpak-node-generator npm crates/gui/ui/package-lock.json \
+            -o crates/gui/flatpak/node-sources.json
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@bf5cafdfd97dcf5a89c7475bbc86a616e1f86acb # v6.7
+        with:
+          bundle: linux-backup-gui.flatpak
+          manifest-path: crates/gui/flatpak/tools.linux-backup.gui.yml
+          cache-key: flatpak-builder-${{ github.workflow }}-${{ hashFiles('Cargo.lock', 'crates/gui/ui/package-lock.json') }}
+
+  appimage:
+    name: appimage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Tauri v2's documented Ubuntu/Debian build prerequisites (host webkit, for this
+      # bundler run only — the shipped Flatpak never touches it; see docs/gui-packaging.md).
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            patchelf
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: crates/gui/ui/package-lock.json
+
+      - name: Build the frontend
+        working-directory: crates/gui/ui
+        run: |
+          npm ci
+          npm run build
+
+      # `tauri-cli` is a build tool, not a project dependency — installed here rather than
+      # added to `crates/gui/ui/package.json`'s devDependencies so this job's tooling choice
+      # doesn't touch the frontend's committed lockfile.
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build the AppImage
+        working-directory: crates/gui
+        run: cargo tauri build --bundles appimage
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-backup-gui-appimage
+          path: target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error

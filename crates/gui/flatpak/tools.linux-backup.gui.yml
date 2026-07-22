@@ -1,0 +1,125 @@
+---
+# Flatpak manifest — the canonical Linux distributable (ADR-0008 Decision 4, issue #104).
+#
+# Builds the Tauri app (Rust backend in this crate + the co-located `ui/` React frontend)
+# from the checked-out source tree, entirely offline inside the sandbox: `cargo`/`npm`
+# dependencies are vendored ahead of time via generated `cargo-sources.json` /
+# `node-sources.json` files that CI produces immediately before invoking `flatpak-builder`
+# (see `.github/workflows/packaging.yml`) — those two files are gitignored, not committed,
+# because they're a lockfile-derived cache, not source.
+#
+# Runtime pin: `org.gnome.Platform`/`org.gnome.Sdk` //48. Chosen per ADR-0008 Decision 4 /
+# #97's Linux-packaging section as "a current stable org.gnome.Platform" — the GNOME 48
+# runtime (March 2025) ships webkit2gtk-4.1/javascriptcoregtk-4.1/gtk3/soup3 pre-built at
+# matching versions, which is the whole point of pinning to it rather than the host's
+# webkit (cross-distro webkit-version risk). The exact pin is explicitly a build-time detail
+# (ADR-0008/#97), not a contract — bump it forward as GNOME runtimes age out of support.
+#
+# NOT verifiable in this sandbox: no `flatpak`/`flatpak-builder`/`org.gnome.Platform` runtime
+# is installed here (no network to fetch them either), so this manifest's runtime/extension
+# version pins, module build commands, and vendored-source wiring are unverified beyond
+# structural YAML validity and a manual cross-check against Tauri's documented Flatpak
+# recipe. CI's first `flatpak-builder` run is authoritative.
+id: tools.linux-backup.gui
+runtime: org.gnome.Platform
+runtime-version: '48'
+sdk: org.gnome.Sdk
+# The freedesktop-sdk generation GNOME 48 (March 2025) was built against, per that runtime's
+# own bundled extension set — GNOME 49's Sept-2025 cut is the first to move onto 25.08.
+# Unverified locally (see header note): if `flatpak-builder` reports either extension branch
+# unavailable for org.gnome.Platform//48, bump both to '25.08' in lockstep.
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.node20
+
+command: linux-backup-gui
+
+finish-args:
+  # Window rendering: Wayland native, X11 fallback for non-Wayland sessions.
+  - --socket=wayland
+  - --socket=fallback-x11
+  # GPU acceleration for the WebKitGTK webview compositor.
+  - --device=dri
+  - --share=ipc
+  # This app's entire purpose is reading/writing arbitrary user paths: environment configs
+  # and keys anywhere under $HOME (crates/core categories), plus an Output location that can
+  # be any writable mount — not just $HOME — enumerated in crates/core/src/location.rs
+  # (mounted drives, `/run/media/$USER`, `/media`, `/mnt`, unmounted USB partitions via
+  # `lsblk`). A per-category `--filesystem` allowlist can't cover that; `--filesystem=host`
+  # is the same tradeoff other Linux backup-tool Flatpaks (e.g. Vorta) accept for the same
+  # reason.
+  - --filesystem=host
+  # Forward-looking, currently unused: `crates/core/src/location.rs`'s `lsblk`/`udisksctl`
+  # subprocess calls invoke *host* binaries, which a Flatpak sandbox does not expose even
+  # with --filesystem=host (that only grants file I/O, not exec). Reaching them from inside
+  # the sandbox needs `flatpak-spawn --host` via the Flatpak portal, which core does not yet
+  # use — tracked as a follow-up, out of scope for #104's packaging work. Kept here as cheap,
+  # harmless scaffolding for that follow-up rather than re-litigated per packaging change.
+  - --talk-name=org.freedesktop.Flatpak
+
+cleanup:
+  - /share/doc
+  - /share/man
+
+modules:
+  - name: linux-backup-gui
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node20/bin
+      env:
+        # `cargo`/`npm` must never reach out during the sandboxed build; both are fed from
+        # the vendored sources copied in below. A network access here would fail anyway
+        # (the build sandbox has none by default) — spelled out so a `cargo add` left without
+        # a matching `cargo-sources.json` regeneration fails loudly (an unresolvable crate)
+        # rather than silently hitting the network in a build environment that happens to
+        # allow it (e.g. a local `flatpak-builder` run without `--sandbox`).
+        CARGO_NET_OFFLINE: 'true'
+        # `flatpak-cargo-generator` vendors crates and a `config` (source-replacement) file
+        # under a `cargo/` directory relative to the build root, then expects `CARGO_HOME` to
+        # point straight at it — cargo does not auto-discover a bare `cargo/config` the way it
+        # would a project-local `.cargo/config.toml`. `/run/build/<module-name>` is
+        # flatpak-builder's own build-directory convention (matches this module's `name:`
+        # below), per Tauri's documented Flatpak recipe.
+        CARGO_HOME: /run/build/linux-backup-gui/cargo
+    build-commands:
+      # The frontend build has to happen before `cargo build`: `crates/gui/build.rs`
+      # (`tauri-build`) validates at Rust compile time that `build.frontendDist`
+      # (`ui/dist/`) exists and Tauri embeds whatever is there — see
+      # `crates/gui/ui/dist/index.html`'s doc comment for why a placeholder is committed.
+      # `flatpak-node-generator` vendors npm's cacache-format cache under
+      # `flatpak-node/npm-cache` relative to the build root (the same `flatpak-node/`
+      # data-root its own docs use for e.g. chromedriver vendoring); `--cache` must point at
+      # it explicitly; `npm ci`'s CWD-relative `--prefix` still resolves against the build
+      # root, not against that cache path.
+      - npm ci --offline --cache flatpak-node/npm-cache --prefix crates/gui/ui
+      - npm run build --prefix crates/gui/ui
+      - cargo build --release --offline --manifest-path crates/gui/Cargo.toml
+      - install -Dm755 target/release/linux-backup-gui /app/bin/linux-backup-gui
+      - install -Dm644 crates/gui/flatpak/tools.linux-backup.gui.desktop
+        /app/share/applications/tools.linux-backup.gui.desktop
+      - install -Dm644 crates/gui/flatpak/tools.linux-backup.gui.metainfo.xml
+        /app/share/metainfo/tools.linux-backup.gui.metainfo.xml
+      - install -Dm644 crates/gui/icons/icon.png
+        /app/share/icons/hicolor/32x32/apps/tools.linux-backup.gui.png
+    sources:
+      # The whole repo, offline-vendored-deps and all — `type: dir` is the standard trick for
+      # building from a local checkout in CI rather than fetching a tagged release over the
+      # network (which CI's checkout already did). Paths are relative to this manifest's
+      # directory (`crates/gui/flatpak/`), hence three levels up to the repo root.
+      - type: dir
+        path: ../../..
+        skip:
+          - .git
+          - target
+          - crates/gui/ui/node_modules
+          - crates/gui/ui/dist
+          - crates/gui/flatpak/cargo-sources.json
+          - crates/gui/flatpak/node-sources.json
+      # Generated by `flatpak-cargo-generator.py` / `flatpak-node-generator.py` from the
+      # repo's `Cargo.lock` / `crates/gui/ui/package-lock.json` immediately before this
+      # manifest is built (`.github/workflows/packaging.yml`) — a bare filename here is
+      # flatpak-builder's syntax for "splice this file's own source-object array in place".
+      # Not committed (`crates/gui/flatpak/.gitignore`): regenerate whenever either lockfile
+      # changes, exactly like any other lockfile-derived cache.
+      - cargo-sources.json
+      - node-sources.json

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Minimal AppStream metainfo for the launchable Flatpak (issue #104). This is intentionally
+  thin — enough for `flatpak-builder`/`appstreamcli validate` to accept the app and for a
+  desktop shell to show a name, summary, and icon. Flathub-store-grade metadata (screenshots,
+  a fuller <description>, urls) is out of scope for #104's packaging work and can be layered
+  on later without touching the manifest.
+-->
+<component type="desktop-application">
+  <id>tools.linux-backup.gui</id>
+  <name>linux-backup</name>
+  <summary>Back up and restore a Linux user's environment</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!-- No LICENSE file or Cargo.toml `license` field exists in the repo yet as of #104; a
+       `<project_license>` tag is left out rather than guessed, since AppStream validators
+       treat it as a factual claim. Add it here once the repo declares one. -->
+  <description>
+    <p>
+      linux-backup captures a Linux user's environment — program configs, SSH keys, KDE
+      Plasma layout, shell setup, user directories, installed-package manifests, and
+      hand-picked custom paths — into one portable, optionally encrypted archive, and
+      restores it back. This GUI is a windowed alternative to the tool's terminal wizard,
+      built on the same selection engine.
+    </p>
+  </description>
+  <launchable type="desktop-id">tools.linux-backup.gui.desktop</launchable>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-07-22">
+      <description>
+        <p>Initial packaged build: walking-skeleton GUI, Flatpak canonical + AppImage fallback.</p>
+      </description>
+    </release>
+  </releases>
+</component>
