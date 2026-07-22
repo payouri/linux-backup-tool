@@ -46,7 +46,12 @@ Read before writing or changing tests:
 - **No `unsafe` without justification.** `core` carries `#![forbid(unsafe_code)]`; if `unsafe` is ever unavoidable elsewhere, a comment must state why (see the why-not-what rule above).
 - **New dependencies need a one-line justification** (health/maintenance, why this crate over alternatives) — follow the pattern in `docs/research/rust-crates.md` rather than adding a dep ad hoc.
 - **No premature abstraction.** Don't introduce a trait/interface for a single implementation "for cleanliness" — see ADR-0001's `ArchiveBackend` reasoning, which generalizes: the abstraction waits for a second real implementation.
-- **Commit messages**: imperative mood, `refs #N` / `closes #N` linking to the originating issue.
+- **Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)**: `type(scope): summary` in imperative mood, lowercase summary, no trailing period.
+  - **Types**: `feat`, `fix`, `docs`, `refactor`, `test`, `perf`, `build`, `ci`, `chore`. Use `feat`/`fix` only for behavior-changing changes; everything else takes the closest matching type.
+  - **Scope** (optional but preferred) names the affected area — typically the crate (`core`, `tui`) or a subsystem (`plasma`, `wizard`, `manifest`, `keymap`). Omit it only when a change is genuinely cross-cutting.
+  - **Breaking changes**: append `!` after the type/scope (`feat(core)!: …`) and explain the break in a `BREAKING CHANGE:` footer.
+  - **Issue links** go in the footer, not the summary: `refs #N` for related work, `closes #N` to auto-close the originating issue.
+  - Example: `feat(tui): add cross-screen keymap overlay` with a `refs #51` footer.
 
 ## Agent skills
 
