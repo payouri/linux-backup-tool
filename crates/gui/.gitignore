@@ -1,0 +1,3 @@
+# `tauri-build` regenerates these ACL/capability schemas on every build (`crates/gui/build.rs`);
+# they're compiler output, not source, exactly like `target/`.
+/gen/

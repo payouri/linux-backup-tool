@@ -1,0 +1,46 @@
+[package]
+name = "linux-backup-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "linux-backup's Tauri GUI: a Rust backend over core's SelectionModel, exposing it to a React frontend (crates/gui/ui) over a JSON IPC boundary, per ADR-0008."
+
+[lints]
+workspace = true
+
+[lib]
+name = "linux_backup_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "linux-backup-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+# Compiles `tauri.conf.json` into the binary and validates `frontendDist` exists at build
+# time (the walking-skeleton gotcha #99 flags — see ui/dist/index.html's doc comment for how
+# that's kept satisfied on a clean checkout without a frontend build step).
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+# The stack fixed by ADR-0008 Decision 1: Tauri 2.x, the only surveyed candidate shipping
+# the ADR-0006 recursive drill-down tree pre-built on the JS side (react-arborist). Default
+# features pull in the `webkit2gtk`/`wry` runtime this ADR already accepted the cost of.
+tauri = "2.11.5"
+# `#[tauri::command]` return types and the view DTOs (Decision 2) must derive `Serialize`;
+# this crate's own dependency, never `core`'s (ADR-0008 Decision 2: zero net-new `core`
+# serde derives).
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+# `gui`'s internal error handling follows the `tui` convention (AGENTS.md): `anyhow` at the
+# UI-crate boundary, `thiserror` reserved for `core`. Used for the ambient `RunContext`
+# construction (`run_context.rs`), mirroring `tui/src/system.rs`.
+anyhow = "1.0.103"
+linux_backup_core = { path = "../core", package = "linux-backup-core" }
+# The only way to reach `getuid()`/`geteuid()`/`gethostname()` from Rust without a heavier
+# crate (same justification as `tui/src/system.rs`, which this module intentionally
+# duplicates rather than sharing code with — ADR-0008: "gui and tui share no code directly").
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.15.0"
