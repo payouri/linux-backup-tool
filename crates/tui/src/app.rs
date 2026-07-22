@@ -415,10 +415,14 @@ fn render_gate_banner(frame: &mut Frame, area: Rect, wizard: &Wizard) {
     frame.render_widget(banner, area);
 }
 
-/// The body region — the only part that swaps between steps. The encryption body (build #69)
-/// and the REVIEW summary (build #71) render here; the remaining bodies (WHAT / WHERE) stay
-/// placeholders until their builds (#68/#70/#72).
+/// The body region — the only part that swaps between steps. WHAT is the two-pane explorer
+/// (build #68); the encryption body (build #69) and the REVIEW summary (build #71) render here
+/// too; the remaining body (WHERE) stays a placeholder until its build (#70/#72).
 fn render_body(frame: &mut Frame, area: Rect, wizard: &Wizard, ctx: &RunContext, reveal: bool) {
+    if wizard.current() == WizardStep::What {
+        crate::what_screen::render(frame, area, wizard.what(), wizard.state());
+        return;
+    }
     if wizard.current() == WizardStep::Encryption {
         crate::encryption_screen::render(frame, area, wizard, reveal);
         return;

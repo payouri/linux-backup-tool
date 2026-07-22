@@ -29,6 +29,7 @@ use linux_backup_core::model::SelectionModel;
 use secrecy::SecretString;
 
 use crate::encryption_screen::{Commit, EncryptionScreen, ModalOutcome};
+use crate::what_screen::WhatScreen;
 
 /// The four fixed wizard steps, in graph order (ADR-0007 D1). Order is conveyed by position
 /// (the stepper is not numbered, #50), so the discriminant order is the render order.
@@ -368,6 +369,11 @@ pub struct Wizard {
     state: WizardState,
     current: WizardStep,
     gate_banner: Option<GateReason>,
+    /// The WHAT step's own view state (focus, cursors, breadcrumb). Held for the whole wizard
+    /// so a jump back to WHAT re-renders where the user left the explorer. Boxed to keep the
+    /// `App`'s `View::Wizard` variant from dwarfing its sibling variants (`large_enum_variant`)
+    /// as each build adds its step's view state here.
+    what: Box<WhatScreen>,
     /// The encryption step's view state (input buffers, focus, the plaintext modal). Persists
     /// for the session so a backward jump to encryption re-renders the earlier field contents.
     /// Boxed to keep it off the [`crate::app::View`] enum's inline footprint.
@@ -378,10 +384,12 @@ impl Wizard {
     /// Opens the wizard at WHAT over `state`.
     #[must_use]
     pub fn new(state: WizardState) -> Self {
+        let what = Box::new(WhatScreen::new(state.selection()));
         Self {
             state,
             current: WizardStep::What,
             gate_banner: None,
+            what,
             encryption_screen: Box::new(EncryptionScreen::default()),
         }
     }
@@ -390,6 +398,12 @@ impl Wizard {
     #[must_use]
     pub fn state(&self) -> &WizardState {
         &self.state
+    }
+
+    /// The WHAT step's view state, read by [`crate::app`]'s render for the two-pane explorer.
+    #[must_use]
+    pub fn what(&self) -> &WhatScreen {
+        self.what.as_ref()
     }
 
     /// The encryption step's view state, for its render (build #69).
@@ -443,10 +457,14 @@ impl Wizard {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // On the encryption step the screen body owns the plain keys (typing into the fields,
         // the modal), so route there; the global step chords stay live inside it (build #69).
+        // The frontier is still re-established afterward so an encryption decision that changes
+        // reachability can't leave `current` stranded ahead of it.
         if self.current == WizardStep::Encryption {
             self.handle_encryption_key(key, ctrl);
+            self.reestablish_frontier();
             return self;
         }
+        let mut consumed = true;
         match key.code {
             // Esc means back/close, never quit (ADR-0005 D-keymap): step back one, inert at
             // WHAT where there is nothing to close to.
@@ -456,16 +474,38 @@ impl Wizard {
             KeyCode::Right if ctrl => self.step_forward(),
             KeyCode::Left if ctrl => self.step_back(),
             // 1–4 jump directly to a reachable step. The #51 rule to suppress these while a
-            // text field has focus is a no-op here — the shell has no focused field yet; the
+            // text field has focus is a no-op here — the WHAT screen has no focused field; the
             // encryption/WHERE screens (builds #70/#72) reinstate the suppression.
             KeyCode::Char(c) if !ctrl && WizardStep::from_digit(c).is_some() => {
                 if let Some(target) = WizardStep::from_digit(c) {
                     self.jump_to(target);
                 }
             }
-            _ => {}
+            _ => consumed = false,
         }
+        // Every key the global chords didn't claim belongs to the current step's body. Only
+        // WHAT has a real body in this build; its reducer edits the Selection through the
+        // model's public API (builds #70/#72 route their own steps here).
+        if !consumed && self.current == WizardStep::What {
+            self.what.handle_key(key, &mut self.state);
+        }
+        // A WHAT edit can lower the completion frontier (empty Selection, or newly-Sensitive
+        // content invalidating a plaintext encryption decision, ADR-0007 D5). Re-establish the
+        // frontier invariant so `current` never sits ahead of a step the edit just made
+        // unreachable — the shell never needed this while step bodies were placeholders that
+        // couldn't touch the Selection.
+        self.reestablish_frontier();
         self
+    }
+
+    /// Pulls `current` back onto the frontier if a Selection edit collapsed it below where the
+    /// wizard was sitting (ADR-0007 D5). Kept as a reducer postcondition rather than folded
+    /// into the WHAT branch so any future step that edits the Selection is covered too.
+    fn reestablish_frontier(&mut self) {
+        let frontier = self.state.frontier();
+        if self.current.index() > frontier {
+            self.current = WizardStep::ALL[frontier];
+        }
     }
 
     /// Attempts a gated forward move. Advances only if the current step is complete and has a
@@ -751,6 +791,22 @@ mod tests {
             Path::new("/home/tester"),
         );
         assert!(state.encryption_invalidated());
+    }
+
+    #[test]
+    fn a_selection_edit_pulls_current_back_onto_the_collapsed_frontier() {
+        // Sit at REVIEW with everything complete (frontier at REVIEW).
+        let wizard =
+            fully_reachable_wizard().handle_key(key(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert_eq!(wizard.current, WizardStep::Review);
+
+        // A WHAT edit empties the Selection, collapsing the frontier back to WHAT. The next
+        // key must re-establish the invariant and pull `current` back off the now-locked step.
+        let mut wizard = wizard;
+        wizard.state = WizardState::new(SelectionModel::new(vec![]), None);
+        let wizard = wizard.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(wizard.current, WizardStep::What);
+        assert!(wizard.current.index() <= wizard.state.frontier());
     }
 
     #[test]

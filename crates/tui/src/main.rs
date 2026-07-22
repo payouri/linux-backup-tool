@@ -27,6 +27,7 @@ mod reflow;
 mod run_screen;
 mod runtime;
 mod system;
+mod what_screen;
 mod wizard;
 
 // Retired screen by screen per spec #62: these inquire-based modules stay compiled (so
