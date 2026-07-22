@@ -29,10 +29,11 @@ use crate::run_screen::{self, BackupWorker};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-/// How long a RUN poll tick waits on crossterm before falling through to drain the progress
-/// channel and repaint. Short enough that a keypress (Ctrl-C cancel) still feels immediate and
-/// the spinner animates smoothly; long enough not to busy-spin the CPU during a long phase.
-const RUN_POLL_INTERVAL: Duration = Duration::from_millis(80);
+/// How long a poll tick waits on crossterm before falling through to drain the active run's
+/// progress channel, advance the spinner, and repaint. Short enough that a keypress (Ctrl-C
+/// cancel) still feels immediate and the spinner animates smoothly; long enough not to
+/// busy-spin the CPU during a long phase.
+const POLL_INTERVAL: Duration = Duration::from_millis(80);
 
 /// Drives an [`App`] to completion: sets up the terminal, runs the redraw-on-event loop until
 /// the app requests quit (or the read loop errors), then restores the terminal regardless of
@@ -57,10 +58,16 @@ pub fn run(app: App) -> Result<()> {
 }
 
 /// The main loop. Every interactive screen is redraw-on-event: draw once, block on the next
-/// input, fold it into state, repeat. The one exception is RUN, which polls: while a backup is
-/// in flight the loop drains the worker's progress channel and crossterm together each tick
-/// (spec #62 / ADR-0005 — RUN is the *only* polling screen), so the frame stays live during
-/// the backup without any other screen spinning the CPU.
+/// input, fold it into state, repeat. The exception is a *running* backup RUN or restore
+/// (`App::is_backup_running` / [`App::needs_poll`], ADR-0005 D4): while either holds, the loop
+/// drains that run's progress channel and crossterm together each tick and drives an
+/// [`Event::Tick`] to advance the flow, so the frame stays live during the run without any
+/// other screen spinning the CPU.
+///
+/// The two runs differ only in where their worker lives: the backup worker is spawned and held
+/// here (drained via [`drain_backup_worker`]), while the restore worker lives inside the flow
+/// and is drained by the `Event::Tick` the reducer routes into it — one poll loop drives
+/// whichever is active.
 ///
 /// Only `KeyEventKind::Press` is forwarded — terminals that also report `Repeat`/`Release`
 /// would otherwise double-handle a single keystroke. Non-key, non-resize events are ignored
@@ -84,42 +91,50 @@ fn run_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
             worker = Some(run_screen::spawn(request));
         }
 
-        let next_event = if app.is_backup_running() {
-            run_poll_tick(&mut app, worker.as_ref())?
+        if app.is_backup_running() || app.needs_poll() {
+            // Drain the backup worker's channel (only the backup run holds its worker here; the
+            // restore run drains its own inside the flow on the `Event::Tick` below). Wait
+            // briefly for one input so the frame stays live, fold it, then pulse a `Tick` to
+            // advance whichever flow is running (spinner / restore channel drain).
+            if let Some(worker) = worker.as_ref() {
+                drain_backup_worker(&mut app, worker);
+            }
+            if let Some(event) = poll_event(POLL_INTERVAL)? {
+                app = app.update(event);
+            }
+            app = app.update(Event::Tick);
         } else {
-            // Back to (or still) redraw-on-event; a finished worker can be released here — its
-            // thread already sent the terminal message and exited.
+            // Redraw-on-event; a finished worker can be released here — its thread already sent
+            // the terminal message and exited.
             worker = None;
-            read_event()?
-        };
-
-        if let Some(event) = next_event {
-            app = app.update(event);
+            if let Some(event) = read_event()? {
+                app = app.update(event);
+            }
         }
     }
     Ok(())
 }
 
-/// One RUN poll tick: drain every pending progress message into the app, animate the spinner,
-/// then wait (briefly) for one input event, returning it for the caller to fold in by value. A
-/// disconnected channel with no terminal message means the worker panicked, which reads as a
-/// failed run.
-fn run_poll_tick(app: &mut App, worker: Option<&BackupWorker>) -> Result<Option<Event>> {
-    if let Some(worker) = worker {
-        loop {
-            match worker.try_recv() {
-                Ok(message) => app.apply_run_message(message),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    app.on_worker_disconnected();
-                    break;
-                }
+/// Drains every pending progress message from the backup worker into the app. A disconnected
+/// channel with no terminal message means the worker panicked, which reads as a failed run.
+/// (The restore worker lives inside the flow and is drained by the reducer's `Event::Tick`.)
+fn drain_backup_worker(app: &mut App, worker: &BackupWorker) {
+    loop {
+        match worker.try_recv() {
+            Ok(message) => app.apply_run_message(message),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                app.on_worker_disconnected();
+                break;
             }
         }
     }
-    app.tick();
+}
 
-    if event::poll(RUN_POLL_INTERVAL).context("poll terminal event")? {
+/// Waits up to `timeout` for one input, returning the mapped [`Event`] or `None` if nothing
+/// arrived (so the caller can fall through to drain a channel and repaint). Used while polling.
+fn poll_event(timeout: Duration) -> Result<Option<Event>> {
+    if event::poll(timeout).context("poll terminal event")? {
         read_event()
     } else {
         Ok(None)

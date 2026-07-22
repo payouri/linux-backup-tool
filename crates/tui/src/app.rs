@@ -26,7 +26,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::cli::RestoreArgs;
 use crate::reflow::ReflowTier;
+use crate::restore_screen::{self, RestoreFlow};
 use crate::run_screen::{BackupRequest, RunMessage, RunPlan, RunScreen};
 use crate::where_step::WhereStep;
 use crate::wizard::{StepStatus, Wizard, WizardState, WizardStep};
@@ -37,8 +39,6 @@ use crate::wizard::{StepStatus, Wizard, WizardState, WizardStep};
 pub enum Screen {
     /// The backup wizard (WHAT → encryption → WHERE → REVIEW), seeded by `linux-backup backup`.
     Backup,
-    /// The restore flow, seeded by `linux-backup restore <dir>`.
-    Restore,
     /// The standalone WHAT screen, seeded by `linux-backup select`.
     Select,
     /// The standalone WHERE screen, seeded by `linux-backup where`.
@@ -51,7 +51,6 @@ impl Screen {
     fn mode_label(self) -> &'static str {
         match self {
             Self::Backup => "backup",
-            Self::Restore => "restore",
             Self::Select => "select",
             Self::Where => "where",
         }
@@ -59,12 +58,15 @@ impl Screen {
 }
 
 /// The live content behind the frame: the backup wizard, the RUN screen the wizard launches
-/// into, or a not-yet-built screen's placeholder. Later builds replace the remaining
-/// placeholders with the restore/dev screens.
+/// into, the restore flow, or a not-yet-built screen's placeholder. Later builds replace the
+/// remaining placeholders with the dev screens. Not `Clone`: the restore flow owns a live
+/// worker channel (a `Receiver`), which has no meaningful copy — the reducer moves state by
+/// value rather than cloning it.
 #[derive(Debug)]
 enum View {
     Wizard(Wizard),
     Run(RunScreen),
+    Restore(RestoreFlow),
     Placeholder(Screen),
 }
 
@@ -75,12 +77,19 @@ enum View {
 pub enum Event {
     Key(KeyEvent),
     Resize(u16, u16),
+    /// A poll tick, emitted by the runtime only while a screen is polling (the restore RUN,
+    /// ADR-0005 D4). It carries no data — it just gives the active flow a chance to drain its
+    /// worker channel and repaint. Every non-polling screen never sees one.
+    Tick,
 }
 
 /// The whole application state: the active [`View`], the injected [`RunContext`] (ADR-0004:
 /// run facts are injected, never read ambiently by anything under `core`), the quit flag the
 /// runtime watches, and a one-shot backup-launch request the runtime drains to start the RUN
 /// worker.
+///
+/// Not `Clone`: [`View::Restore`] owns a live worker channel that cannot be meaningfully
+/// copied; the reducer moves `self` by value rather than cloning it.
 #[derive(Debug)]
 pub struct App {
     view: View,
@@ -135,6 +144,26 @@ impl App {
         }
     }
 
+    /// Builds the initial state for the `restore <dir>` route (#72). Unlike the wizard, restore
+    /// is seeded from a CLI argument (the Backup dir) rather than a scan, so it has its own
+    /// constructor: the [`RestoreFlow`] probes the dir (via `core`, ADR-0005 D6) to decide
+    /// whether to open on the overwrite-confirm, an encrypted-Backup unlock path, or a fatal
+    /// report for an invalid dir.
+    #[must_use]
+    pub fn new_restore(args: RestoreArgs, run_context: RunContext) -> Self {
+        let flow = RestoreFlow::new(args.backup_dir, run_context.clone());
+        Self {
+            view: View::Restore(flow),
+            // Restore never enters the wizard, so its WHERE body is inert and no backup launch
+            // is ever pending; F2 reveal is a wizard-only chord.
+            where_step: WhereStep::empty(),
+            run_context,
+            should_quit: false,
+            pending_backup: None,
+            reveal: false,
+        }
+    }
+
     /// Whether the runtime should tear down and exit after the last `update`.
     #[must_use]
     pub fn should_quit(&self) -> bool {
@@ -148,8 +177,9 @@ impl App {
         self.pending_backup.take()
     }
 
-    /// Whether a backup is in flight — the runtime polls the progress channel + crossterm each
-    /// tick while this holds (RUN is the only polling screen) and blocks on input otherwise.
+    /// Whether a backup is in flight — while this holds the runtime polls the RUN worker's
+    /// progress channel + crossterm each tick (rather than blocking on input) and drives an
+    /// [`Event::Tick`] to animate the spinner. See also [`App::needs_poll`] for restore.
     #[must_use]
     pub fn is_backup_running(&self) -> bool {
         matches!(&self.view, View::Run(run) if run.is_running())
@@ -171,29 +201,52 @@ impl App {
         }
     }
 
-    /// Advances the RUN spinner one frame — the runtime calls this each poll tick so an
-    /// indeterminate phase animates even on a tick with no worker message. A no-op elsewhere.
-    pub fn tick(&mut self) {
-        if let View::Run(run) = &mut self.view {
-            run.tick();
-        }
+    /// Whether the current screen wants the runtime to poll rather than block on input — true
+    /// while the restore worker is running (ADR-0005 D4). The backup RUN screen polls too, but
+    /// its worker lives in the runtime, so it is gated by [`App::is_backup_running`] instead;
+    /// the runtime polls whenever either holds. When polling, the runtime drives an
+    /// [`Event::Tick`] each interval so the running flow can drain its worker channel.
+    #[must_use]
+    pub fn needs_poll(&self) -> bool {
+        matches!(&self.view, View::Restore(flow) if flow.is_running())
     }
 
-    /// The pure reducer: fold one [`Event`] into the next state. Taking and returning `Self`
-    /// by value keeps it a total function of its inputs — the property the reducer unit tests
-    /// rely on — with no `&mut` aliasing or hidden I/O.
+    /// The reducer: fold one [`Event`] into the next state. Taking and returning `Self` by value
+    /// keeps it a total function of its inputs — the property the reducer unit tests rely on —
+    /// with no `&mut` aliasing. The single impurity is the restore launch (a Confirm/Unlock
+    /// `Enter` routed into the flow spawns the worker thread, ADR-0005 D4), mirroring the RUN
+    /// screen; every other transition is side-effect-free.
     ///
     /// `Ctrl-C` is the sole quit (the #51 keymap) and is handled here, before any view sees
-    /// the key. Every other key routes to the active view; `Esc` there means back/close and
-    /// never quits. Resizes are folded so the loop repaints; the reflow tier is recomputed
-    /// from the frame at render time, so there is no size-dependent state to store.
+    /// the key — on a running backup/restore it doubles as the abort. Every other key routes to
+    /// the active view; `Esc` there means back/close and never quits. [`Event::Tick`] is
+    /// delivered only while a screen is polling and advances whichever flow is running (the RUN
+    /// spinner or the restore flow's channel drain). Resizes are folded so the loop repaints;
+    /// the reflow tier is recomputed from the frame at render time, so there is no
+    /// size-dependent state to store.
     #[must_use]
     pub fn update(mut self, event: Event) -> Self {
+        // A poll tick advances whichever flow is running: the RUN spinner (so an indeterminate
+        // phase still animates on a tick with no worker message) or the restore flow (draining
+        // its own worker channel). It reaches the reducer only while a screen is polling.
+        if let Event::Tick = event {
+            self.view = match self.view {
+                View::Run(mut run) => {
+                    run.tick();
+                    View::Run(run)
+                }
+                View::Restore(flow) => View::Restore(flow.tick()),
+                other => other,
+            };
+            return self;
+        }
         let Event::Key(key) = event else {
+            // Resize (and any other non-key event): nothing to fold — the loop repaints and the
+            // reflow tier is recomputed from the frame at render time.
             return self;
         };
-        // `Ctrl-C` is the sole quit everywhere, and during a running backup it *is* the cancel
-        // (the run is abandoned as the app tears down — `core::backup` is synchronous with no
+        // `Ctrl-C` is the sole quit everywhere, and during a running backup/restore it *is* the
+        // cancel (the run is abandoned as the app tears down — `core` is synchronous with no
         // cooperative cancellation, so aborting the process is the honest cancel here).
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
@@ -238,6 +291,19 @@ impl App {
                 if run.is_terminal() && key.code == KeyCode::Enter && key.modifiers.is_empty() =>
             {
                 self.should_quit = true;
+            }
+            // The restore flow owns its keys (overwrite-confirm, passphrase unlock, dismissing
+            // the result); a Confirm/Unlock `Enter` routed in spawns its worker thread.
+            View::Restore(flow) => {
+                self.view = View::Restore(flow.handle_key(key));
+                // The standalone restore route has nothing behind it, so closing its flow
+                // (Cancel, or dismissing the result) is a quit — folded here rather than
+                // reaching into `should_quit` from inside the flow.
+                if let View::Restore(flow) = &self.view
+                    && flow.wants_exit()
+                {
+                    self.should_quit = true;
+                }
             }
             // A running RUN ignores everything but Ctrl-C (above); placeholder screens have no
             // interactions yet (`Esc` is inert, never quits).
@@ -294,6 +360,7 @@ impl App {
                 );
             }
             View::Run(run) => crate::run_screen::render(frame, area, run, tier),
+            View::Restore(flow) => restore_screen::render(frame, area, flow, tier),
             View::Placeholder(screen) => render_placeholder(frame, area, *screen),
         }
     }
@@ -750,7 +817,7 @@ mod tests {
         let app = app.update(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.should_quit());
         // And on a placeholder screen.
-        let app = App::new(Screen::Restore, test_context());
+        let app = App::new(Screen::Select, test_context());
         let app = app.update(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.should_quit());
     }
@@ -1041,6 +1108,48 @@ mod tests {
 
     fn key_event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press)
+    }
+
+    #[test]
+    fn restore_route_opens_on_the_overwrite_confirm() {
+        // A non-existent dir opens on a fatal report rather than a confirm — but either way the
+        // restore route renders its own screen, not the placeholder.
+        let args = RestoreArgs {
+            backup_dir: PathBuf::from("/does/not/exist"),
+            verify: false,
+            overwrite: false,
+        };
+        let app = App::new_restore(args, test_context());
+        let lines = rendered_lines(&app, 70, 16);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("failed") || l.contains("restore")),
+            "expected a restore screen, got: {lines:?}"
+        );
+        assert!(
+            !app.needs_poll(),
+            "a freshly-seeded restore is not yet running"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_the_restore_route() {
+        let args = RestoreArgs {
+            backup_dir: PathBuf::from("/does/not/exist"),
+            verify: false,
+            overwrite: false,
+        };
+        let app = App::new_restore(args, test_context());
+        let app = app.update(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn a_tick_on_a_non_polling_screen_is_inert() {
+        let app = app_with_wizard(non_sensitive_wizard());
+        let app = app.update(Event::Tick);
+        assert!(!app.should_quit());
     }
 
     #[test]

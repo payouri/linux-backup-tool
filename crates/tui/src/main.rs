@@ -24,6 +24,7 @@ mod app;
 mod cli;
 mod encryption_screen;
 mod reflow;
+mod restore_screen;
 mod run_screen;
 mod runtime;
 mod system;
@@ -63,13 +64,16 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<()> {
     // argv[0] is the program name; every parseable token starts after it.
     let args = std::env::args().skip(1);
-    let screen = match cli::parse_args(args).map_err(anyhow::Error::msg)? {
-        cli::Command::Backup => Screen::Backup,
-        cli::Command::Restore(_) => Screen::Restore,
-        cli::Command::Select => Screen::Select,
-        cli::Command::Where => Screen::Where,
-    };
-
+    let command = cli::parse_args(args).map_err(anyhow::Error::msg)?;
     let run_context = system::build_run_context()?;
-    runtime::run(App::new(screen, run_context))
+
+    // `restore` carries its Backup-dir argument into a dedicated constructor (the flow probes
+    // it to pick its opening screen, #72); the argument-less routes just seed their `Screen`.
+    let app = match command {
+        cli::Command::Restore(args) => App::new_restore(args, run_context),
+        cli::Command::Backup => App::new(Screen::Backup, run_context),
+        cli::Command::Select => App::new(Screen::Select, run_context),
+        cli::Command::Where => App::new(Screen::Where, run_context),
+    };
+    runtime::run(app)
 }
