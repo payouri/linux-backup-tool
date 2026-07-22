@@ -1,0 +1,6 @@
+# Silences Cargo's end-of-build future-incompat notification, which only
+# surfaces dependency issues (own-crate future-incompat lints still warn
+# inline and are caught by the `-D warnings` clippy gate). Currently noise
+# from proc-macro-error2 v2.0.1 pulled in via age -> i18n-embed-fl.
+[future-incompat-report]
+frequency = "never"
