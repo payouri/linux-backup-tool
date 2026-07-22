@@ -35,6 +35,9 @@ pub struct Glyphs {
     pub locked: &'static str,
     /// Focus/breadcrumb pointer (`▸` → `>`): pane cursors, field markers, the breadcrumb.
     pub pointer: &'static str,
+    /// Bullet (`•` → `*`): the passphrase mask, the offered/pick-list radio dot, the
+    /// plaintext-modal Category list, and the restore partial-report failure lines.
+    pub bullet: &'static str,
     /// The indeterminate-phase spinner frames (braille → `\|/-`).
     pub spinner: &'static [char],
 }
@@ -55,11 +58,12 @@ impl Glyphs {
         current: "●",
         locked: "·",
         pointer: "▸",
+        bullet: "•",
         spinner: &UNICODE_SPINNER,
     };
 
     /// The no-emoji fallback set (#61 map). `⚠`→`/!\`, `🔒`→`[!]`, `✓`→`OK`, `✗`→`x`, `●`→`>`,
-    /// `·`→`.`, `▸`→`>`, spinner→`\|/-`.
+    /// `·`→`.`, `▸`→`>`, `•`→`*`, spinner→`\|/-`.
     pub const ASCII: Self = Self {
         warn: "/!\\",
         lock: "[!]",
@@ -68,6 +72,7 @@ impl Glyphs {
         current: ">",
         locked: ".",
         pointer: ">",
+        bullet: "*",
         spinner: &ASCII_SPINNER,
     };
 
@@ -120,7 +125,15 @@ mod tests {
         assert_eq!(glyphs.warn, "/!\\");
         assert_eq!(glyphs.lock, "[!]");
         assert_eq!(glyphs.check, "OK");
+        assert_eq!(glyphs.bullet, "*");
         assert_eq!(glyphs.spinner, &['\\', '|', '/', '-']);
+    }
+
+    #[test]
+    fn the_unicode_bullet_stays_unicode() {
+        // The non-ASCII `•` survives in the Unicode set; only the fallback swaps it to `*`.
+        assert_eq!(Glyphs::UNICODE.bullet, "•");
+        assert_eq!(Glyphs::ASCII.bullet, "*");
     }
 
     #[test]

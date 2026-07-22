@@ -299,10 +299,17 @@ impl App {
             self.reveal = !self.reveal;
             return self;
         }
-        // F3 toggles hidden-file visibility in the WHERE autocomplete (#51 Reveal). It lives on
-        // `App` beside `reveal` because the WHERE step's view state does too; on the non-wizard
-        // routes the step is inert, so the toggle is a harmless no-op there.
+        // F3 toggles hidden-file visibility in an autocomplete field (#51 Reveal). On the WHAT
+        // step with the Custom-path field open it flips *that* field's toggle; otherwise it flips
+        // the WHERE field's (which lives on `App`, and is a harmless no-op on the inert routes).
         if key.code == KeyCode::F(3) {
+            if let View::Wizard(wizard) = &mut self.view
+                && wizard.current() == WizardStep::What
+                && wizard.what().is_typing()
+            {
+                wizard.toggle_what_show_hidden();
+                return self;
+            }
             self.where_step.toggle_show_hidden();
             return self;
         }
@@ -328,6 +335,20 @@ impl App {
                         .handle_key(key, &|name| std::env::var(name).ok());
                     let (location, writable) = self.where_step.chosen();
                     wizard.set_where(location, writable);
+                    self.view = View::Wizard(wizard);
+                } else if wizard.current() == WizardStep::What
+                    && wizard.what().is_typing()
+                    && what_field_targets_screen(key)
+                {
+                    // The WHAT Custom-path field owns the plain keys while it is open; like WHERE
+                    // it needs the injected run facts + env resolver, so it is driven here rather
+                    // than inside the pure wizard reducer (ADR-0004/0005 D6).
+                    wizard.handle_what_field_key(
+                        key,
+                        &self.run_context.home,
+                        self.run_context.privilege,
+                        &|name| std::env::var(name).ok(),
+                    );
                     self.view = View::Wizard(wizard);
                 } else {
                     self.view = View::Wizard(wizard.handle_key(key));
@@ -458,6 +479,16 @@ fn where_key_targets_screen(key: KeyEvent, typing: bool) -> bool {
         KeyCode::Esc => typing,
         _ => true,
     }
+}
+
+/// Whether a key pressed while the WHAT Custom-path field is open belongs to the field rather
+/// than the wizard (#51/#75). Only called when the field is focused: the step-motion chords
+/// (`Ctrl-←`/`Ctrl-→`) stay with the wizard so they move between steps even mid-entry, while
+/// everything else — typing, the candidate list, `Tab`/`→`/`Enter`, `Esc` (which closes the
+/// field), and a typed `1`–`4` digit — is the field's.
+fn what_field_targets_screen(key: KeyEvent) -> bool {
+    !(key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Left | KeyCode::Right))
 }
 
 /// Seeds a wizard from a Smart-default Selection and the context's Output location. This is
@@ -659,7 +690,16 @@ fn render_body(
     glyphs: Glyphs,
 ) {
     if wizard.current() == WizardStep::What {
-        crate::what_screen::render(frame, area, wizard.what(), wizard.state(), glyphs);
+        crate::what_screen::render(
+            frame,
+            area,
+            wizard.what(),
+            wizard.state(),
+            &ctx.home,
+            ctx.privilege,
+            &|name| std::env::var(name).ok(),
+            glyphs,
+        );
         return;
     }
     if wizard.current() == WizardStep::Encryption {
@@ -1527,6 +1567,42 @@ mod tests {
         let jumped =
             app_with_wizard(wizard_on_review()).update(key(KeyCode::Char('1'), KeyModifiers::NONE));
         assert_eq!(current_step(&jumped), WizardStep::What);
+    }
+
+    #[test]
+    fn a_digit_reaches_the_open_what_custom_path_field_instead_of_jumping() {
+        // Open the WHAT Custom-path add field (Down onto the Custom paths row, then →).
+        let app = app_with_wizard(non_sensitive_wizard())
+            .update(kev(KeyCode::Down, KeyModifiers::NONE))
+            .update(kev(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(current_step(&app), WizardStep::What);
+        // With the field focused, a typed digit edits the buffer rather than jumping steps (#51).
+        let app = app.update(kev(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(current_step(&app), WizardStep::What);
+        // But the step-motion chords still move between steps mid-entry.
+        let app = app.update(kev(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(current_step(&app), WizardStep::Encryption);
+    }
+
+    #[test]
+    fn no_emoji_fallback_swaps_the_bullet_mask() {
+        // The passphrase mask's `•` is the bullet glyph: Unicode draws `•`, the ASCII set `*`.
+        let mut app = type_into(offered_encryption_typing(), "hunter2");
+        let unicode = rendered_lines(&app, 80, 24);
+        assert!(
+            unicode.iter().any(|l| l.contains("•••••••")),
+            "expected the Unicode bullet mask, got: {unicode:?}"
+        );
+        app.glyphs = Glyphs::ASCII;
+        let ascii = rendered_lines(&app, 80, 24);
+        assert!(
+            ascii.iter().any(|l| l.contains("*******")),
+            "expected the ASCII bullet mask, got: {ascii:?}"
+        );
+        assert!(
+            !ascii.iter().any(|l| l.contains('•')),
+            "the ASCII fallback must show no `•`, got: {ascii:?}"
+        );
     }
 
     #[test]

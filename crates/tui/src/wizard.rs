@@ -26,9 +26,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use linux_backup_core::archive::Encryption;
 use linux_backup_core::crypto;
 use linux_backup_core::model::SelectionModel;
+use linux_backup_core::Privilege;
 use secrecy::SecretString;
 
 use crate::encryption_screen::{Commit, EncryptionScreen, ModalOutcome};
+use crate::path_autocomplete::Getenv;
 use crate::what_screen::WhatScreen;
 
 /// The four fixed wizard steps, in graph order (ADR-0007 D1). Order is conveyed by position
@@ -427,6 +429,30 @@ impl Wizard {
     /// here (it never gates, #61).
     pub fn set_where(&mut self, location: Option<PathBuf>, writable: bool) {
         self.state.set_location(location, writable);
+    }
+
+    /// Folds one key into the WHAT step's Custom-path add field (#75). `App` routes here while
+    /// the field is open (`self.what().is_typing()`), supplying the injected run facts and env
+    /// resolver the pure `handle_key` reducer doesn't carry (ADR-0004). Adding a Custom path can
+    /// newly expose Sensitive content, so the frontier is re-established afterward exactly as a
+    /// WHAT edit through `handle_key` would (ADR-0007 D5).
+    pub fn handle_what_field_key(
+        &mut self,
+        key: KeyEvent,
+        home: &Path,
+        privilege: Privilege,
+        getenv: Getenv,
+    ) {
+        self.gate_banner = None;
+        self.what
+            .handle_field_key(key, &mut self.state, home, privilege, getenv);
+        self.reestablish_frontier();
+    }
+
+    /// Flips the WHAT Custom-path field's reveal-hidden toggle (the `F3` reveal, #51). A no-op
+    /// while the field is closed, so `App` can call it whenever `F3` fires on the WHAT step.
+    pub fn toggle_what_show_hidden(&mut self) {
+        self.what.toggle_custom_show_hidden();
     }
 
     /// The step the wizard is currently on.

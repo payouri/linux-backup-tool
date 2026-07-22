@@ -28,7 +28,6 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
-use linux_backup_core::fs_probe::{self, DirEntry};
 use linux_backup_core::location::{self, FreeSpaceWarning, LocationRow};
 use linux_backup_core::{catalog, Privilege, RunContext};
 use ratatui::layout::Rect;
@@ -38,15 +37,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::glyphs::Glyphs;
-
-/// How many candidate rows the list shows before folding the remainder into a `+M more` footer
-/// (#52's type-to-narrow, no giant scroll). Kept small so the list fits the reflow ladder's
-/// minimum body without a scrollbar.
-const CANDIDATE_CAP: usize = 8;
-
-/// A resolver from env-var name to value — the ADR-0004 carve-out, supplied by the caller so
-/// `core` never reads the environment itself. `main` passes `std::env::var`; tests pass a fake.
-type Getenv<'a> = &'a dyn Fn(&str) -> Option<String>;
+use crate::path_autocomplete::{self, Autocomplete, Getenv};
 
 /// Which region of the WHERE body has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,17 +85,6 @@ pub struct WhereStep {
     chosen: Option<Chosen>,
     home: PathBuf,
     privilege: Privilege,
-}
-
-/// The computed autocomplete listing for the current buffer — recomputed on demand (in both the
-/// reducer and the render) rather than cached, so it always reflects the live buffer and disk.
-struct Autocomplete {
-    candidates: Vec<DirEntry>,
-    selected: usize,
-    /// Total matches before the [`CANDIDATE_CAP`] truncation, for the `+M more` footer.
-    total: usize,
-    /// Non-root typed a path outside `$HOME` — no candidates are offered (proactive scope, #52).
-    out_of_scope: bool,
 }
 
 impl WhereStep {
@@ -256,20 +236,7 @@ impl WhereStep {
     /// directory — component-by-component, stopping at each directory's trailing `/` (#52).
     fn complete_tab(&mut self, getenv: Getenv) {
         let view = self.autocomplete(getenv);
-        if view.candidates.is_empty() {
-            return;
-        }
-        let (dir_part, fragment) = split_buffer(&self.buffer);
-        if view.candidates.len() == 1 {
-            self.buffer = extend(dir_part, &view.candidates[0]);
-        } else {
-            let lcp = longest_common_prefix(&view.candidates);
-            // Only extend when the common prefix reaches past what's already typed — otherwise
-            // Tab is a no-op on an already-ambiguous fragment (the prototype's `~/Do →Tab→ ~/Do`).
-            if lcp.chars().count() > fragment.chars().count() {
-                self.buffer = format!("{dir_part}{lcp}");
-            }
-        }
+        path_autocomplete::complete_tab(&mut self.buffer, &view);
         self.ac_selected = 0;
     }
 
@@ -277,11 +244,8 @@ impl WhereStep {
     /// a trailing `/` when it's a directory so the next segment can follow.
     fn accept_ghost(&mut self, getenv: Getenv) {
         let view = self.autocomplete(getenv);
-        let (dir_part, _) = split_buffer(&self.buffer);
-        if let Some(candidate) = view.candidates.get(view.selected) {
-            self.buffer = extend(dir_part, candidate);
-            self.ac_selected = 0;
-        }
+        path_autocomplete::accept_ghost(&mut self.buffer, &view);
+        self.ac_selected = 0;
     }
 
     /// `Enter`: accept the highlighted candidate when it would extend the buffer, otherwise
@@ -289,7 +253,7 @@ impl WhereStep {
     /// candidate list drives `Enter`), while a buffer that already names its target confirms it.
     fn accept_or_commit(&mut self, getenv: Getenv) {
         let view = self.autocomplete(getenv);
-        let (_, fragment) = split_buffer(&self.buffer);
+        let (_, fragment) = path_autocomplete::split_buffer(&self.buffer);
         match view.candidates.get(view.selected) {
             Some(candidate) if candidate.name.to_string_lossy() != fragment => {
                 self.accept_ghost(getenv);
@@ -313,83 +277,23 @@ impl WhereStep {
         });
     }
 
-    /// Computes the live candidate listing for the current buffer, applying scope, dotfile
-    /// hiding, prefix narrowing, and dirs-first ordering. The directory listing itself is
-    /// `core`'s (ADR-0005 D6); everything here is presentation/policy over what it returns.
+    /// Computes the live candidate listing for the current buffer via the shared engine
+    /// ([`crate::path_autocomplete`]) — scope, dotfile hiding, prefix narrowing, and dirs-first
+    /// ordering over `core`'s directory listing (ADR-0005 D6).
     fn autocomplete(&self, getenv: Getenv) -> Autocomplete {
-        // An empty buffer is "no input yet", not an out-of-scope path: expanding it yields an
-        // empty path that fails the non-root scope check, so without this a non-root user would
-        // see `⚠ outside ~` the instant the field opens, before typing anything (#52).
-        if self.buffer.is_empty() {
-            return Autocomplete {
-                candidates: Vec::new(),
-                selected: 0,
-                total: 0,
-                out_of_scope: false,
-            };
-        }
-
-        let expanded_full = location::expand_path(&self.buffer, &self.home, getenv);
-        if catalog::validate_custom_path(&expanded_full, &self.home, self.privilege).is_err() {
-            return Autocomplete {
-                candidates: Vec::new(),
-                selected: 0,
-                total: 0,
-                out_of_scope: true,
-            };
-        }
-
-        let (dir_part, fragment) = split_buffer(&self.buffer);
-        let listing_dir = location::expand_path(dir_part, &self.home, getenv);
-        let fragment_lower = fragment.to_lowercase();
-        let reveal_hidden = self.show_hidden || fragment.starts_with('.');
-
-        let mut matched: Vec<DirEntry> = fs_probe::list_dir(&listing_dir)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| {
-                let name = entry.name.to_string_lossy();
-                if name.starts_with('.') && !reveal_hidden {
-                    return false;
-                }
-                name.to_lowercase().starts_with(&fragment_lower)
-            })
-            .collect();
-        // Directories first, then files; alphabetical case-insensitive within each group (#52).
-        matched.sort_by(|a, b| {
-            b.is_dir.cmp(&a.is_dir).then_with(|| {
-                a.name
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .cmp(&b.name.to_string_lossy().to_lowercase())
-            })
-        });
-
-        let total = matched.len();
-        matched.truncate(CANDIDATE_CAP);
-        let selected = self.ac_selected.min(matched.len().saturating_sub(1));
-        Autocomplete {
-            candidates: matched,
-            selected,
-            total,
-            out_of_scope: false,
-        }
+        path_autocomplete::compute(
+            &self.buffer,
+            self.ac_selected,
+            self.show_hidden,
+            &self.home,
+            self.privilege,
+            getenv,
+        )
     }
 
-    /// The ghost-text tail: the remaining characters of the highlighted candidate past what's
-    /// typed, plus a `/` for a directory. Empty when there's nothing to suggest.
+    /// The ghost-text tail for the highlighted candidate — delegated to the shared engine.
     fn ghost(&self, view: &Autocomplete) -> String {
-        let (_, fragment) = split_buffer(&self.buffer);
-        let Some(candidate) = view.candidates.get(view.selected) else {
-            return String::new();
-        };
-        let name = candidate.name.to_string_lossy();
-        let typed = fragment.chars().count();
-        let mut ghost: String = name.chars().skip(typed).collect();
-        if candidate.is_dir {
-            ghost.push('/');
-        }
-        ghost
+        path_autocomplete::ghost(&self.buffer, view)
     }
 
     /// The advisory free-space warning for the location currently in focus (the cursor row while
@@ -411,13 +315,6 @@ impl WhereStep {
         location::free_space_warning(selection_size, available).map(|w| (w, label))
     }
 
-    fn scope_hint(&self) -> &'static str {
-        match self.privilege {
-            Privilege::Root => "scope: full filesystem (root)",
-            Privilege::NonRoot => "scope: under ~ (non-root)",
-        }
-    }
-
     /// Draws the WHERE body: the location pick-list, the custom-path field with its live
     /// candidate list and ghost-text, the advisory space warning, and the standing scope hint.
     /// Lines past `area.height` are dropped so the body never overflows the reflow frame.
@@ -437,7 +334,11 @@ impl WhereStep {
 
         for (idx, loc) in self.locations.iter().enumerate() {
             let picked = self.mode == Mode::Picking && self.cursor == idx;
-            let marker = if picked { "(•)" } else { "( )" };
+            let marker = if picked {
+                format!("({})", glyphs.bullet)
+            } else {
+                "( )".to_owned()
+            };
             let mut spans = vec![Span::raw(format!("{marker} {}", loc.label))];
             let tight = loc
                 .available_space
@@ -452,7 +353,11 @@ impl WhereStep {
         let custom_row = self.locations.len();
         let custom_picked =
             self.mode == Mode::Typing || (self.mode == Mode::Picking && self.cursor == custom_row);
-        let custom_marker = if custom_picked { "(•)" } else { "( )" };
+        let custom_marker = if custom_picked {
+            format!("({})", glyphs.bullet)
+        } else {
+            "( )".to_owned()
+        };
 
         if self.mode == Mode::Typing {
             let view = self.autocomplete(getenv);
@@ -473,35 +378,7 @@ impl WhereStep {
             }
             lines.push(Line::from(field));
 
-            if view.out_of_scope {
-                lines.push(Line::styled(
-                    format!(
-                        "{} outside ~ — non-root can only add paths under your home",
-                        glyphs.warn
-                    ),
-                    warn,
-                ));
-            } else {
-                for (idx, candidate) in view.candidates.iter().enumerate() {
-                    let name = candidate.name.to_string_lossy();
-                    let slash = if candidate.is_dir { "/" } else { "" };
-                    let kind = if candidate.is_dir { "dir" } else { "file" };
-                    let link = if candidate.is_symlink {
-                        " →symlink"
-                    } else {
-                        ""
-                    };
-                    let cursor = if idx == view.selected { "  ←" } else { "" };
-                    lines.push(Line::from(format!("  {name}{slash}  {kind}{link}{cursor}")));
-                }
-                let hidden = view.total.saturating_sub(view.candidates.len());
-                if hidden > 0 {
-                    lines.push(Line::styled(
-                        format!("  +{hidden} more — keep typing to narrow"),
-                        dim,
-                    ));
-                }
-            }
+            lines.extend(path_autocomplete::candidate_lines(&view, glyphs));
         } else {
             lines.push(Line::from(format!("{custom_marker} Type a path…")));
         }
@@ -519,7 +396,10 @@ impl WhereStep {
             ));
         }
 
-        lines.push(Line::styled(self.scope_hint().to_string(), dim));
+        lines.push(Line::styled(
+            path_autocomplete::scope_hint(self.privilege).to_string(),
+            dim,
+        ));
 
         let visible: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
         frame.render_widget(Paragraph::new(visible), area);
@@ -554,44 +434,6 @@ fn bindable_candidate(row: &LocationRow) -> Option<LocationCandidate> {
         | LocationRow::RescanDrives
         | LocationRow::CustomPath => None,
     }
-}
-
-/// Splits a path buffer into its committed directory part (everything up to and including the
-/// last `/`) and the current segment being typed after it. A buffer with no `/` is all segment.
-fn split_buffer(buffer: &str) -> (&str, &str) {
-    match buffer.rfind('/') {
-        Some(idx) => (&buffer[..=idx], &buffer[idx + 1..]),
-        None => ("", buffer),
-    }
-}
-
-/// The directory part plus `candidate`'s name, with a trailing `/` for a directory so completion
-/// stops at (and can continue past) the segment boundary.
-fn extend(dir_part: &str, candidate: &DirEntry) -> String {
-    let mut out = format!("{dir_part}{}", candidate.name.to_string_lossy());
-    if candidate.is_dir {
-        out.push('/');
-    }
-    out
-}
-
-/// The longest common prefix of the candidates' names — how far `Tab` can extend a fragment
-/// without guessing between them.
-fn longest_common_prefix(candidates: &[DirEntry]) -> String {
-    let mut names = candidates.iter().map(|c| c.name.to_string_lossy());
-    let Some(first) = names.next() else {
-        return String::new();
-    };
-    let mut prefix: Vec<char> = first.chars().collect();
-    for name in names {
-        let common = prefix
-            .iter()
-            .zip(name.chars())
-            .take_while(|(a, b)| **a == *b)
-            .count();
-        prefix.truncate(common);
-    }
-    prefix.into_iter().collect()
 }
 
 /// Human-readable byte count (`B`/`KB`/`MB`/`GB`, 1024-based). Kept local to this screen module
@@ -921,7 +763,7 @@ mod tests {
     #[test]
     fn render_shows_more_footer_when_candidates_overflow_the_cap() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        for i in 0..CANDIDATE_CAP + 5 {
+        for i in 0..path_autocomplete::CANDIDATE_CAP + 5 {
             fs::create_dir(tmp.path().join(format!("dir{i:02}"))).expect("create dir");
         }
         let mut step = typing_step(tmp.path());

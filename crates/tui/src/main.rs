@@ -23,6 +23,7 @@ mod cli;
 mod encryption_screen;
 mod glyphs;
 mod help;
+mod path_autocomplete;
 mod reflow;
 mod restore_screen;
 mod run_screen;

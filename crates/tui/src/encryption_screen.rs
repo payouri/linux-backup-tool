@@ -369,7 +369,7 @@ fn field_line(
     let content = if reveal {
         secret.expose_secret().to_owned()
     } else {
-        "•".repeat(secret.expose_secret().chars().count())
+        glyphs.bullet.repeat(secret.expose_secret().chars().count())
     };
     let marker = if focused {
         format!("{} ", glyphs.pointer)
@@ -497,7 +497,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, wizard: &Wizard, reveal: boo
     frame.render_widget(body, area);
 
     if let Some(modal) = &screen.modal {
-        render_modal(frame, area, modal, &categories);
+        render_modal(frame, area, modal, &categories, glyphs);
     }
 }
 
@@ -534,7 +534,11 @@ fn radio_line(selected: bool, focused: bool, label: &str, glyphs: Glyphs) -> Lin
     } else {
         "  ".to_owned()
     };
-    let glyph = if selected { "(•) " } else { "( ) " };
+    let glyph = if selected {
+        format!("({}) ", glyphs.bullet)
+    } else {
+        "( ) ".to_owned()
+    };
     let style = if focused {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
@@ -552,10 +556,11 @@ fn render_modal(
     area: Rect,
     modal: &PlaintextModal,
     categories: &[&'static str],
+    glyphs: Glyphs,
 ) {
     let named = categories
         .iter()
-        .map(|c| format!("• {c}"))
+        .map(|c| format!("{} {c}", glyphs.bullet))
         .collect::<Vec<_>>()
         .join("  ");
 

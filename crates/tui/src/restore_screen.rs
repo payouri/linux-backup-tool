@@ -513,29 +513,38 @@ fn report_from_outcome(outcome: RestoreOutcome) -> Stage {
 /// Formats the visible slice of a partial report's failure list for a viewport of `capacity`
 /// rows, starting at `scroll`. When more failures remain below than fit, the last visible row
 /// becomes the `… (+N more)` truncation line (#72) so an overflowing list stays bounded.
-fn partial_lines(failures: &[RestoreFailure], scroll: usize, capacity: usize) -> Vec<String> {
+fn partial_lines(
+    failures: &[RestoreFailure],
+    scroll: usize,
+    capacity: usize,
+    bullet: &str,
+) -> Vec<String> {
     if capacity == 0 || failures.is_empty() {
         return Vec::new();
     }
     let start = scroll.min(failures.len() - 1);
     let remaining = failures.len() - start;
     if remaining <= capacity {
-        return failures[start..].iter().map(format_failure).collect();
+        return failures[start..]
+            .iter()
+            .map(|f| format_failure(f, bullet))
+            .collect();
     }
     // Reserve the final row for the truncation line rather than dropping a failure silently.
     let shown = capacity - 1;
     let mut lines: Vec<String> = failures[start..start + shown]
         .iter()
-        .map(format_failure)
+        .map(|f| format_failure(f, bullet))
         .collect();
     let more = failures.len() - (start + shown);
     lines.push(format!("… (+{more} more)"));
     lines
 }
 
-/// One failed Entry in the partial report: `• <path> — <os error>` verbatim (#72).
-fn format_failure(failure: &RestoreFailure) -> String {
-    format!("• {} — {}", failure.path, failure.reason)
+/// One failed Entry in the partial report: `• <path> — <os error>` verbatim (#72), the bullet
+/// resolved through the active glyph set so the no-emoji fallback is complete.
+fn format_failure(failure: &RestoreFailure, bullet: &str) -> String {
+    format!("{bullet} {} — {}", failure.path, failure.reason)
 }
 
 /// The short mode label the restore frame shows in place of app-name chrome (#50).
@@ -653,7 +662,7 @@ fn render_unlock(frame: &mut Frame, area: Rect, unlock: &Unlock, glyphs: Glyphs)
     let field = if unlock.reveal {
         unlock.input.exposed().to_owned()
     } else {
-        "•".repeat(unlock.input.char_count())
+        glyphs.bullet.repeat(unlock.input.char_count())
     };
     let mut lines = vec![
         Line::from("Enter passphrase to unlock this backup"),
@@ -733,7 +742,7 @@ fn render_report(frame: &mut Frame, area: Rect, report: &Report, home: &Path, gl
             ];
             // Reserve the two heading rows above plus a trailing hint row.
             let capacity = usize::from(area.height).saturating_sub(3);
-            for text in partial_lines(failures, *scroll, capacity) {
+            for text in partial_lines(failures, *scroll, capacity, glyphs.bullet) {
                 lines.push(Line::from(text));
             }
             lines
@@ -1036,7 +1045,7 @@ mod tests {
     #[test]
     fn partial_lines_truncates_overflow_with_a_more_line() {
         let items = failures(10);
-        let lines = partial_lines(&items, 0, 4);
+        let lines = partial_lines(&items, 0, 4, "•");
         assert_eq!(lines.len(), 4);
         assert!(lines[0].starts_with("• /home/tester/file-0 — os error 0"));
         assert_eq!(lines[3], "… (+7 more)");
@@ -1045,7 +1054,7 @@ mod tests {
     #[test]
     fn partial_lines_shows_all_when_they_fit() {
         let items = failures(3);
-        let lines = partial_lines(&items, 0, 8);
+        let lines = partial_lines(&items, 0, 8, "•");
         assert_eq!(lines.len(), 3);
         assert!(lines.iter().all(|l| !l.contains("more")));
     }
