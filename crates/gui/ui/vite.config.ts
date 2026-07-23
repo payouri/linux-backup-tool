@@ -11,6 +11,13 @@ import { defineConfig } from 'vitest/config'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  // Tauri waits on `devUrl` (crates/gui/tauri.conf.json → localhost:1420); pin Vite to that
+  // exact port and fail loudly rather than silently drifting to 5173, which would leave
+  // `cargo tauri dev` hanging on an unreachable dev server.
+  server: {
+    port: 1420,
+    strictPort: true,
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
