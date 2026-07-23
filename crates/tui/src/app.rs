@@ -78,9 +78,12 @@ enum View {
 pub enum Event {
     Key(KeyEvent),
     Resize(u16, u16),
-    /// A poll tick, emitted by the runtime only while a screen is polling (the restore RUN,
-    /// ADR-0005 D4). It carries no data — it just gives the active flow a chance to drain its
-    /// worker channel and repaint. Every non-polling screen never sees one.
+    /// A poll tick, emitted by the runtime only while a screen is polling: the backup/restore
+    /// RUN (ADR-0005 D4), or the wizard's WHAT step while one of its own probes is pending
+    /// (ADR-0009 D2). It carries no data — it just gives the active flow a chance to drain its
+    /// worker channel and repaint. WHAT is *conditionally* polling — a `Tick` reaches it only
+    /// while `wizard.what().has_pending_probe()` holds (see [`App::needs_poll`]); every other
+    /// non-polling screen, and WHAT outside a pending probe, never sees one.
     Tick,
 }
 
@@ -225,13 +228,15 @@ impl App {
     }
 
     /// Whether the current screen wants the runtime to poll rather than block on input — true
-    /// while the restore worker is running (ADR-0005 D4). The backup RUN screen polls too, but
-    /// its worker lives in the runtime, so it is gated by [`App::is_backup_running`] instead;
-    /// the runtime polls whenever either holds. When polling, the runtime drives an
-    /// [`Event::Tick`] each interval so the running flow can drain its worker channel.
+    /// while the restore worker is running (ADR-0005 D4), or while the wizard's WHAT step has a
+    /// probe of its own in flight (ADR-0009 D2). The backup RUN screen polls too, but its worker
+    /// lives in the runtime, so it is gated by [`App::is_backup_running`] instead; the runtime
+    /// polls whenever any of the three holds. When polling, the runtime drives an [`Event::Tick`]
+    /// each interval so the running flow can drain its worker channel.
     #[must_use]
     pub fn needs_poll(&self) -> bool {
         matches!(&self.view, View::Restore(flow) if flow.is_running())
+            || matches!(&self.view, View::Wizard(wizard) if wizard.what().has_pending_probe())
     }
 
     /// The reducer: fold one [`Event`] into the next state. Taking and returning `Self` by value
@@ -244,16 +249,20 @@ impl App {
     /// the key — on a running backup/restore it doubles as the abort. Every other key routes to
     /// the active view; `Esc` there means back/close and never quits. [`Event::Tick`] is
     /// delivered only while a screen is polling and advances whichever flow is running (the RUN
-    /// spinner or the restore flow's channel drain). Resizes are folded so the loop repaints;
-    /// the reflow tier is recomputed from the frame at render time, so there is no
-    /// size-dependent state to store here — the one deliberate exception is the WHAT/WHERE
-    /// custom-path fields' `visible_cap` (#87), cached by `render` itself since it alone knows
-    /// the post-layout inner height (see [`crate::where_step::WhereStep`]'s `visible_cap` doc).
+    /// spinner, the restore flow's channel drain, or WHAT's own pending-probe drain, ADR-0009
+    /// D2) — it never blocks a key from reaching the wizard's reducer in the same turn.
+    /// Resizes are folded so the loop repaints; the reflow tier is recomputed from the frame at
+    /// render time, so there is no size-dependent state to store here — the one deliberate
+    /// exception is the WHAT/WHERE custom-path fields' `visible_cap` (#87), cached by `render`
+    /// itself since it alone knows the post-layout inner height (see
+    /// [`crate::where_step::WhereStep`]'s `visible_cap` doc).
     #[must_use]
     pub fn update(mut self, event: Event) -> Self {
         // A poll tick advances whichever flow is running: the RUN spinner (so an indeterminate
-        // phase still animates on a tick with no worker message) or the restore flow (draining
-        // its own worker channel). It reaches the reducer only while a screen is polling.
+        // phase still animates on a tick with no worker message), the restore flow (draining its
+        // own worker channel), or the wizard's WHAT step (draining its own pending probe,
+        // ADR-0009 D2, regardless of which step is currently active — see `Wizard::tick_what`).
+        // It reaches the reducer only while a screen is polling.
         if let Event::Tick = event {
             self.view = match self.view {
                 View::Run(mut run) => {
@@ -261,7 +270,11 @@ impl App {
                     View::Run(run)
                 }
                 View::Restore(flow) => View::Restore(flow.tick()),
-                other => other,
+                View::Wizard(mut wizard) => {
+                    wizard.tick_what();
+                    View::Wizard(wizard)
+                }
+                View::Placeholder(screen) => View::Placeholder(screen),
             };
             return self;
         }
@@ -860,7 +873,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::path::{Path, PathBuf};
-    use std::time::SystemTime;
+    use std::time::{Duration, Instant, SystemTime};
+
+    use crate::pending_probe::PendingProbe;
+    use crate::what_screen::WhatProbeResult;
 
     use linux_backup_core::model::{Entry, EntryRoot, EntryType};
     use linux_backup_core::Privilege;
@@ -1301,6 +1317,71 @@ mod tests {
         let app = app_with_wizard(non_sensitive_wizard());
         let app = app.update(Event::Tick);
         assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn needs_poll_is_false_without_a_pending_what_probe() {
+        let app = app_with_wizard(non_sensitive_wizard());
+        assert!(!app.needs_poll());
+    }
+
+    #[test]
+    fn needs_poll_is_true_while_what_has_a_pending_probe() {
+        // ADR-0009 D2's third disjunct: WHAT joins the poll loop only while one of its own
+        // probes is pending, alongside the existing restore/backup cases.
+        let mut wizard = non_sensitive_wizard();
+        wizard
+            .what_mut()
+            .set_pending_probe(PendingProbe::spawn(|| WhatProbeResult::TotalSize(0)));
+        let app = app_with_wizard(wizard);
+        assert!(app.needs_poll());
+    }
+
+    #[test]
+    fn tick_drains_whats_pending_probe_and_needs_poll_goes_false_again() {
+        let mut wizard = non_sensitive_wizard();
+        wizard
+            .what_mut()
+            .set_pending_probe(PendingProbe::spawn(|| WhatProbeResult::TotalSize(7)));
+        let mut app = app_with_wizard(wizard);
+        assert!(
+            app.needs_poll(),
+            "expected polling while a probe is pending"
+        );
+
+        // Tick until the worker thread's result actually lands or a bounded deadline passes —
+        // avoids a fixed `sleep` racing the spawned thread's own scheduling.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while app.needs_poll() && Instant::now() < deadline {
+            app = app.update(Event::Tick);
+        }
+        assert!(
+            !app.needs_poll(),
+            "expected the Tick-drain to clear the pending probe once it resolved"
+        );
+    }
+
+    #[test]
+    fn input_is_never_blocked_by_a_pending_what_probe() {
+        let mut wizard = non_sensitive_wizard();
+        wizard
+            .what_mut()
+            .set_pending_probe(PendingProbe::spawn(|| WhatProbeResult::TotalSize(0)));
+        let app = app_with_wizard(wizard);
+        assert!(app.needs_poll());
+
+        // Ctrl-D deselects the whole focused Category scope — a real Selection mutation, proving
+        // the WHAT reducer still runs a keystroke to completion while a probe is in flight
+        // (ADR-0009 D4: input is never blocked by a pending probe).
+        let app = app.update(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        let View::Wizard(wizard) = &app.view else {
+            panic!("expected the wizard view");
+        };
+        assert_eq!(
+            wizard.state().selection().entries().len(),
+            0,
+            "expected Ctrl-D to deselect the scope even with a probe pending"
+        );
     }
 
     #[test]
