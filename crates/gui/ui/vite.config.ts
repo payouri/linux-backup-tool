@@ -1,7 +1,7 @@
 import path from 'node:path'
 
 import tailwindcss from '@tailwindcss/vite'
-import react from '@vitejs/plugin-react'
+import react from '@vitejs/plugin-react-swc'
 // `defineConfig` from `vitest/config` re-exports Vite's, extended with a `test` key — one
 // config file serves both `vite build`/`vite dev` and `vitest` rather than a second file.
 import { defineConfig } from 'vitest/config'
