@@ -41,6 +41,11 @@ linux_backup_core = { path = "../core", package = "linux-backup-core" }
 # crate (same justification as `tui/src/system.rs`, which this module intentionally
 # duplicates rather than sharing code with — ADR-0008: "gui and tui share no code directly").
 libc = "0.2"
+# `age::Encryptor::with_user_passphrase` (in `core`) takes a `secrecy::SecretString`; this
+# crate needs the same type to carry the encryption step's typed passphrase into
+# `archive::Encryption::Passphrase` without ever touching it as a plain `String`. Same version
+# `core`/`tui` pin, so all three crates share one `secrecy` instance rather than resolving two.
+secrecy = "0.10"
 
 [dev-dependencies]
 tempfile = "3.15.0"

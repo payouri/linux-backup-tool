@@ -2,7 +2,10 @@
 //! `core` only, exposing `core::SelectionModel` to the React frontend (`crates/gui/ui/`)
 //! over a JSON IPC boundary. Issue #99 is the walking skeleton: one managed
 //! `SelectionModel`, seeded from Smart defaults exactly as `tui`'s `seed_wizard` does, and
-//! one lazy `["selection-summary"]` query command.
+//! one lazy `["selection-summary"]` query command. Issue #100 adds the lazy `["tree",
+//! prefix]` explorer and the seven Selection mutations. Issue #101 adds the encryption step
+//! (a managed gui-side `EncryptionDecision`, ADR-0007's ported "recorded context") and the
+//! WHERE step's collision pre-check.
 //!
 //! `#[cfg(test)]` modules in this crate compile under `--cfg test`, so this allow only ever
 //! applies to them — see `core/src/lib.rs` for the same pattern.
@@ -10,19 +13,23 @@
 
 mod commands;
 mod dto;
+mod encryption;
 mod error;
 mod run_context;
 mod state;
 mod tree;
 
-pub use dto::{DirectoryStateDto, SelectionSummaryDto};
+pub use dto::{
+    encryption_status, DirectoryStateDto, EncryptionStatusDto, SelectionSummaryDto, WhereCheckDto,
+};
+pub use encryption::EncryptionDecision;
 pub use error::SerializableCoreError;
 pub use tree::{category_children, category_nodes, TreeNodeDto, TreeNodeKindDto};
 
 use linux_backup_core::scan::CategoryScan;
 use linux_backup_core::{scan, SelectionModel};
 
-use state::{RunContextState, ScanCacheState, SelectionState};
+use state::{EncryptionState, RunContextState, ScanCacheState, SelectionState};
 
 /// Builds the initial `SelectionModel` a fresh GUI window opens on: `scanned` filtered to
 /// each Category's Smart default — the exact derivation `tui`'s `seed_wizard`
@@ -47,6 +54,7 @@ pub fn run() -> anyhow::Result<()> {
     let ctx = run_context::build_run_context()?;
     let scanned = scan::scan_taxonomy(&ctx);
     let selection = seed_selection(&scanned);
+    let encryption_decision = EncryptionDecision::new(&selection);
 
     // `tauri::generate_context!()` expands to `tauri`-crate-owned codegen that unwraps while
     // parsing the `tauri.conf.json` this crate's `build.rs` (`tauri-build`) already
@@ -60,6 +68,7 @@ pub fn run() -> anyhow::Result<()> {
         .manage(SelectionState::new(selection))
         .manage(RunContextState(ctx))
         .manage(ScanCacheState(scanned))
+        .manage(EncryptionState::new(encryption_decision))
         .invoke_handler(tauri::generate_handler![
             commands::selection_summary,
             commands::tree,
@@ -70,6 +79,11 @@ pub fn run() -> anyhow::Result<()> {
             commands::reselect_entry,
             commands::deselect_root,
             commands::reselect_root,
+            commands::encryption_status,
+            commands::set_passphrase,
+            commands::choose_plaintext,
+            commands::home_directory,
+            commands::where_check,
         ])
         .run(context)
         .map_err(|err| anyhow::anyhow!("error while running the Tauri application: {err}"))

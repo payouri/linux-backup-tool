@@ -7,6 +7,8 @@ use std::sync::Mutex;
 use linux_backup_core::scan::CategoryScan;
 use linux_backup_core::{RunContext, SelectionModel};
 
+use crate::encryption::EncryptionDecision;
+
 /// The `tauri::State` wrapper around the authoritative `SelectionModel`. A `Mutex` because
 /// Tauri may run command handlers on different threads across invocations, and the command
 /// layer here is a thin, synchronous mirror (ADR-0008: "no selection logic" in this layer)
@@ -38,3 +40,15 @@ pub struct RunContextState(pub RunContext);
 /// the identical one-scan-per-session assumption, scanning once at wizard start and never
 /// again. No `Mutex`: this is computed once and never mutated afterwards.
 pub struct ScanCacheState(pub Vec<CategoryScan>);
+
+/// The `tauri::State` wrapper around the gui-side [`EncryptionDecision`] (issue #101,
+/// ADR-0007 D3/D5's "recorded context"): which passphrase (if any) is committed, and — while
+/// plaintext — the Sensitive set that decision was made against. A `Mutex` for the same reason
+/// as [`SelectionState`]: command handlers may run on different threads across invocations.
+pub struct EncryptionState(pub Mutex<EncryptionDecision>);
+
+impl EncryptionState {
+    pub fn new(decision: EncryptionDecision) -> Self {
+        Self(Mutex::new(decision))
+    }
+}

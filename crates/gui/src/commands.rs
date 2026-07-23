@@ -12,23 +12,39 @@
 //! yet); allowed module-wide rather than repeated per function, since every mutation
 //! command shares the identical justification: the frontend's `useMutation` call sites
 //! match one uniform `Result` shape across all seven, not six-plus-one.
+//!
+//! Issue #101 adds the encryption step's `["encryption-status"]` read, its two decision
+//! mutations (`set_passphrase`, `choose_plaintext`), and the WHERE step's `home_directory`
+//! read and `where_check` pre-flight — all still no more than a lock-and-delegate over
+//! `core`/the gui-side `EncryptionDecision` (ADR-0007's "recorded context", `crate::encryption`).
 #![allow(clippy::unnecessary_wraps)]
 
 use std::path::{Path, PathBuf};
 
+use secrecy::SecretString;
 use tauri::State;
 
-use linux_backup_core::{catalog, SelectionModel};
+use linux_backup_core::{catalog, location, CoreError, SelectionModel};
 
-use crate::dto::SelectionSummaryDto;
+use crate::dto::{self, EncryptionStatusDto, SelectionSummaryDto, WhereCheckDto};
 use crate::error::SerializableCoreError;
-use crate::state::{RunContextState, ScanCacheState, SelectionState};
+use crate::state::{EncryptionState, RunContextState, ScanCacheState, SelectionState};
 use crate::tree::{self, TreeNodeDto};
 
 /// Recovers a poisoned lock rather than propagating it: a prior command handler panicking
 /// mid-mutation shouldn't crash every future command over one bad handler, and every lock
 /// this module takes is held only across infallible, panic-free `core` calls anyway.
 fn lock_selection(state: &SelectionState) -> std::sync::MutexGuard<'_, SelectionModel> {
+    state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Recovers a poisoned lock the same way [`lock_selection`] does — see that function's doc.
+fn lock_encryption(
+    state: &EncryptionState,
+) -> std::sync::MutexGuard<'_, crate::encryption::EncryptionDecision> {
     state
         .0
         .lock()
@@ -181,4 +197,85 @@ pub fn reselect_root(
 ) -> Result<(), SerializableCoreError> {
     lock_selection(&state).reselect_root(Path::new(&root));
     Ok(())
+}
+
+/// The lazy `["encryption-status"]` query (issue #101, ADR-0007 D2/D4/D5): the encryption
+/// step's derived state — Auto-insist plus the gui-side [`EncryptionDecision`]'s
+/// completeness/invalidation — reflecting the live Selection each call, so a WHAT edit that
+/// changes sensitivity is picked up the moment this is invalidated/refetched, never a stale
+/// snapshot. Infallible, like `selection_summary`.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn encryption_status(
+    selection_state: State<'_, SelectionState>,
+    encryption_state: State<'_, EncryptionState>,
+) -> EncryptionStatusDto {
+    let selection = lock_selection(&selection_state);
+    let decision = lock_encryption(&encryption_state);
+    dto::encryption_status(&selection, &decision)
+}
+
+/// Commits a passphrase (stories 22/23) — the encryption safe harbor (ADR-0007 D5). A blank
+/// passphrase is rejected as [`CoreError::BlankPassphrase`] (story 24) before it ever touches
+/// the gui-side decision, mirroring `archive::encrypt`'s own hard reject at the point a
+/// passphrase is actually used — this is a preflight of that same invariant, not a new one.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn set_passphrase(
+    encryption_state: State<'_, EncryptionState>,
+    passphrase: String,
+) -> Result<(), SerializableCoreError> {
+    if passphrase.is_empty() {
+        return Err(SerializableCoreError::from(&CoreError::BlankPassphrase));
+    }
+    lock_encryption(&encryption_state).set_passphrase(SecretString::from(passphrase));
+    Ok(())
+}
+
+/// Records a deliberate plaintext decision (stories 22/25): the non-Sensitive "leave
+/// plaintext" path, and — for a Sensitive Selection — overriding Auto-insist. The frontend is
+/// responsible for only calling this after its own second confirmation naming the Categories
+/// about to land in plaintext (`encryption_status`'s `sensitiveCategories`); this command
+/// itself carries no confirmation gate of its own; see this module's doc for why the command
+/// layer holds no such policy.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn choose_plaintext(
+    selection_state: State<'_, SelectionState>,
+    encryption_state: State<'_, EncryptionState>,
+) -> Result<(), SerializableCoreError> {
+    let selection = lock_selection(&selection_state);
+    lock_encryption(&encryption_state).choose_plaintext(&selection);
+    Ok(())
+}
+
+/// The real machine's `$HOME`, so the WHERE step (story 26) can quick-offer it as an Output
+/// location without the frontend re-deriving it.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn home_directory(run_context_state: State<'_, RunContextState>) -> String {
+    run_context_state.0.home.to_string_lossy().into_owned()
+}
+
+/// The WHERE step's pre-flight check (issue #101, stories 26/27): validates `location` is a
+/// writable directory and pre-checks the Backup-dir collision against the *same* name
+/// `backup()` will later compute (`backup_dir_name`), so a collision is learned here, not
+/// mid-run. Delegates entirely to `location::resolve_selection` rather than re-implementing
+/// the writable/collision checks, so there is one implementation of both refusals instead of
+/// two that could drift apart; `available_space` is `None` (no live disk enumeration in this
+/// slice — story 25/32's free-space warning is a candidate for a later build), so the
+/// advisory free-space warning never fires here, only the two hard refusals do.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn where_check(
+    run_context_state: State<'_, RunContextState>,
+    selection_state: State<'_, SelectionState>,
+    location: String,
+) -> Result<WhereCheckDto, SerializableCoreError> {
+    let ctx = &run_context_state.0;
+    let selection = lock_selection(&selection_state);
+    let name = linux_backup_core::backup_dir_name(ctx);
+    location::resolve_selection(Path::new(&location), &name, selection.total_size(), None)
+        .map(|resolved| WhereCheckDto::from(&resolved))
+        .map_err(|error| SerializableCoreError::from(&error))
 }

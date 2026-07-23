@@ -1,6 +1,7 @@
 import { type QueryClient, useMutation, useQueryClient } from '@tanstack/react-query'
 
 import { invoke } from '@/lib/ipc'
+import { encryptionStatusQueryKey } from '@/hooks/useEncryptionStatus'
 import { selectionSummaryQueryKey } from '@/hooks/useSelectionSummary'
 import { treeRootQueryKey } from '@/hooks/useTree'
 import type { SerializableCoreError } from '@/types/errors'
@@ -10,12 +11,15 @@ import type { SerializableCoreError } from '@/types/errors'
  * #100): `select_category`, `deselect_category`, `add_custom_path`, `deselect_entry`,
  * `reselect_entry`, `deselect_root`, `reselect_root`. Every one of these `useMutation`
  * hooks shares the same **invalidate, don't return** convention — the command's own return
- * carries no derived state, so `onSuccess` invalidates every `["tree", ...]` query plus
- * `["selection-summary"]` and lets TanStack Query refetch whatever is actually mounted.
+ * carries no derived state, so `onSuccess` invalidates every `["tree", ...]` query,
+ * `["selection-summary"]`, and `["encryption-status"]` (issue #101: a WHAT edit can change
+ * Auto-insist and invalidate a completed plaintext decision, ADR-0007 D5) and lets TanStack
+ * Query refetch whatever is actually mounted.
  */
 function invalidateSelectionViews(queryClient: QueryClient) {
   queryClient.invalidateQueries({ queryKey: treeRootQueryKey })
   queryClient.invalidateQueries({ queryKey: selectionSummaryQueryKey })
+  queryClient.invalidateQueries({ queryKey: encryptionStatusQueryKey })
 }
 
 /** Category-level toggle ON (story 7): mirrors `SelectionModel::select_category`. */

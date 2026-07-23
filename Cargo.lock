@@ -2558,6 +2558,7 @@ dependencies = [
  "anyhow",
  "libc",
  "linux-backup-core",
+ "secrecy",
  "serde",
  "serde_json",
  "tauri",
