@@ -876,7 +876,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use crate::pending_probe::PendingProbe;
-    use crate::what_screen::WhatProbeResult;
+    use crate::what_screen::{ProbeTarget, WhatProbeResult};
 
     use linux_backup_core::model::{Entry, EntryRoot, EntryType};
     use linux_backup_core::Privilege;
@@ -1330,9 +1330,10 @@ mod tests {
         // ADR-0009 D2's third disjunct: WHAT joins the poll loop only while one of its own
         // probes is pending, alongside the existing restore/backup cases.
         let mut wizard = non_sensitive_wizard();
-        wizard
-            .what_mut()
-            .set_pending_probe(PendingProbe::spawn(|| WhatProbeResult::TotalSize(0)));
+        wizard.what_mut().set_pending_probe(
+            PendingProbe::spawn(|| WhatProbeResult::TotalSize(0)),
+            ProbeTarget::Category("KDE Plasma"),
+        );
         let app = app_with_wizard(wizard);
         assert!(app.needs_poll());
     }
@@ -1340,9 +1341,10 @@ mod tests {
     #[test]
     fn tick_drains_whats_pending_probe_and_needs_poll_goes_false_again() {
         let mut wizard = non_sensitive_wizard();
-        wizard
-            .what_mut()
-            .set_pending_probe(PendingProbe::spawn(|| WhatProbeResult::TotalSize(7)));
+        wizard.what_mut().set_pending_probe(
+            PendingProbe::spawn(|| WhatProbeResult::TotalSize(7)),
+            ProbeTarget::Category("KDE Plasma"),
+        );
         let mut app = app_with_wizard(wizard);
         assert!(
             app.needs_poll(),
@@ -1364,9 +1366,10 @@ mod tests {
     #[test]
     fn input_is_never_blocked_by_a_pending_what_probe() {
         let mut wizard = non_sensitive_wizard();
-        wizard
-            .what_mut()
-            .set_pending_probe(PendingProbe::spawn(|| WhatProbeResult::TotalSize(0)));
+        wizard.what_mut().set_pending_probe(
+            PendingProbe::spawn(|| WhatProbeResult::TotalSize(0)),
+            ProbeTarget::Category("KDE Plasma"),
+        );
         let app = app_with_wizard(wizard);
         assert!(app.needs_poll());
 

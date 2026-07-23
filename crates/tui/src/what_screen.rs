@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use linux_backup_core::model::{DirectoryState, Entry, EntryType, SelectionModel};
@@ -62,6 +63,27 @@ pub enum WhatProbeResult {
     /// The whole Selection's on-disk size (a candidate for #96's `total_size` probe).
     TotalSize(u64),
 }
+
+/// Where a pending WHAT probe's spinner appears once it crosses the debounce threshold, and
+/// what value it stands in for until the probe resolves (#94). Recorded alongside the probe at
+/// request time — which row a probe is *for* is known up front, before its value is, which is
+/// the nature of "pending" — so `render` never has to guess which row a still-in-flight probe
+/// belongs to. Neither variant is constructed outside this module's own tests yet, mirroring
+/// [`WhatProbeResult`]: no production op requests a probe until #96 wires one in.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeTarget {
+    /// An Explorer file row, keyed by its absolute path (matching [`WhatProbeResult::Size`]'s
+    /// own key) — the spinner replaces that row's metric-column entry.
+    Explorer(PathBuf),
+    /// A Categories row, keyed by its Category name — the spinner sits next to that row.
+    Category(&'static str),
+}
+
+/// The elapsed-time threshold (ADR-0009 D3) past which a pending probe's spinner becomes
+/// visible. Below this, WHAT renders exactly as if nothing were pending, so a probe that
+/// resolves quickly never flickers anything.
+const SPINNER_DEBOUNCE: Duration = Duration::from_millis(375);
 
 /// The always-shown Custom-paths Category (CONTEXT.md's "Custom path", story 6) — its left-pane
 /// row is the entry point for the autocomplete add field (#50 / #75).
@@ -111,14 +133,16 @@ pub struct WhatScreen {
     /// Memoized `absolute_path -> on-disk size` (#83) — see [`cached_subtree_size`]'s doc for
     /// why this needs interior mutability (`render` only ever holds `&WhatScreen`).
     size_cache: RefCell<HashMap<PathBuf, u64>>,
-    /// The single in-flight WHAT probe, if any (ADR-0009 D2): replaced, never queued, when a
-    /// new one is requested — see [`WhatScreen::tick`]. `None` outside a pending probe is also
+    /// The single in-flight WHAT probe, if any (ADR-0009 D2), paired with the
+    /// [`ProbeTarget`] row its eventual value belongs to: replaced, never queued, when a new
+    /// one is requested — see [`WhatScreen::tick`]. `None` outside a pending probe is also
     /// when [`crate::app::App::needs_poll`] stops polling for WHAT. No production request path
-    /// exists yet (#96); this ticket lands the spine only.
-    pending_probe: Option<PendingProbe<WhatProbeResult>>,
+    /// exists yet (#96); this ticket lands the debounced-spinner render (#94) against a
+    /// synthetic probe, ready for whichever real op #96 wires in first.
+    pending_probe: Option<(PendingProbe<WhatProbeResult>, ProbeTarget)>,
     /// Bumped once per poll tick while a probe is pending (mirroring `RunScreen`'s own
-    /// `spinner_tick`, `run_screen.rs`), so a future debounced spinner (#94) has a live frame
-    /// counter to animate on.
+    /// `spinner_tick`, `run_screen.rs`), animating the debounced spinner's frame once it
+    /// becomes visible (#94).
     spinner_tick: usize,
     /// The cached left-pane Category rows (#112). Computed eagerly at exactly four choke points:
     /// `sync_categories`, `toggle`, `select_scope`, and `commit_custom_path` (#112). This avoids
@@ -262,12 +286,13 @@ impl WhatScreen {
     /// Advances WHAT's own poll loop by one tick (ADR-0009 D2), mirroring
     /// `drain_backup_worker`/`RunScreen::tick` (`run_screen.rs`): a non-blocking `try_recv` that,
     /// on success, folds the resolved [`WhatProbeResult`] into the relevant cache and clears the
-    /// pending slot, plus a `spinner_tick` bump so a future debounced spinner (#94) has a live
-    /// frame to animate on. A disconnected channel (an abandoned worker) also clears the slot —
-    /// there is nothing further to wait on. A no-op when nothing is pending, so calling this on
-    /// every tick regardless of view is harmless (`App::update` does exactly that).
+    /// pending slot, plus a `spinner_tick` bump so the debounced spinner (#94) has a live frame
+    /// to animate on once it becomes visible. A disconnected channel (an abandoned worker) also
+    /// clears the slot — there is nothing further to wait on. A no-op when nothing is pending, so
+    /// calling this on every tick regardless of view is harmless (`App::update` does exactly
+    /// that).
     pub fn tick(&mut self) {
-        let Some(probe) = &self.pending_probe else {
+        let Some((probe, _target)) = &self.pending_probe else {
             return;
         };
         match probe.try_recv() {
@@ -281,6 +306,15 @@ impl WhatScreen {
             Err(TryRecvError::Disconnected) => self.pending_probe = None,
         }
         self.spinner_tick = self.spinner_tick.wrapping_add(1);
+    }
+
+    /// The pending probe's target once it's been in flight past [`SPINNER_DEBOUNCE`] (#94) —
+    /// `None` both when nothing is pending and while a pending probe is still inside the
+    /// debounce window, so `render` shows a spinner in exactly the cases the acceptance criteria
+    /// name and never for a probe that resolves quickly.
+    fn visible_spinner_target(&self) -> Option<&ProbeTarget> {
+        let (probe, target) = self.pending_probe.as_ref()?;
+        (probe.elapsed() >= SPINNER_DEBOUNCE).then_some(target)
     }
 
     /// Folds one resolved [`WhatProbeResult`] into its cache. `TotalSize` has no cache slot yet
@@ -766,6 +800,11 @@ struct ExplorerRow {
     component: OsString,
     /// The node's relative path — what the tri-state and toggles are keyed on.
     node_path: PathBuf,
+    /// The underlying Entry's absolute path, for a file row only — `None` for a directory or
+    /// empty directory, which have no single Entry (and so no probe) to key against. Matched
+    /// against a pending [`ProbeTarget::Explorer`] to decide whether this row's metric column
+    /// shows the debounced spinner instead of [`Self::metric`] (#94).
+    absolute_path: Option<PathBuf>,
     kind: NodeKind,
     state: DirectoryState,
 }
@@ -891,6 +930,7 @@ fn explorer_rows(
             let node_path = prefix.join(&component);
             let state = accumulator.state();
             let name = component.to_string_lossy();
+            let mut absolute_path = None;
             let (kind, label) = if accumulator.has_children {
                 (
                     NodeKind::Directory {
@@ -903,12 +943,15 @@ fn explorer_rows(
                     Some((_, EntryType::Directory)) => {
                         (NodeKind::EmptyDirectory, format!("{name}/"))
                     }
-                    Some((absolute, _)) => (
-                        NodeKind::File {
-                            size: cached_subtree_size(size_cache, &absolute),
-                        },
-                        name.into_owned(),
-                    ),
+                    Some((absolute, _)) => {
+                        absolute_path = Some(absolute.clone());
+                        (
+                            NodeKind::File {
+                                size: cached_subtree_size(size_cache, &absolute),
+                            },
+                            name.into_owned(),
+                        )
+                    }
                     None => (NodeKind::EmptyDirectory, format!("{name}/")),
                 }
             };
@@ -916,6 +959,7 @@ fn explorer_rows(
                 label,
                 component,
                 node_path,
+                absolute_path,
                 kind,
                 state,
             }
@@ -1028,6 +1072,7 @@ pub fn render(
     glyphs: Glyphs,
 ) {
     let typing = screen.custom_input.is_some();
+    let (category_spinner, explorer_spinner) = spinner_targets(screen, glyphs);
 
     if area.width < TWO_PANE_MIN_WIDTH {
         if typing {
@@ -1042,6 +1087,7 @@ pub fn render(
                         screen.category_cursor,
                         true,
                         glyphs,
+                        category_spinner,
                     );
                 }
                 Pane::Explorer => {
@@ -1055,6 +1101,7 @@ pub fn render(
                         screen.explorer_cursor,
                         true,
                         glyphs,
+                        explorer_spinner,
                     );
                 }
             }
@@ -1071,6 +1118,7 @@ pub fn render(
         screen.category_cursor,
         screen.focus == Pane::Categories && !typing,
         glyphs,
+        category_spinner,
     );
     if typing {
         render_custom_field(frame, columns[1], screen, home, privilege, getenv, glyphs);
@@ -1085,7 +1133,34 @@ pub fn render(
             screen.explorer_cursor,
             screen.focus == Pane::Explorer,
             glyphs,
+            explorer_spinner,
         );
+    }
+}
+
+/// A pending probe's render target inside the Categories pane: the Category name it names,
+/// paired with the debounce-frame glyph drawn in place of that row's count (#94).
+type CategorySpinner<'a> = Option<(&'a str, char)>;
+/// A pending probe's render target inside the Explorer pane: the file row's absolute path,
+/// paired with the debounce-frame glyph drawn in place of that row's metric (#94).
+type ExplorerSpinner<'a> = Option<(&'a Path, char)>;
+
+/// Resolves `screen`'s pending probe (if past the debounce threshold) into the pane-scoped
+/// spinner render inputs (#94): at most one of the two is ever `Some`, since a probe targets
+/// exactly one pane. Each carries the debounce-frame glyph paired with the key `render_categories`
+/// / `render_explorer` match a row against, so a probe outside its own pane's row list is
+/// silently drawn nowhere rather than guessed at.
+fn spinner_targets(
+    screen: &WhatScreen,
+    glyphs: Glyphs,
+) -> (CategorySpinner<'_>, ExplorerSpinner<'_>) {
+    let Some(target) = screen.visible_spinner_target() else {
+        return (None, None);
+    };
+    let glyph = glyphs.spinner[screen.spinner_tick % glyphs.spinner.len()];
+    match target {
+        ProbeTarget::Category(name) => (Some((*name, glyph)), None),
+        ProbeTarget::Explorer(path) => (None, Some((path.as_path(), glyph))),
     }
 }
 
@@ -1168,6 +1243,9 @@ fn breadcrumb_line(category: Option<&str>, crumbs: &[OsString], cols: u16) -> St
     reflow::render_breadcrumb(tier, category, &segments, cols)
 }
 
+/// `spinner`, when `Some`, pairs the debounce-frame glyph with the Category name a pending probe
+/// targets (#94): that row's count is replaced by the bare glyph on the row it names, in place —
+/// no dedicated status line, no other row affected.
 fn render_categories(
     frame: &mut Frame,
     area: Rect,
@@ -1175,6 +1253,7 @@ fn render_categories(
     cursor: usize,
     focused: bool,
     glyphs: Glyphs,
+    spinner: CategorySpinner,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1200,7 +1279,13 @@ fn render_categories(
                 checkbox(row.state)
             };
             let name = row.name;
-            let count = row.selected;
+            // A debounced probe pending for this row replaces its count with the bare spinner
+            // glyph — instant pop-in back to the count on the next render once it resolves,
+            // never a fade or highlight (#94).
+            let count = match spinner {
+                Some((target, glyph)) if target == name => glyph.to_string(),
+                _ => row.selected.to_string(),
+            };
             let lock = if row.sensitive {
                 format!(" {}", glyphs.lock)
             } else {
@@ -1217,7 +1302,9 @@ fn render_categories(
 
 // `category`/`crumbs` join `rows` rather than a pre-built breadcrumb string (#85) because the
 // text's responsive rung depends on this pane's own inner width, only known once `block.inner`
-// runs below.
+// runs below. `spinner`, when `Some`, pairs the debounce-frame glyph with the absolute path of
+// the file row a pending probe targets (#94): that row's metric column shows the bare glyph in
+// place of `ExplorerRow::metric`, instant pop-in back to the resolved value on the next render.
 #[allow(clippy::too_many_arguments)]
 fn render_explorer(
     frame: &mut Frame,
@@ -1228,6 +1315,7 @@ fn render_explorer(
     cursor: usize,
     focused: bool,
     glyphs: Glyphs,
+    spinner: ExplorerSpinner,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1258,7 +1346,12 @@ fn render_explorer(
             };
             let box_glyph = checkbox(row.state);
             let label = &row.label;
-            let metric = row.metric();
+            let metric = match spinner {
+                Some((target, glyph)) if Some(target) == row.absolute_path.as_deref() => {
+                    glyph.to_string()
+                }
+                _ => row.metric(),
+            };
             let line = Line::from(format!("{marker}{box_glyph} {label}  {metric}"));
             if matches!(row.kind, NodeKind::EmptyDirectory) {
                 line.style(Style::default().add_modifier(Modifier::DIM))
@@ -1285,12 +1378,17 @@ fn scroll_offset(height: u16, cursor: usize) -> u16 {
 
 #[cfg(test)]
 impl WhatScreen {
-    /// Test-only: injects a probe directly into the pending slot, standing in for the request
-    /// path a real WHAT op will call once one is wired through (#96). Lets other modules' tests
-    /// (`app.rs`'s `needs_poll`/`Tick` coverage, via [`crate::wizard::Wizard::what_mut`]) set up
-    /// a pending-probe scenario without a production trigger to hang it off yet.
-    pub(crate) fn set_pending_probe(&mut self, probe: PendingProbe<WhatProbeResult>) {
-        self.pending_probe = Some(probe);
+    /// Test-only: injects a probe and its render target directly into the pending slot,
+    /// standing in for the request path a real WHAT op will call once one is wired through
+    /// (#96). Lets other modules' tests (`app.rs`'s `needs_poll`/`Tick` coverage, via
+    /// [`crate::wizard::Wizard::what_mut`]) set up a pending-probe scenario without a
+    /// production trigger to hang it off yet.
+    pub(crate) fn set_pending_probe(
+        &mut self,
+        probe: PendingProbe<WhatProbeResult>,
+        target: ProbeTarget,
+    ) {
+        self.pending_probe = Some((probe, target));
     }
 }
 
@@ -1727,6 +1825,150 @@ mod tests {
         focus_explorer(&mut screen, &mut state);
         let lines = render_to_lines(&screen, &state, 90, 12);
         assert!(lines.join("\n").contains("3 KB"), "file size: {lines:?}");
+    }
+
+    // --- Debounced spinner placement, copy, and dismissal (#94) ------------------------------
+
+    /// A probe that blocks on a release signal until the test sends it, so it stays reliably
+    /// "pending" for as long as a debounce-threshold assertion needs — no race against the
+    /// worker thread's own scheduling, mirroring `a_new_pending_probe_replaces_rather_than_...`
+    /// above.
+    fn blocking_probe(
+        result: WhatProbeResult,
+    ) -> (PendingProbe<WhatProbeResult>, std::sync::mpsc::Sender<()>) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let probe = PendingProbe::spawn(move || {
+            let _ = release_rx.recv();
+            result
+        });
+        (probe, release_tx)
+    }
+
+    /// A single-file KDE Plasma Selection rooted at a real 3 KB temp file, so its Explorer row
+    /// has a genuine on-disk size for a spinner to stand in for and a resolved value to pop back
+    /// to. The `TempDir` must outlive the file's use, hence it is returned alongside the path.
+    fn file_backed_selection() -> (tempfile::TempDir, PathBuf, SelectionModel) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("plasmashellrc");
+        let mut handle = std::fs::File::create(&file).expect("create fixture");
+        handle.write_all(&vec![0u8; 3 * 1024]).expect("write bytes");
+        let selection = SelectionModel::new(vec![Entry {
+            absolute_path: file.clone(),
+            relative_path: PathBuf::from("plasmashellrc"),
+            root: EntryRoot::Home,
+            entry_type: EntryType::File,
+            category: "KDE Plasma",
+            sensitive: false,
+        }]);
+        (dir, file, selection)
+    }
+
+    #[test]
+    fn explorer_probe_shows_no_spinner_before_the_debounce_threshold() {
+        let (_dir, file, selection) = file_backed_selection();
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+
+        let (probe, release_tx) = blocking_probe(WhatProbeResult::Size(file.clone(), 999_999));
+        screen.set_pending_probe(probe, ProbeTarget::Explorer(file));
+
+        // Rendered right away: nowhere near the 375ms debounce threshold yet.
+        let joined = render_to_lines(&screen, &state, 90, 12).join("\n");
+        assert!(
+            joined.contains("3 KB"),
+            "expected the real size below the debounce threshold, not a spinner: {joined}"
+        );
+        assert!(
+            Glyphs::UNICODE.spinner.iter().all(|g| !joined.contains(*g)),
+            "no spinner glyph should appear before 375ms: {joined}"
+        );
+
+        let _ = release_tx.send(());
+        wait_for_drain(&mut screen);
+    }
+
+    #[test]
+    fn explorer_probe_shows_the_bare_spinner_glyph_in_the_metric_column_past_the_threshold() {
+        let (_dir, file, selection) = file_backed_selection();
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+
+        let (probe, release_tx) = blocking_probe(WhatProbeResult::Size(file.clone(), 999_999));
+        screen.set_pending_probe(probe, ProbeTarget::Explorer(file));
+        std::thread::sleep(Duration::from_millis(450));
+
+        let joined = render_to_lines(&screen, &state, 90, 12).join("\n");
+        assert!(
+            !joined.contains("3 KB"),
+            "the metric column must not show the real size while the spinner is up: {joined}"
+        );
+        assert!(
+            Glyphs::UNICODE.spinner.iter().any(|g| joined.contains(*g)),
+            "expected a bare spinner glyph in the Explorer row's metric column: {joined}"
+        );
+
+        let _ = release_tx.send(());
+        wait_for_drain(&mut screen);
+    }
+
+    #[test]
+    fn categories_probe_shows_the_bare_spinner_glyph_next_to_the_affected_row_past_the_threshold() {
+        let state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+
+        let (probe, release_tx) = blocking_probe(WhatProbeResult::TotalSize(0));
+        screen.set_pending_probe(probe, ProbeTarget::Category("KDE Plasma"));
+        std::thread::sleep(Duration::from_millis(450));
+
+        let lines = render_to_lines(&screen, &state, 90, 20);
+        let row = lines
+            .iter()
+            .find(|line| line.contains("KDE Plasma"))
+            .expect("the KDE Plasma Categories row");
+        assert!(
+            Glyphs::UNICODE.spinner.iter().any(|g| row.contains(*g)),
+            "expected a bare spinner glyph next to the affected Category row: {row}"
+        );
+
+        let _ = release_tx.send(());
+        wait_for_drain(&mut screen);
+    }
+
+    #[test]
+    fn resolved_value_replaces_the_spinner_on_the_very_next_render_with_no_transition() {
+        let (_dir, file, selection) = file_backed_selection();
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+
+        // Resolves to the file's own real size: once applied, the cache and the on-disk fact
+        // agree, so the post-resolve assertion below is checking dismissal, not a stray value.
+        let (probe, release_tx) = blocking_probe(WhatProbeResult::Size(file.clone(), 3 * 1024));
+        screen.set_pending_probe(probe, ProbeTarget::Explorer(file));
+        std::thread::sleep(Duration::from_millis(450));
+
+        let joined = render_to_lines(&screen, &state, 90, 12).join("\n");
+        assert!(
+            Glyphs::UNICODE.spinner.iter().any(|g| joined.contains(*g)),
+            "expected the spinner up before the probe resolves: {joined}"
+        );
+
+        let _ = release_tx.send(());
+        wait_for_drain(&mut screen);
+
+        // The very next render after the probe resolves: the resolved value replaces the
+        // spinner outright, with no intermediate/transition frame in between (#94).
+        let joined = render_to_lines(&screen, &state, 90, 12).join("\n");
+        assert!(
+            joined.contains("3 KB"),
+            "expected the resolved size to replace the spinner immediately: {joined}"
+        );
+        assert!(
+            Glyphs::UNICODE.spinner.iter().all(|g| !joined.contains(*g)),
+            "no spinner glyph should remain once the probe has resolved: {joined}"
+        );
     }
 
     #[test]
@@ -2326,10 +2568,13 @@ mod tests {
     fn tick_drains_a_resolved_probe_into_the_size_cache_and_clears_the_slot() {
         let mut screen = WhatScreen::default();
         let path = PathBuf::from("/home/tester/big-file");
-        screen.set_pending_probe(PendingProbe::spawn({
-            let path = path.clone();
-            move || WhatProbeResult::Size(path, 4096)
-        }));
+        screen.set_pending_probe(
+            PendingProbe::spawn({
+                let path = path.clone();
+                move || WhatProbeResult::Size(path, 4096)
+            }),
+            ProbeTarget::Explorer(path.clone()),
+        );
         assert!(screen.has_pending_probe());
 
         wait_for_drain(&mut screen);
@@ -2362,19 +2607,25 @@ mod tests {
         // The stale probe blocks until released, so it is still unresolved (guaranteed "in
         // flight") at the moment it is replaced below.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        screen.set_pending_probe(PendingProbe::spawn({
-            let stale_path = stale_path.clone();
-            move || {
-                let _ = release_rx.recv();
-                WhatProbeResult::Size(stale_path, 111)
-            }
-        }));
+        screen.set_pending_probe(
+            PendingProbe::spawn({
+                let stale_path = stale_path.clone();
+                move || {
+                    let _ = release_rx.recv();
+                    WhatProbeResult::Size(stale_path, 111)
+                }
+            }),
+            ProbeTarget::Explorer(stale_path.clone()),
+        );
         // Replacing the slot drops the stale `PendingProbe` — and its `Receiver` — outright;
         // there is no queue holding both requests in flight (ADR-0009 D2).
-        screen.set_pending_probe(PendingProbe::spawn({
-            let fresh_path = fresh_path.clone();
-            move || WhatProbeResult::Size(fresh_path, 222)
-        }));
+        screen.set_pending_probe(
+            PendingProbe::spawn({
+                let fresh_path = fresh_path.clone();
+                move || WhatProbeResult::Size(fresh_path, 222)
+            }),
+            ProbeTarget::Explorer(fresh_path.clone()),
+        );
         // Let the abandoned stale worker finish and attempt its now-nowhere `send`.
         let _ = release_tx.send(());
 
