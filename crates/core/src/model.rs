@@ -267,20 +267,21 @@ impl SelectionModel {
     /// so a Custom path can be removed while drilled out (grilling confirmed this must work),
     /// not only while active.
     ///
-    /// Also clears any `deselected`/`deselected_roots` entry at or under the removed path.
-    /// Nothing in this model can ever create such an entry *strictly under* a Custom path's own
-    /// relative path in the first place — `add_custom_path`/[`custom_entry`] insert exactly one
-    /// Entry per Custom path, never a scanned Subtree under it (unlike a Category's regular
-    /// Entries), so there is no descendant Entry a nested Drill-down deselection could apply to.
-    /// The one registry entry that *can* exist is an exact-path match — the Custom path itself
-    /// deselected as a Drill-down root (`deselect_root`) or per-file (`deselect_entry`) before
-    /// being removed here. Leaving that stale mark behind would misreport `is_root_deselected`/
-    /// `is_deselected` as true for a path the model no longer has any Entry for at all, and would
-    /// wrongly withhold a *different, brand-new* Entry a later `add_custom_path` at the very same
-    /// path creates — `add_custom_path` inserts straight into `entries` with no
-    /// `is_under_deselected_root` check of its own (unlike `select_category`/`reselect_root`),
-    /// so a leftover `deselected_roots` entry would otherwise silently desync from an Entry that
-    /// is, in fact, active again.
+    /// Also clears this Custom path's *own* `deselected`/`deselected_roots` mark, at exactly its
+    /// relative path — the entry left behind by a prior `deselect_entry`/`deselect_root` on it.
+    /// Leaving it would misreport `is_deselected`/`is_root_deselected` as true for a path the
+    /// model no longer holds any Entry for, and would silently withhold a *different, brand-new*
+    /// Entry a later `add_custom_path` at the very same path creates — `add_custom_path` inserts
+    /// straight into `entries` with no `is_under_deselected_root` check of its own (unlike
+    /// `select_category`/`reselect_root`), so a leftover `deselected_roots` entry would otherwise
+    /// desync from an Entry that is, in fact, active again.
+    ///
+    /// Only the exact key is cleared, never the whole prefix under it: `add_custom_path`/
+    /// [`custom_entry`] insert exactly one Entry per Custom path (never a scanned Subtree, unlike
+    /// a Category's regular Entries), so no mark strictly *under* this path's relative path ever
+    /// belongs to the Entry being removed. A separately-added, nested Custom path (paths may
+    /// nest — `add_custom_path` dedups only on an exact `absolute_path` match) keeps its own
+    /// deselection mark, which a prefix wipe would wrongly clear out from under it.
     ///
     /// A no-op if no Entry (active or withheld) has `absolute_path` — removing a path never
     /// added is not an error, and this only ever deletes what the model already holds, so it
@@ -306,10 +307,8 @@ impl SelectionModel {
             self.total_size_cache.set(None);
         }
 
-        self.deselected
-            .retain(|path| !path.starts_with(&relative_path));
-        self.deselected_roots
-            .retain(|path| !path.starts_with(&relative_path));
+        self.deselected.remove(&relative_path);
+        self.deselected_roots.remove(&relative_path);
     }
 
     /// The active (non-deselected) Entries, in path order (the `BTreeMap` key order — #82's
@@ -1609,6 +1608,29 @@ mod tests {
         selection.remove_custom_path(&notes);
 
         assert_eq!(selection.total_size(), 0);
+    }
+
+    #[test]
+    fn remove_custom_path_keeps_a_nested_sibling_custom_paths_own_deselection() {
+        // Custom paths can nest: `add_custom_path` dedups only on an exact `absolute_path`,
+        // so a directory and a file within it can both be separate Custom-path Entries.
+        // Removing the parent must clear only the parent's own mark, not wipe the whole
+        // prefix and take the still-present child's deselection with it.
+        let home = Path::new("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+        let parent = Path::new("/home/test/dir");
+        let child = Path::new("/home/test/dir/notes.md");
+        selection.add_custom_path(parent, home);
+        selection.add_custom_path(child, home);
+        selection.deselect_entry(Path::new("dir/notes.md"));
+        assert!(selection.is_deselected(Path::new("dir/notes.md")));
+
+        selection.remove_custom_path(parent);
+
+        assert!(
+            selection.is_deselected(Path::new("dir/notes.md")),
+            "removing the parent Custom path must not clear a nested sibling's own deselection"
+        );
     }
 
     /// A deep Drill-down tree (#48): several nested levels under one Category, so the
