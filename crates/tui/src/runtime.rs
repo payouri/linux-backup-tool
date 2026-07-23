@@ -58,7 +58,9 @@ pub fn run(app: App) -> Result<()> {
 }
 
 /// The main loop. Every interactive screen is redraw-on-event: draw once, block on the next
-/// input, fold it into state, repeat. The exception is a *running* backup RUN or restore
+/// input, fold it in, then drain any further events already queued (a held key's autorepeat
+/// burst) before repeating — so a burst collapses into a single repaint instead of one per
+/// event. The exception is a *running* backup RUN or restore
 /// (`App::is_backup_running` / [`App::needs_poll`], ADR-0005 D4): while either holds, the loop
 /// drains that run's progress channel and crossterm together each tick and drives an
 /// [`Event::Tick`] to advance the flow, so the frame stays live during the run without any
@@ -109,6 +111,16 @@ fn run_loop(terminal: &mut Tui, mut app: App) -> Result<()> {
             worker = None;
             if let Some(event) = read_event()? {
                 app = app.update(event);
+            }
+            // Held-key autorepeat floods the queue with `Press` events (no `Repeat` variant is
+            // emitted; this app pushes no kitty enhancement flags — see
+            // docs/research/2026-07-22-crossterm-event-coalescing.md). Drain everything already
+            // buffered before the single repaint below so a burst collapses into one frame
+            // instead of one repaint per queued event.
+            while event::poll(Duration::ZERO).context("poll terminal event")? {
+                if let Some(event) = read_event()? {
+                    app = app.update(event);
+                }
             }
         }
     }
