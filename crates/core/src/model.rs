@@ -51,6 +51,7 @@
 //! instead of filtering every Entry in the Selection per render — the last O(n)-per-render cost
 //! #82 didn't already reach, because it lived in `tui`, not here.
 
+use std::cell::Cell;
 use std::collections::btree_map::Range;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -187,6 +188,19 @@ pub struct SelectionModel {
     /// whose `relative_path` starts with one of these is excluded by that root, not a per-file
     /// mark. The storable shape exposed by `deselected_roots` for the Profile to persist.
     deselected_roots: BTreeSet<PathBuf>,
+    /// Lazily-populated `total_size()` result: `None` means "unknown, recompute on next call".
+    /// Every method that changes which Entries are active (`add_custom_path`, `deselect_entry`,
+    /// `reselect_entry`, `select_category`, `deselect_category`, `deselect_root`,
+    /// `reselect_root`) calls `.set(None)` to invalidate it, so a stale total from a `stat` done
+    /// before the Selection changed can never be handed back. Nothing invalidates it for an
+    /// out-of-band disk mutation (a file growing between scan and backup) — `total_size`'s doc
+    /// already scoped that as not its concern, and this cache doesn't change that contract, only
+    /// how often the unchanged answer is re-`stat`ed. A `Cell` rather than `RefCell` because the
+    /// cached value (`Option<u64>`) is `Copy`, so there's nothing to borrow-check; interior
+    /// mutability is needed at all only because `total_size(&self)`'s signature can't change
+    /// (WHERE/REVIEW render paths and `RunPlan::new` call it every render with a shared
+    /// reference).
+    total_size_cache: Cell<Option<u64>>,
 }
 
 impl SelectionModel {
@@ -203,6 +217,7 @@ impl SelectionModel {
             withheld: BTreeMap::new(),
             deselected: BTreeSet::new(),
             deselected_roots: BTreeSet::new(),
+            total_size_cache: Cell::new(None),
         }
     }
 
@@ -243,6 +258,7 @@ impl SelectionModel {
         }
         let entry = custom_entry(absolute_path, home);
         self.entries.insert(entry.relative_path.clone(), entry);
+        self.total_size_cache.set(None);
     }
 
     /// The active (non-deselected) Entries, in path order (the `BTreeMap` key order — #82's
@@ -267,6 +283,7 @@ impl SelectionModel {
         };
         self.deselected.insert(relative_path.to_path_buf());
         self.withheld.insert(relative_path.to_path_buf(), entry);
+        self.total_size_cache.set(None);
     }
 
     /// Reverses `deselect_entry`: clears `relative_path`'s per-file deselection and moves the
@@ -281,6 +298,7 @@ impl SelectionModel {
         }
         if let Some(entry) = self.withheld.remove(relative_path) {
             self.entries.insert(relative_path.to_path_buf(), entry);
+            self.total_size_cache.set(None);
         }
     }
 
@@ -355,6 +373,9 @@ impl SelectionModel {
         for path in to_reselect {
             self.reselect_entry(&path);
         }
+        if !to_insert_active.is_empty() {
+            self.total_size_cache.set(None);
+        }
         for entry in to_insert_active {
             self.entries.insert(entry.relative_path.clone(), entry);
         }
@@ -371,6 +392,7 @@ impl SelectionModel {
     /// survive a full off/on cycle within the same run — an accepted simplification for the
     /// alpha's first Selection screen (#30); re-drilling after re-checking is cheap.
     pub fn deselect_category(&mut self, category_name: &str) {
+        self.total_size_cache.set(None);
         self.entries.retain(|_, e| e.category != category_name);
 
         let removed_withheld: Vec<PathBuf> = self
@@ -419,6 +441,7 @@ impl SelectionModel {
             // undo before returning.
             return;
         }
+        self.total_size_cache.set(None);
         for (path, entry) in moved {
             self.withheld.insert(path, entry);
         }
@@ -442,6 +465,7 @@ impl SelectionModel {
                 !self.deselected.contains(&path) && !self.is_under_deselected_root(&path);
             if reactivatable {
                 self.entries.insert(path, entry);
+                self.total_size_cache.set(None);
             } else {
                 self.withheld.insert(path, entry);
             }
@@ -545,15 +569,26 @@ impl SelectionModel {
 
     /// The sum of every selected Entry's current on-disk size in bytes.
     ///
-    /// Recomputed from disk each call rather than cached, so it reflects whatever is
-    /// actually there at read time (a file growing/shrinking between scan and backup is
-    /// not this method's concern).
+    /// WHERE/REVIEW's render paths and `RunPlan::new` call this on every render, and it used to
+    /// re-`stat` every active Entry from disk each time even when the Selection hadn't changed
+    /// since the last call — the common case for a screen that's just redrawing. The result is
+    /// now cached in `total_size_cache` (a `Cell`, so this can stay `&self`) and only recomputed
+    /// after a miss; every Selection-mutating method above invalidates it. This does *not* make
+    /// the total live against the filesystem between calls — a file growing/shrinking with no
+    /// intervening Selection mutation is still not reflected until something invalidates the
+    /// cache, same as it wasn't this method's concern before caching existed.
     pub fn total_size(&self) -> u64 {
-        self.entries
+        if let Some(cached) = self.total_size_cache.get() {
+            return cached;
+        }
+        let total = self
+            .entries
             .values()
             .filter_map(|e| std::fs::metadata(&e.absolute_path).ok())
             .map(|m| m.len())
-            .sum()
+            .sum();
+        self.total_size_cache.set(Some(total));
+        total
     }
 
     /// Whether the Selection is empty (story 42: an empty Selection should bounce rather
@@ -833,6 +868,41 @@ mod tests {
             selection.selected_paths(),
             vec![tmp.path().join(".config/kwinrc")]
         );
+        assert_eq!(selection.total_size(), 100);
+    }
+
+    #[test]
+    fn total_size_cache_hit_reuses_prior_value_across_an_out_of_band_disk_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let entry = entry_with_size(tmp.path(), ".config/kwinrc", 100);
+        let absolute_path = entry.absolute_path.clone();
+        let selection = SelectionModel::new(vec![entry]);
+
+        assert_eq!(selection.total_size(), 100);
+
+        // Out-of-band disk mutation with no intervening Selection mutation: a cache hit must
+        // keep returning the value computed on the first call rather than re-stat.
+        std::fs::File::create(&absolute_path)
+            .expect("truncate file")
+            .set_len(999)
+            .expect("set_len");
+
+        assert_eq!(selection.total_size(), 100);
+    }
+
+    #[test]
+    fn total_size_cache_miss_recomputes_after_a_selection_mutation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kwinrc = entry_with_size(tmp.path(), ".config/kwinrc", 100);
+        let heavy_icon = entry_with_size(tmp.path(), ".local/share/icons/heavy.svg", 200);
+        let mut selection = SelectionModel::new(vec![kwinrc, heavy_icon]);
+
+        assert_eq!(selection.total_size(), 300);
+
+        // A Selection mutation must invalidate the cache so the next call recomputes rather
+        // than keeps returning the pre-mutation total.
+        selection.deselect_entry(Path::new(".local/share/icons/heavy.svg"));
+
         assert_eq!(selection.total_size(), 100);
     }
 
