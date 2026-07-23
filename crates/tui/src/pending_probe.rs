@@ -24,10 +24,6 @@ pub struct PendingProbe<T> {
     // Kept alive so the thread isn't detached mid-probe; never joined explicitly — a `send`
     // into a dropped `Receiver` (the abandonment path) is not observed as a joined result.
     _handle: JoinHandle<()>,
-    // Read only by `elapsed()` below, which has no production caller yet (the ADR-0009 D3
-    // debounce math it backs is #94's decision) — recorded anyway because "records its own
-    // spawn Instant" is this ticket's own acceptance criterion, ahead of that consumer.
-    #[allow(dead_code)]
     started: Instant,
 }
 
@@ -62,9 +58,8 @@ impl<T: Send + 'static> PendingProbe<T> {
     }
 
     /// How long this probe has been in flight, for the caller's debounce threshold (ADR-0009
-    /// D3: a spinner becomes visible once this crosses 375ms). Unused until #94 wires the
-    /// debounced-spinner render that reads it.
-    #[allow(dead_code)]
+    /// D3: a spinner becomes visible once this crosses 375ms) — read by
+    /// [`crate::what_screen::WhatScreen`]'s own debounce check (#94).
     #[must_use]
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
