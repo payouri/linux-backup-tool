@@ -26,7 +26,7 @@ tauri-build = { version = "2.6.3", features = [] }
 # The stack fixed by ADR-0008 Decision 1: Tauri 2.x, the only surveyed candidate shipping
 # the ADR-0006 recursive drill-down tree pre-built on the JS side (react-arborist). Default
 # features pull in the `webkit2gtk`/`wry` runtime this ADR already accepted the cost of.
-tauri = "2.11.5"
+tauri = { version = "2.11.5", features = [] }
 # `#[tauri::command]` return types and the view DTOs (Decision 2) must derive `Serialize`;
 # this crate's own dependency, never `core`'s (ADR-0008 Decision 2: zero net-new `core`
 # serde derives).
