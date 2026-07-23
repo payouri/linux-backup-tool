@@ -120,6 +120,11 @@ pub struct WhatScreen {
     /// `spinner_tick`, `run_screen.rs`), so a future debounced spinner (#94) has a live frame
     /// counter to animate on.
     spinner_tick: usize,
+    /// The cached left-pane Category rows (#112). Computed eagerly at exactly four choke points:
+    /// `sync_categories`, `toggle`, `select_scope`, and `commit_custom_path` (#112). This avoids
+    /// O(categories × entries) recomputation on every render and folds `category_state`'s prior
+    /// double-scan into a single pass.
+    category_rows: Vec<CategoryRow>,
 }
 
 /// The view state of the Custom-path add field — the buffer plus its autocomplete cursor and
@@ -175,6 +180,8 @@ impl WhatScreen {
     /// dropping one already known — so a toggle-off (which only withholds Entries) can't erase
     /// a row. The Custom-paths Category is always present and pinned to the bottom (its row is
     /// the always-shown add affordance, story 6 / #50), regardless of whether it holds anything.
+    /// Recomputes the cached `category_rows` only when the category set actually grows (#112);
+    /// see the guard below for why unconditional recompute would defeat the cache.
     fn sync_categories(&mut self, selection: &SelectionModel) {
         let mut known: BTreeSet<&'static str> = self.categories.iter().copied().collect();
         for entry in selection.entries() {
@@ -183,7 +190,55 @@ impl WhatScreen {
         known.remove(CUSTOM_PATHS);
         let mut ordered: Vec<&'static str> = known.into_iter().collect();
         ordered.push(CUSTOM_PATHS);
+        // Categories only ever grow here (never drop, per this fn's contract), so a length
+        // change is exactly a growth. Recompute only then: sync_categories runs on every key
+        // (top of handle_key), and recomputing unconditionally would make every cursor-only
+        // keystroke pay the O(categories × entries) scan this cache exists to avoid (#112).
+        let grew = ordered.len() != self.categories.len();
         self.categories = ordered;
+        if grew {
+            self.recompute_category_rows(selection);
+        }
+    }
+
+    /// Recomputes the cached `category_rows` from the current categories and selection state
+    /// (#112). Called eagerly at four choke points (`sync_categories`, `toggle`, `select_scope`,
+    /// `commit_custom_path`) rather than on every render. Folds `category_state`'s prior
+    /// double-scan into a single pass over entries.
+    fn recompute_category_rows(&mut self, selection: &SelectionModel) {
+        self.category_rows = self
+            .categories
+            .iter()
+            .map(|&name| {
+                let all = selection.entries_in_category(name);
+                let sensitive = all.iter().any(|entry| entry.sensitive);
+
+                // Count active entries in this category, folding in the computation that
+                // used to be done by `category_state` to avoid the double-scan.
+                let active = selection
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.category == name)
+                    .count();
+                let total = all.len();
+
+                let state = if active == 0 {
+                    DirectoryState::None
+                } else if active == total {
+                    DirectoryState::All
+                } else {
+                    DirectoryState::Partial
+                };
+
+                CategoryRow {
+                    name,
+                    selected: active,
+                    sensitive,
+                    state,
+                    add_affordance: name == CUSTOM_PATHS && all.is_empty(),
+                }
+            })
+            .collect();
     }
 
     /// Whether the Custom-path add field is focused — the signal [`crate::app`] uses to route
@@ -347,14 +402,18 @@ impl WhatScreen {
 
     /// `Space`: toggles the focused node. A directory toggles its whole subtree (prefix-wins,
     /// ADR-0006); a file toggles that one Entry; a Category toggles all its Entries.
+    /// Triggers a recompute of the cached `category_rows` after the mutation (#112).
     fn toggle(&mut self, state: &mut WizardState) {
         match self.focus {
             Pane::Categories => {
                 if let Some(name) = self.current_category() {
-                    let select = matches!(
-                        category_state(state.selection(), name),
-                        DirectoryState::None
-                    );
+                    // Use cached category_rows to determine the state before the mutation,
+                    // avoiding a separate category_state() call (#112).
+                    let select = self
+                        .category_rows
+                        .iter()
+                        .find(|row| row.name == name)
+                        .is_none_or(|row| matches!(row.state, DirectoryState::None));
                     set_category(state, name, select);
                 }
             }
@@ -365,10 +424,12 @@ impl WhatScreen {
                 }
             }
         }
+        self.recompute_category_rows(state.selection());
     }
 
     /// `Ctrl-A`/`Ctrl-D`: select or deselect the whole focused scope — every Category on the
     /// left, or every row of the current directory on the right (#51 Select group).
+    /// Triggers a recompute of the cached `category_rows` after the loop (#112).
     fn select_scope(&mut self, state: &mut WizardState, select: bool) {
         match self.focus {
             Pane::Categories => {
@@ -382,6 +443,7 @@ impl WhatScreen {
                 }
             }
         }
+        self.recompute_category_rows(state.selection());
     }
 
     /// The rows of the directory the explorer currently shows, derived fresh from the
@@ -569,7 +631,12 @@ impl WhatScreen {
         }
         state.selection_mut().add_custom_path(&expanded, home);
         self.custom_input = None;
+        // A committed custom path lands under the always-present CUSTOM_PATHS category, so it
+        // changes that row's counts without growing the category set — sync_categories' growth
+        // guard won't fire. Recompute explicitly: this is the fourth deliberate-intent choke
+        // point (#112).
         self.sync_categories(state.selection());
+        self.recompute_category_rows(state.selection());
     }
 }
 
@@ -608,6 +675,7 @@ struct CategoryRow {
 
 /// The tri-state of a whole Category, from its active-vs-total Entry split — the left pane's
 /// analogue of a directory node's [`SelectionModel::directory_state`].
+#[cfg(test)]
 fn category_state(selection: &SelectionModel, category: &str) -> DirectoryState {
     let total = selection.entries_in_category(category).len();
     let active = selection
@@ -622,29 +690,6 @@ fn category_state(selection: &SelectionModel, category: &str) -> DirectoryState 
     } else {
         DirectoryState::Partial
     }
-}
-
-fn category_rows(screen: &WhatScreen, selection: &SelectionModel) -> Vec<CategoryRow> {
-    screen
-        .categories
-        .iter()
-        .map(|&name| {
-            let all = selection.entries_in_category(name);
-            let sensitive = all.iter().any(|entry| entry.sensitive);
-            let selected = selection
-                .entries()
-                .iter()
-                .filter(|entry| entry.category == name)
-                .count();
-            CategoryRow {
-                name,
-                selected,
-                sensitive,
-                state: category_state(selection, name),
-                add_affordance: name == CUSTOM_PATHS && all.is_empty(),
-            }
-        })
-        .collect()
 }
 
 /// Walks each candidate path's ancestors to find which deselected roots cover it.
@@ -982,8 +1027,6 @@ pub fn render(
     getenv: Getenv,
     glyphs: Glyphs,
 ) {
-    let selection = state.selection();
-    let categories = category_rows(screen, selection);
     let typing = screen.custom_input.is_some();
 
     if area.width < TWO_PANE_MIN_WIDTH {
@@ -995,7 +1038,7 @@ pub fn render(
                     render_categories(
                         frame,
                         area,
-                        &categories,
+                        &screen.category_rows,
                         screen.category_cursor,
                         true,
                         glyphs,
@@ -1024,7 +1067,7 @@ pub fn render(
     render_categories(
         frame,
         columns[0],
-        &categories,
+        &screen.category_rows,
         screen.category_cursor,
         screen.focus == Pane::Categories && !typing,
         glyphs,
@@ -2358,5 +2401,160 @@ mod tests {
             screen.tick();
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn cursor_only_keys_leave_cached_rows_untouched_no_recompute() {
+        // #112 AC: A cursor-only key (motion, focus toggle, narrowly non-mutating) should not
+        // trigger a recompute of the cached category_rows. This test verifies that the cached
+        // rows pointer identity stays the same after cursor-only keys.
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        assert_eq!(screen.category_rows.len(), 3); // KDE Plasma, Shell, Custom paths
+
+        // Poke a sentinel into the cache. A recompute would overwrite it with the true count;
+        // its survival across the burst is a direct, allocator-independent witness that no
+        // recompute ran (pointer identity would be defeated by the allocator reusing the freed
+        // buffer, so it can't distinguish "not recomputed" from "recomputed in place").
+        for row in &mut screen.category_rows {
+            row.selected = usize::MAX;
+        }
+
+        // Apply cursor-only keys: arrows, Tab, Home, End, PgUp/PgDn.
+        screen.handle_key(key(KeyCode::Up), &mut state);
+        screen.handle_key(key(KeyCode::Down), &mut state);
+        screen.handle_key(key(KeyCode::PageUp), &mut state);
+        screen.handle_key(key(KeyCode::PageDown), &mut state);
+        screen.handle_key(key(KeyCode::Home), &mut state);
+        screen.handle_key(key(KeyCode::End), &mut state);
+        screen.handle_key(key(KeyCode::Tab), &mut state);
+        screen.handle_key(key(KeyCode::BackTab), &mut state);
+
+        assert!(
+            screen
+                .category_rows
+                .iter()
+                .all(|row| row.selected == usize::MAX),
+            "cursor-only keys must not recompute the cached category_rows"
+        );
+    }
+
+    #[test]
+    fn category_cache_recomputes_at_four_choke_points() {
+        // #112 AC: The cached category_rows must recompute at exactly four choke points:
+        // 1. sync_categories (on category growth)
+        // 2. toggle (after mutating branch)
+        // 3. select_scope (after loop)
+        // 4. commit_custom_path (asserted separately below, as it needs a real filesystem path)
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+
+        // Choke point 1: sync_categories (called during construction, so verify it initialized)
+        assert_eq!(screen.category_rows.len(), 3); // KDE Plasma, Shell, Custom paths
+        assert_eq!(screen.category_rows[0].name, "KDE Plasma");
+        assert_eq!(screen.category_rows[0].selected, 3); // All 3 KDE Plasma entries
+
+        // Choke point 2: toggle (Categories pane)
+        screen.handle_key(key(KeyCode::Char(' ')), &mut state);
+        // After toggling KDE Plasma off, its selected count should drop to 0.
+        assert_ne!(
+            screen.category_rows[0].selected, 3,
+            "toggle should trigger a recompute"
+        );
+
+        // Choke point 3: select_scope (Ctrl-A on Categories)
+        screen.handle_key(ctrl(KeyCode::Char('a')), &mut state);
+        // After Ctrl-A, all categories should be fully selected again.
+        assert_eq!(
+            screen.category_rows[0].selected, 3,
+            "select_scope should trigger a recompute"
+        );
+
+        // Verify the cache is correctly updated by checking all rows.
+        let total_selected: usize = screen.category_rows.iter().map(|r| r.selected).sum();
+        assert_eq!(
+            total_selected, 4,
+            "all entries should be selected after Ctrl-A"
+        ); // 3 KDE Plasma + 1 Shell
+    }
+
+    #[test]
+    fn commit_custom_path_recomputes_the_cached_rows() {
+        // #112 AC (fourth choke point): a committed custom path lands under the always-present
+        // Custom-paths category, so it changes that row's counts without growing the category
+        // set. sync_categories' growth guard won't fire, so commit_custom_path must recompute on
+        // its own — this asserts the cached row reflects the new Entry.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        std::fs::write(home.join("notes.md"), b"x").expect("fixture file");
+
+        let mut state = WizardState::new(SelectionModel::new(vec![]), Some(home.to_path_buf()));
+        let mut screen = WhatScreen::new(state.selection());
+        let before = screen
+            .category_rows
+            .iter()
+            .find(|r| r.name == CUSTOM_PATHS)
+            .map(|r| r.selected)
+            .expect("the always-shown Custom paths row");
+        assert_eq!(before, 0, "no custom path committed yet");
+
+        screen.custom_input = Some(CustomInput::default());
+        drive_field(&mut screen, &mut state, home, "~/notes.md", KeyCode::Enter);
+
+        let after = screen
+            .category_rows
+            .iter()
+            .find(|r| r.name == CUSTOM_PATHS)
+            .map(|r| r.selected)
+            .expect("the always-shown Custom paths row");
+        assert_eq!(
+            after, 1,
+            "commit_custom_path must recompute the cached rows to reflect the new Entry"
+        );
+    }
+
+    #[test]
+    fn movement_bursts_stay_cheap_regardless_of_selection_size() {
+        // #112 AC: A burst of movement keys (cursor-only, no mutation) should scale linearly
+        // with the number of keys, not with the Selection size. This test generates a large
+        // Selection and verifies that repeated cursor movements don't cause repeated recomputes.
+        let large_selection = SelectionModel::new(
+            (0..100)
+                .flat_map(|i| {
+                    vec![
+                        entry(
+                            "KDE Plasma",
+                            EntryType::File,
+                            &format!(".local/plasma/file{i}"),
+                        ),
+                        entry("Shell", EntryType::File, &format!(".config/shell{i}")),
+                    ]
+                })
+                .collect(),
+        );
+
+        let mut state = WizardState::new(large_selection, Some(PathBuf::from("/home/tester")));
+        let mut screen = WhatScreen::new(state.selection());
+
+        // Poke a sentinel into the cache; a recompute on any burst key would overwrite it with
+        // the true count. Its survival is an allocator-independent witness that the whole burst
+        // did zero recompute work — the cost of a movement key is O(1), not O(Selection size).
+        for row in &mut screen.category_rows {
+            row.selected = usize::MAX;
+        }
+
+        // Apply a burst of movement keys.
+        for _ in 0..50 {
+            screen.handle_key(key(KeyCode::Down), &mut state);
+            screen.handle_key(key(KeyCode::Up), &mut state);
+        }
+
+        assert!(
+            screen
+                .category_rows
+                .iter()
+                .all(|row| row.selected == usize::MAX),
+            "a movement burst must not recompute category_rows even on a large Selection"
+        );
     }
 }
