@@ -1,30 +1,14 @@
-<!--
-  Committed placeholder — NOT the real frontend build output.
-
-  `tauri-build` (crates/gui/build.rs) validates at Rust *compile* time that
-  `build.frontendDist` (this directory) exists, regardless of whether anyone has run the
-  frontend build. Without this file, `cargo build --workspace` / `cargo test --workspace`
-  would fail on a clean checkout unless CI ran `npm install && npm run build` first — a
-  frontend build step the Rust gates should not need (issue #99's walking-skeleton gotcha).
-
-  `crates/gui/ui/.gitignore` ignores `dist/` like any generated Vite output, so this one
-  file is force-added (`git add -f`) to be the sole tracked exception — everything else a
-  real build drops in here (JS/CSS bundles, fonts, ...) stays untracked and ignored.
-
-  Run `npm install && npm run build` in `crates/gui/ui/` to overwrite this with the real
-  Vite build before `cargo tauri dev` / `cargo tauri build` (a real window needs real
-  assets); that overwrite then shows up as a local modification to this tracked file —
-  restore it (`git checkout -- dist/index.html`) rather than committing the real build.
--->
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>linux-backup</title>
+    <script type="module" crossorigin src="/assets/index-BE6Mji1Z.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DVQzBzBM.css">
   </head>
   <body>
-    <div id="root">
-      Placeholder — run <code>npm run build</code> in crates/gui/ui/ to produce the real app.
-    </div>
+    <div id="root"></div>
   </body>
 </html>
