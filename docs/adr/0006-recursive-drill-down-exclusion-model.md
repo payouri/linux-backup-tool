@@ -154,3 +154,30 @@ persisted `Vec<PathBuf>` shape; the `BTreeMap` is in-memory only, built fresh fr
 fresh scan) on load. No migration, no `SCHEMA_VERSION` bump — consistent with Decision 3's "the
 Archive itself is the record" and Decision 4's "no new field and no migration" already covering any
 representation the *in-memory* model chooses for the same persisted facts.
+
+## Addendum: 2026-07-23 — explorer tri-state stays Category-agnostic (issue #86)
+
+Issue #86 asked whether the recursive Drill-down explorer's tri-state checkbox, at a directory
+node whose Subtree is shared by more than one Category (e.g. `.config`, `.local`), should keep
+showing the Category-agnostic union (today's behavior, preserved by #83's AC) or narrow to only
+the focused Category's Entries.
+
+**Decision: stays Category-agnostic. No code change.**
+
+`directory_state`/`deselect_root`/`reselect_root` (Decision 5) are and remain Category-agnostic: a
+toggle at a shared node touches every Entry under that prefix regardless of Category. A
+per-Category-scoped checkbox was considered and rejected because it would show a state the toggle
+does not honor — decoupling display from effect, the same "second representation of the same
+truth" Decision 1 already ruled out, this time keyed by Category rather than by directory. Making
+the *toggle* itself Category-scoped to match would need a real model change (per-Category subtree
+exclusion is not expressible in the flat two-set model at a shared prefix without either falling
+back to per-Entry deselection at scale or introducing a Category-aware exclusion registry) — out
+of proportion to a display question, and nothing in the ticket's motivation licensed it.
+
+**Accepted tradeoff, recorded for future contributors:** at a shared node, a Partial checkbox can
+come entirely from a Category other than the one being viewed. Toggling it still deselects the
+whole Subtree across every Category sharing that prefix — including a Category whose own Entries
+there were fully selected. This is a direct, correct consequence of Decision 5's Category-agnostic
+`directory_state`/`deselect_root` pairing, not a bug: the checkbox tells the truth about what the
+toggle does. A future UI affordance to communicate "this toggle also affects other Categories" is
+a separate, later concern with no ticket currently open for it.
