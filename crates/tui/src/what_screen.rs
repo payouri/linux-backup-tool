@@ -569,6 +569,31 @@ fn category_rows(screen: &WhatScreen, selection: &SelectionModel) -> Vec<Categor
         .collect()
 }
 
+/// Walks each candidate path's ancestors to find which deselected roots cover it.
+/// This mirrors `core::SelectionModel::is_under_deselected_root` but inverted: instead of
+/// checking if a single path is under any deselected root, it finds all deselected roots that
+/// cover at least one path in the candidate set.
+///
+/// This is O(paths × depth × log m) instead of the naive O(roots × paths), avoiding the freeze
+/// when re-enabling a large Category that was deselected leaf-by-leaf (creating O(k) `deselected_roots`).
+fn find_deselected_roots_covering_paths(
+    paths: &[PathBuf],
+    deselected_roots: &BTreeSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots = BTreeSet::new();
+    for path in paths {
+        for ancestor in path.ancestors() {
+            if ancestor == Path::new("") {
+                break;
+            }
+            if deselected_roots.contains(ancestor) {
+                roots.insert(ancestor.to_path_buf());
+            }
+        }
+    }
+    roots.into_iter().collect()
+}
+
 /// Selects or deselects every Entry of `category`. Deselecting withholds each Entry's subtree
 /// (`deselect_root`, which keeps it recoverable); selecting reverses both a subtree withhold
 /// and any per-file Drill-down deselection, so `Ctrl-A` restores a Category in full — including
@@ -584,12 +609,8 @@ fn set_category(state: &mut WizardState, category: &str, select: bool) {
         .collect();
     let selection = state.selection_mut();
     if select {
-        let covering_roots: Vec<PathBuf> = selection
-            .deselected_roots()
-            .iter()
-            .filter(|root| paths.iter().any(|path| path.starts_with(root)))
-            .cloned()
-            .collect();
+        let covering_roots: Vec<PathBuf> =
+            find_deselected_roots_covering_paths(&paths, selection.deselected_roots());
         for root in &covering_roots {
             selection.reselect_root(root);
         }
@@ -2081,5 +2102,83 @@ mod tests {
             "the row's tri-state must equal directory_state's Category-agnostic verdict"
         );
         assert_eq!(dotlocal.state, DirectoryState::Partial);
+    }
+
+    #[test]
+    fn find_deselected_roots_covering_paths_pinned_against_synthetic_btreeset() {
+        // Unit test for the O(paths × depth) ancestor-walk helper. Verifies it correctly
+        // identifies which deselected roots (subtree prefixes) cover a candidate set of paths.
+        let mut deselected_roots = BTreeSet::new();
+        deselected_roots.insert(PathBuf::from(".local/share/icons"));
+        deselected_roots.insert(PathBuf::from(".config/plasma"));
+        deselected_roots.insert(PathBuf::from(".bashrc"));
+
+        // Single path covered by a root at depth 3.
+        let covering = find_deselected_roots_covering_paths(
+            &[PathBuf::from(".local/share/icons/hicolor/scalable/app.svg")],
+            &deselected_roots,
+        );
+        assert_eq!(covering.len(), 1);
+        assert!(covering.contains(&PathBuf::from(".local/share/icons")));
+
+        // Multiple paths covered by different roots.
+        let covering = find_deselected_roots_covering_paths(
+            &[
+                PathBuf::from(".local/share/icons/a.svg"),
+                PathBuf::from(".config/plasma/plasmarc"),
+            ],
+            &deselected_roots,
+        );
+        assert_eq!(covering.len(), 2);
+        assert!(covering.contains(&PathBuf::from(".local/share/icons")));
+        assert!(covering.contains(&PathBuf::from(".config/plasma")));
+
+        // Exact-match root (a file deselection, not a subtree).
+        let covering =
+            find_deselected_roots_covering_paths(&[PathBuf::from(".bashrc")], &deselected_roots);
+        assert_eq!(covering.len(), 1);
+        assert!(covering.contains(&PathBuf::from(".bashrc")));
+
+        // Path not covered by any root.
+        let covering =
+            find_deselected_roots_covering_paths(&[PathBuf::from(".zshrc")], &deselected_roots);
+        assert!(covering.is_empty());
+
+        // Multiple paths but one root covers them (no duplication in result).
+        let covering = find_deselected_roots_covering_paths(
+            &[
+                PathBuf::from(".local/share/icons/a.svg"),
+                PathBuf::from(".local/share/icons/b.svg"),
+            ],
+            &deselected_roots,
+        );
+        assert_eq!(covering.len(), 1);
+        assert!(covering.contains(&PathBuf::from(".local/share/icons")));
+    }
+
+    #[test]
+    fn re_enabling_a_large_category_stays_fast() {
+        // Regression test for issue #110: re-enabling a ~40,000-entry Category that was
+        // deselected leaf-by-leaf (creating ~40,000 single-file deselected_roots) must
+        // complete quickly without UI freeze. The fix extracts a O(paths × depth × log m)
+        // ancestor-walk helper, replacing the naive O(roots × paths) scan.
+        let leaf_paths: Vec<PathBuf> = (0..40_000)
+            .map(|i| PathBuf::from(format!("icon{i}.svg")))
+            .collect();
+
+        // Build a synthetic deselected_roots set mimicking 40k leaf deselections.
+        let deselected_roots: BTreeSet<PathBuf> = leaf_paths.iter().cloned().collect();
+
+        let started = std::time::Instant::now();
+        let covering = find_deselected_roots_covering_paths(&leaf_paths, &deselected_roots);
+        let elapsed = started.elapsed();
+
+        // All 40k paths should be found as covering their own exact roots.
+        assert_eq!(covering.len(), 40_000);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "finding covering roots for 40,000 paths took {elapsed:?} — the O(roots × paths) \
+             freeze (#110) is back"
+        );
     }
 }
