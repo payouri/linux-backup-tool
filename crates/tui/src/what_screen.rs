@@ -395,7 +395,13 @@ impl WhatScreen {
 
     fn set_cursor(&mut self, index: usize) {
         match self.focus {
-            Pane::Categories => self.category_cursor = index,
+            Pane::Categories => {
+                if self.category_cursor != index {
+                    self.breadcrumb.clear();
+                    self.explorer_cursor = 0;
+                }
+                self.category_cursor = index;
+            }
             Pane::Explorer => self.explorer_cursor = index,
         }
     }
@@ -1566,6 +1572,42 @@ mod tests {
             screen.focus,
             Pane::Explorer,
             "climbing stays on the explorer pane"
+        );
+    }
+
+    #[test]
+    fn switching_categories_resets_breadcrumb_and_explorer_cursor() {
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+
+        // Drill into KDE Plasma (cursor 0, as it sorts first alphabetically).
+        screen.handle_key(key(KeyCode::Right), &mut state); // into .local
+        screen.handle_key(key(KeyCode::Right), &mut state); // into .local/share
+        assert_eq!(
+            screen.breadcrumb,
+            [OsString::from(".local"), OsString::from("share")]
+        );
+        // Move explorer cursor to a non-zero position to verify it resets.
+        screen.explorer_cursor = 1;
+
+        // Switch focus to Categories and move to the second Category (Shell).
+        screen.handle_key(key(KeyCode::Tab), &mut state); // back to Categories
+        assert_eq!(screen.focus, Pane::Categories);
+        screen.handle_key(key(KeyCode::Down), &mut state); // to Shell
+
+        // Breadcrumb and explorer cursor must reset when category changes.
+        assert!(
+            screen.breadcrumb.is_empty(),
+            "breadcrumb must clear on category switch"
+        );
+        assert_eq!(
+            screen.explorer_cursor, 0,
+            "explorer cursor must reset on category switch"
+        );
+        assert_eq!(
+            screen.category_cursor, 1,
+            "category cursor has moved to Shell"
         );
     }
 
