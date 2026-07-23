@@ -70,18 +70,41 @@ pub enum ProgressEventDto {
 const ENTRY_EMIT_STRIDE: usize = 25;
 const ENTRY_EMIT_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The [`Progress`] implementation `run_backup`'s worker drives: every `core` callback becomes
-/// a [`ProgressEventDto`] sent over the channel. Sends are best-effort (`let _ =`) — if the
-/// webview already tore down, `core` neither blocks nor observes an error, matching the
-/// trait's one-way contract (mirrors `crates/tui`'s `ChannelProgress`).
-struct ChannelProgress {
-    channel: Channel<ProgressEventDto>,
+/// Implemented by every wire-safe payload a [`ChannelProgress`] can send: the two
+/// notifications `core::Progress` ever emits, translated into that payload's own shape.
+/// Generalizing `ChannelProgress` over this trait — rather than duplicating its throttle
+/// logic per screen — is what lets issue #103's restore channel (a superset that also
+/// carries a one-shot collision request `ChannelProgress` itself knows nothing about) reuse
+/// this exact machinery instead of re-implementing the stride/interval throttle.
+pub(crate) trait ProgressChannelEvent: serde::Serialize + Send + 'static {
+    fn phase(phase: PhaseDto) -> Self;
+    fn entry(done: usize, total: usize) -> Self;
+}
+
+impl ProgressChannelEvent for ProgressEventDto {
+    fn phase(phase: PhaseDto) -> Self {
+        Self::Phase { phase }
+    }
+
+    fn entry(done: usize, total: usize) -> Self {
+        Self::Entry { done, total }
+    }
+}
+
+/// The [`Progress`] implementation a run's worker drives: every `core` callback becomes a
+/// `T` sent over the channel. Sends are best-effort (`let _ =`) — if the webview already
+/// tore down, `core` neither blocks nor observes an error, matching the trait's one-way
+/// contract (mirrors `crates/tui`'s `ChannelProgress`). Generic over `T` (issue #103) so
+/// `run_restore`'s superset channel reuses the identical throttle rather than a second copy
+/// of it.
+pub(crate) struct ChannelProgress<T: ProgressChannelEvent> {
+    channel: Channel<T>,
     last_entry_emit: Instant,
     last_entry_done: usize,
 }
 
-impl ChannelProgress {
-    fn new(channel: Channel<ProgressEventDto>) -> Self {
+impl<T: ProgressChannelEvent> ChannelProgress<T> {
+    pub(crate) fn new(channel: Channel<T>) -> Self {
         Self {
             channel,
             last_entry_emit: Instant::now(),
@@ -90,11 +113,9 @@ impl ChannelProgress {
     }
 }
 
-impl Progress for ChannelProgress {
+impl<T: ProgressChannelEvent> Progress for ChannelProgress<T> {
     fn on_phase(&mut self, phase: Phase) {
-        let _ = self.channel.send(ProgressEventDto::Phase {
-            phase: phase.into(),
-        });
+        let _ = self.channel.send(T::phase(phase.into()));
         // A fresh phase resets the throttle window so its own first Entry (if any) isn't
         // starved by the previous phase's last send.
         self.last_entry_emit = Instant::now();
@@ -108,7 +129,7 @@ impl Progress for ChannelProgress {
         if !(final_entry || strided || timed_out) {
             return;
         }
-        let _ = self.channel.send(ProgressEventDto::Entry { done, total });
+        let _ = self.channel.send(T::entry(done, total));
         self.last_entry_emit = Instant::now();
         self.last_entry_done = done;
     }
@@ -188,11 +209,16 @@ const INTERNAL_RUN_FAILURE_MESSAGE: &str =
     "The backup stopped unexpectedly due to an internal error. Details were logged for diagnosis.";
 
 /// Logs a worker panic host-side (stderr — captured by the launching terminal, or by
-/// `journald`/Flatpak's log sink in a packaged run) and returns the sanitized message that
-/// crosses IPC. The raw panic payload (a `&str`, a `String`, or neither) is extracted here
-/// rather than left to the process-wide panic hook alone, so the *specific* run that failed is
-/// attributed in the log line, not just "a panic happened somewhere."
-fn log_worker_panic(join_error: tokio::task::JoinError) -> String {
+/// `journald`/Flatpak's log sink in a packaged run). The raw panic payload (a `&str`, a
+/// `String`, or neither) is extracted here rather than left to the process-wide panic hook
+/// alone, so the *specific* run that failed is attributed in the log line, not just "a panic
+/// happened somewhere."
+///
+/// `op` names the run kind in the log line (`"backup"`/`"restore"`, issue #103) — the sanitized
+/// message each call site sends over IPC is its own constant (backup's
+/// [`INTERNAL_RUN_FAILURE_MESSAGE`], restore's own in `restore.rs`), never derived from `op` or
+/// the panic payload, so this function's job stops at logging and never touches the wire.
+pub(crate) fn log_worker_panic(op: &str, join_error: tokio::task::JoinError) {
     if join_error.is_panic() {
         let payload = join_error.into_panic();
         let message = payload
@@ -200,14 +226,13 @@ fn log_worker_panic(join_error: tokio::task::JoinError) -> String {
             .map(|s| (*s).to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "<non-string panic payload>".to_string());
-        eprintln!("[linux-backup-gui] backup worker panicked: {message}");
+        eprintln!("[linux-backup-gui] {op} worker panicked: {message}");
     } else {
         // Not a panic (e.g. the runtime shut down mid-task) — still an `Internal`-shaped
         // outcome, but there is no panic payload to extract or log beyond the `JoinError`
         // itself.
-        eprintln!("[linux-backup-gui] backup worker join failed without a panic: {join_error}");
+        eprintln!("[linux-backup-gui] {op} worker join failed without a panic: {join_error}");
     }
-    INTERNAL_RUN_FAILURE_MESSAGE.to_string()
 }
 
 /// Installs a process-wide panic hook that logs host-side before delegating to the previous
@@ -225,12 +250,42 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Recovers a poisoned lock the same way `commands.rs`'s lock helpers do.
-fn lock_cancel(state: &RunCancelState) -> std::sync::MutexGuard<'_, Option<CancelToken>> {
+/// Recovers a poisoned lock the same way `commands.rs`'s lock helpers do. `pub(crate)` so
+/// issue #103's `restore.rs` can share `RunCancelState`'s single slot for `cancel_restore`
+/// rather than duplicating this helper.
+pub(crate) fn lock_cancel(
+    state: &RunCancelState,
+) -> std::sync::MutexGuard<'_, Option<CancelToken>> {
     state
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Atomically claims [`RunCancelState`]'s single slot for a fresh run, or refuses if one is
+/// already in flight — enforcing on the *backend* the "one run at a time" invariant ADR-0008's
+/// run model previously only assumed the frontend would uphold. `run_backup` and `run_restore`
+/// share this exact slot (both are managed as the one `RunCancelState` instance), so this one
+/// guard also rejects a backup and a restore racing each other, not just two of the same kind.
+///
+/// The check-and-set happens under a single lock acquisition, so two concurrent callers can't
+/// both observe `None` and each believe they own the slot — one wins, the other is refused
+/// before it clones anything out of the other managed states or touches `core` at all. Without
+/// this, a second run silently overwrote the slot: the first run's `CancelToken` handle for
+/// `cancel_backup`/`cancel_restore` to find was gone (misrouting Cancel), and — for a restore
+/// blocked on a collision prompt — its [`state::CollisionReplyState`] `Sender` was dropped
+/// too, auto-resolving its prompt to a silent decline the user never answered.
+///
+/// [`state::CollisionReplyState`]: crate::state::CollisionReplyState
+pub(crate) fn try_begin_run(state: &RunCancelState) -> Option<CancelToken> {
+    let mut guard = lock_cancel(state);
+    if guard.is_some() {
+        return None;
+    }
+    let cancel = CancelToken::new();
+    *guard = Some(cancel.clone());
+    drop(guard);
+    Some(cancel)
 }
 
 /// The RUN command (issue #102, ADR-0008 Decision 3): runs `core::backup` on a
@@ -241,12 +296,13 @@ fn lock_cancel(state: &RunCancelState) -> std::sync::MutexGuard<'_, Option<Cance
 /// WHERE step existed yet; this is the first command that overrides it per-run rather than
 /// using the managed default.
 ///
-/// Wrapped in `Result` only because Tauri requires it of any `async` command taking
-/// reference-shaped inputs (every `State<'_, _>` parameter here) — never because this command
-/// has a real error path. Every failure mode (a real `CoreError`, a cooperative cancel, a
-/// worker panic) is already a variant of the `Ok` payload's [`RunOutcomeDto`]; `Err` is
-/// structurally unreachable, kept as [`SerializableCoreError`] only for the same uniform-`Result`
-/// convention `commands.rs`'s six always-`Ok` mutations already establish.
+/// `Result`-wrapped for two reasons now: Tauri requires it of any `async` command taking
+/// reference-shaped inputs (every `State<'_, _>` parameter here), and — since the review that
+/// added [`try_begin_run`] — `Err` is a genuine, reachable outcome: a second run started while
+/// one is already in flight is refused with [`SerializableCoreError::already_running`] before
+/// this command touches `core` at all, rather than silently clobbering the first run's managed
+/// state. Every *other* failure mode (a real `CoreError`, a cooperative cancel, a worker panic)
+/// still rides the `Ok` payload's [`RunOutcomeDto`], unchanged.
 ///
 /// `disallowed_macros` is waived for [`run_backup_impl`]'s whole one-function module rather
 /// than on the function itself: `#[tauri::command]`'s expansion of an `async` fn taking
@@ -264,14 +320,17 @@ pub mod run_backup_impl {
     use tauri::State;
 
     use linux_backup_core::archive::Encryption;
-    use linux_backup_core::{backup, packages::SystemCommandRunner, CancelToken};
+    use linux_backup_core::{backup, packages::SystemCommandRunner};
 
     use crate::error::SerializableCoreError;
     use crate::state::{EncryptionState, RunCancelState, RunContextState, SelectionState};
 
-    use super::{lock_cancel, map_join_result, ChannelProgress, ProgressEventDto, RunOutcomeDto};
+    use super::{
+        lock_cancel, map_join_result, try_begin_run, ChannelProgress, ProgressEventDto,
+        RunOutcomeDto,
+    };
 
-    #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+    #[allow(clippy::needless_pass_by_value)]
     #[tauri::command]
     pub async fn run_backup(
         selection_state: State<'_, SelectionState>,
@@ -281,11 +340,23 @@ pub mod run_backup_impl {
         location: String,
         channel: Channel<ProgressEventDto>,
     ) -> Result<RunOutcomeDto, SerializableCoreError> {
-        // Cloned/pulled out of the managed state up front (mirrors `crates/tui`'s
-        // `BackupRequest`): the worker closure below must own everything it touches, since it
-        // runs on a different thread than the one this `async fn`'s state locks are valid on.
-        // Every `State<'_, _>` parameter is used only in this section, before the `.await`
-        // below — none of their non-`'static` lifetimes needs to survive being held across it.
+        // An owned, `'static` clone of the shared `Arc` (see `RunCancelState`'s doc) — this,
+        // not the `State` wrapper itself, is what gets held across the `.await` below.
+        let cancel_state = cancel_state.inner().clone();
+
+        // Claimed *before* anything else is cloned out of the other managed states (issue
+        // #103 review fix): a run already in flight is refused here, immediately, rather than
+        // this command doing a bunch of work first only to clobber the other run's slot at the
+        // last moment.
+        let Some(cancel) = try_begin_run(&cancel_state) else {
+            return Err(SerializableCoreError::already_running());
+        };
+
+        // Cloned/pulled out of the managed state (mirrors `crates/tui`'s `BackupRequest`): the
+        // worker closure below must own everything it touches, since it runs on a different
+        // thread than the one this `async fn`'s state locks are valid on. Every `State<'_, _>`
+        // parameter is used only in this section, before the `.await` below — none of their
+        // non-`'static` lifetimes needs to survive being held across it.
         let selection = selection_state
             .0
             .lock()
@@ -300,12 +371,6 @@ pub mod run_backup_impl {
         let mut ctx = run_context_state.0.clone();
         ctx.output_location = std::path::PathBuf::from(location);
         let encrypted = encryption.is_encrypted();
-        // An owned, `'static` clone of the shared `Arc` (see `RunCancelState`'s doc) — this,
-        // not the `State` wrapper itself, is what gets held across the `.await` below.
-        let cancel_state = cancel_state.inner().clone();
-
-        let cancel = CancelToken::new();
-        *lock_cancel(&cancel_state) = Some(cancel.clone());
 
         let join_result = tauri::async_runtime::spawn_blocking(move || {
             let mut progress = ChannelProgress::new(channel);
@@ -353,7 +418,8 @@ fn map_join_result(
         Ok(Err(CoreError::Cancelled)) => RunOutcomeDto::Cancelled,
         Ok(Err(error)) => RunOutcomeDto::Failed(SerializableCoreError::from(&error)),
         Err(tauri::Error::JoinError(join_error)) => {
-            RunOutcomeDto::Internal(log_worker_panic(join_error))
+            log_worker_panic("backup", join_error);
+            RunOutcomeDto::Internal(INTERNAL_RUN_FAILURE_MESSAGE.to_string())
         }
         // Any other `tauri::Error` `spawn_blocking`'s `JoinHandle::poll` could in principle
         // surface is just as undiagnosable to the frontend as a panic — treat it the same way
@@ -387,10 +453,11 @@ mod tests {
     use linux_backup_core::manifest::{Manifest, PackageInfo, VanishedEntry, SCHEMA_VERSION};
 
     use super::{
-        backup_outcome_dto, manifest_summary_dto, map_join_result, PhaseDto, ProgressEventDto,
-        RunOutcomeDto, INTERNAL_RUN_FAILURE_MESSAGE,
+        backup_outcome_dto, lock_cancel, manifest_summary_dto, map_join_result, try_begin_run,
+        PhaseDto, ProgressEventDto, RunOutcomeDto, INTERNAL_RUN_FAILURE_MESSAGE,
     };
     use crate::error::SerializableCoreError;
+    use crate::state::RunCancelState;
 
     fn manifest_with(
         entries: usize,
@@ -614,5 +681,51 @@ mod tests {
             }
             other => panic!("expected Internal, got {other:?}"),
         }
+    }
+
+    /// The one-run-at-a-time enforcement (issue #103 review fix): a second caller must be
+    /// refused the slot, never silently overwrite the first run's `CancelToken` — the
+    /// vulnerability the review's trace demonstrated (a clobbered slot misroutes `cancel_*`
+    /// and, for a restore blocked on a collision prompt, auto-resolves it without the user's
+    /// answer). `run_backup`/`run_restore` share this exact `RunCancelState` slot, so this one
+    /// guard covers both a same-kind race and a backup-vs-restore race identically.
+    #[test]
+    fn try_begin_run_refuses_a_second_run_while_one_is_in_flight_without_clobbering_the_first() {
+        let state = RunCancelState::default();
+
+        let first = try_begin_run(&state).expect("the first caller must claim the slot");
+        let second = try_begin_run(&state);
+
+        assert!(
+            second.is_none(),
+            "a second run must be refused while one is already in flight"
+        );
+
+        // The slot must still reference *this exact* first-run token — proving the refused
+        // second attempt never touched it. Cancelling `first` and observing the slot's own
+        // token reflect that is the strongest evidence available short of pointer identity.
+        first.cancel();
+        assert!(
+            lock_cancel(&state)
+                .as_ref()
+                .expect("the slot must still hold the first run's token")
+                .is_cancelled(),
+            "the slot's token must be the same handle as `first`, unclobbered by the refusal"
+        );
+    }
+
+    #[test]
+    fn try_begin_run_allows_a_fresh_run_once_the_slot_is_cleared() {
+        let state = RunCancelState::default();
+
+        let first = try_begin_run(&state).expect("first run claims the slot");
+        *lock_cancel(&state) = None; // the run ended, mirroring `run_backup`'s own cleanup.
+
+        let second = try_begin_run(&state);
+        assert!(
+            second.is_some(),
+            "a fresh run must be allowed once the previous one has cleared the slot"
+        );
+        drop(first);
     }
 }

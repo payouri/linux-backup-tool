@@ -29,6 +29,22 @@ impl From<&CoreError> for SerializableCoreError {
     }
 }
 
+impl SerializableCoreError {
+    /// A GUI-only refusal `core` has no concept of at all (issue #103's review-driven
+    /// one-run-at-a-time enforcement): a second `run_backup`/`run_restore` invocation while
+    /// one is already in flight is rejected with this rather than being allowed to clobber the
+    /// first run's managed `RunCancelState`/`CollisionReplyState` slots. Not built via
+    /// `From<&CoreError>` — there is no such `CoreError` variant, since guarding concurrent
+    /// runs is this crate's command-layer concern, never `core`'s.
+    #[must_use]
+    pub(crate) fn already_running() -> Self {
+        Self {
+            kind: "already_running",
+            message: "another run is already in progress".to_string(),
+        }
+    }
+}
+
 /// A stable tag per [`CoreError`] variant. Matched exhaustively (no catch-all `_`) so a new
 /// `CoreError` variant fails this build rather than silently serializing as an
 /// unrecognizable message-only error.
@@ -117,5 +133,13 @@ mod tests {
 
         assert_eq!(serializable.kind, "cancelled");
         assert_eq!(serializable.message, "run cancelled");
+    }
+
+    #[test]
+    fn already_running_carries_its_own_kind_not_derived_from_any_core_error() {
+        let serializable = SerializableCoreError::already_running();
+
+        assert_eq!(serializable.kind, "already_running");
+        assert_eq!(serializable.message, "another run is already in progress");
     }
 }

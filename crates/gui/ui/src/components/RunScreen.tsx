@@ -4,6 +4,25 @@ import { useSelectionSummary } from '@/hooks/useSelectionSummary'
 import { useWizardStore } from '@/stores/useWizardStore'
 import type { BackupPhase } from '@/types/run'
 
+/**
+ * Extracts a human-readable message from a rejected `invoke()` promise (issue #103 review
+ * fix, mirrored from `RestoreScreen`): a fallible command's `Err` — e.g.
+ * `SerializableCoreError::already_running()`'s `{kind, message}`, reachable now that
+ * `run_backup` shares the one-run-at-a-time slot with `run_restore` — arrives here as the
+ * mutation's `error`, not wrapped in a JS `Error` instance.
+ */
+function errorMessage(error: unknown): string {
+  if (
+    error !== null &&
+    typeof error === 'object' &&
+    'message' in error &&
+    typeof (error as { message: unknown }).message === 'string'
+  ) {
+    return (error as { message: string }).message
+  }
+  return 'The backup could not be started.'
+}
+
 /** The RUN display label for each backup phase — mirrors `crates/tui`'s `run_screen::
  * phase_label` (`Scanning` shows as "Reading", #61's copy sheet), so both surfaces describe
  * the same run the same way. */
@@ -75,6 +94,11 @@ export function RunScreen() {
     return (
       <div className="flex flex-col gap-4">
         <h2 className="text-lg font-semibold">Review</h2>
+        {run.error !== null && (
+          <p role="alert" className="text-destructive text-sm">
+            {errorMessage(run.error)}
+          </p>
+        )}
         {summary.data && (
           <p className="text-sm">
             {summary.data.entryCount} Entries · {formatBytes(summary.data.totalSizeBytes)} ·{' '}

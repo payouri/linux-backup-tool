@@ -69,3 +69,14 @@ impl EncryptionState {
 /// `'static`; the owned `Arc` clone sidesteps that entirely.
 #[derive(Default, Clone)]
 pub struct RunCancelState(pub Arc<Mutex<Option<CancelToken>>>);
+
+/// The blocked restore worker's pending collision-confirm reply slot (issue #103): `Some`
+/// only for the window between `core::restore`'s `CollisionPolicy::Confirm` callback sending
+/// its one-shot `CollisionRequest` and the reply arriving. `run_restore`'s worker thread
+/// stashes the `std::sync::mpsc::Sender` half here immediately before it blocks on the
+/// matching `Receiver`; `resolve_collision` looks here for where to deliver the user's single
+/// yes/no. `Arc`-wrapped for the identical `'static`-across-`.await` reason as
+/// [`RunCancelState`] — `run_restore` is itself an async command holding this across its own
+/// `spawn_blocking().await`.
+#[derive(Default, Clone)]
+pub struct CollisionReplyState(pub Arc<Mutex<Option<std::sync::mpsc::Sender<bool>>>>);

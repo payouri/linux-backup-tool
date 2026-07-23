@@ -17,6 +17,7 @@ mod commands;
 mod dto;
 mod encryption;
 mod error;
+mod restore;
 mod run;
 mod run_context;
 mod state;
@@ -27,13 +28,20 @@ pub use dto::{
 };
 pub use encryption::EncryptionDecision;
 pub use error::SerializableCoreError;
+pub use restore::{
+    OwnershipOutcomeDto, RestoreEventDto, RestoreFailureDto, RestoreOutcomeDto, RestoreProbeDto,
+    RestoreRunOutcomeDto, SkippedCollisionDto,
+};
 pub use run::{BackupOutcomeDto, ManifestSummaryDto, PhaseDto, ProgressEventDto, RunOutcomeDto};
 pub use tree::{category_children, category_nodes, TreeNodeDto, TreeNodeKindDto};
 
 use linux_backup_core::scan::CategoryScan;
 use linux_backup_core::{scan, SelectionModel};
 
-use state::{EncryptionState, RunCancelState, RunContextState, ScanCacheState, SelectionState};
+use state::{
+    CollisionReplyState, EncryptionState, RunCancelState, RunContextState, ScanCacheState,
+    SelectionState,
+};
 
 /// Builds the initial `SelectionModel` a fresh GUI window opens on: `scanned` filtered to
 /// each Category's Smart default — the exact derivation `tui`'s `seed_wizard`
@@ -80,6 +88,7 @@ pub fn run() -> anyhow::Result<()> {
         .manage(ScanCacheState(scanned))
         .manage(EncryptionState::new(encryption_decision))
         .manage(RunCancelState::default())
+        .manage(CollisionReplyState::default())
         .invoke_handler(tauri::generate_handler![
             commands::selection_summary,
             commands::tree,
@@ -97,6 +106,10 @@ pub fn run() -> anyhow::Result<()> {
             commands::where_check,
             run::run_backup_impl::run_backup,
             run::cancel_backup,
+            restore::restore_probe,
+            restore::run_restore_impl::run_restore,
+            restore::cancel_restore,
+            restore::resolve_collision,
         ])
         .run(context)
         .map_err(|err| anyhow::anyhow!("error while running the Tauri application: {err}"))

@@ -53,6 +53,10 @@ export function useBackupRun() {
   const [progress, setProgress] = useState<RunProgress>(INITIAL_PROGRESS)
 
   const mutation = useMutation<RunOutcome, unknown, { location: string }>({
+    // A stable key (issue #103 review fix) so `App.tsx` can observe "a backup is running"
+    // via `useIsMutating` without lifting this hook's own instance up to that level — the
+    // toggle-disabling guard against switching away mid-run.
+    mutationKey: ['run-backup'],
     mutationFn: ({ location }) => {
       setProgress(INITIAL_PROGRESS)
       const channel = new Channel<ProgressEvent>()
