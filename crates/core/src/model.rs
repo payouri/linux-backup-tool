@@ -261,6 +261,57 @@ impl SelectionModel {
         self.total_size_cache.set(None);
     }
 
+    /// Permanently removes a Custom path from the Selection (#106) — distinct from
+    /// `deselect_entry`/`deselect_root`, which only move an Entry into `withheld` for a later
+    /// `reselect_*`. The Entry is dropped from wherever it currently sits, active or withheld,
+    /// so a Custom path can be removed while drilled out (grilling confirmed this must work),
+    /// not only while active.
+    ///
+    /// Also clears any `deselected`/`deselected_roots` entry at or under the removed path.
+    /// Nothing in this model can ever create such an entry *strictly under* a Custom path's own
+    /// relative path in the first place — `add_custom_path`/[`custom_entry`] insert exactly one
+    /// Entry per Custom path, never a scanned Subtree under it (unlike a Category's regular
+    /// Entries), so there is no descendant Entry a nested Drill-down deselection could apply to.
+    /// The one registry entry that *can* exist is an exact-path match — the Custom path itself
+    /// deselected as a Drill-down root (`deselect_root`) or per-file (`deselect_entry`) before
+    /// being removed here. Leaving that stale mark behind would misreport `is_root_deselected`/
+    /// `is_deselected` as true for a path the model no longer has any Entry for at all, and would
+    /// wrongly withhold a *different, brand-new* Entry a later `add_custom_path` at the very same
+    /// path creates — `add_custom_path` inserts straight into `entries` with no
+    /// `is_under_deselected_root` check of its own (unlike `select_category`/`reselect_root`),
+    /// so a leftover `deselected_roots` entry would otherwise silently desync from an Entry that
+    /// is, in fact, active again.
+    ///
+    /// A no-op if no Entry (active or withheld) has `absolute_path` — removing a path never
+    /// added is not an error, and this only ever deletes what the model already holds, so it
+    /// carries none of `catalog::validate_custom_path`'s scope/privilege policy (that governs
+    /// what may be *added*, not what may be deleted).
+    pub fn remove_custom_path(&mut self, absolute_path: &Path) {
+        let is_target = |entry: &&Entry| {
+            entry.category == catalog::CUSTOM_PATHS.name && entry.absolute_path == absolute_path
+        };
+        let Some(relative_path) = self
+            .entries
+            .values()
+            .find(is_target)
+            .or_else(|| self.withheld.values().find(is_target))
+            .map(|entry| entry.relative_path.clone())
+        else {
+            return;
+        };
+
+        let removed_active = self.entries.remove(&relative_path).is_some();
+        let removed_withheld = self.withheld.remove(&relative_path).is_some();
+        if removed_active || removed_withheld {
+            self.total_size_cache.set(None);
+        }
+
+        self.deselected
+            .retain(|path| !path.starts_with(&relative_path));
+        self.deselected_roots
+            .retain(|path| !path.starts_with(&relative_path));
+    }
+
     /// The active (non-deselected) Entries, in path order (the `BTreeMap` key order — #82's
     /// dated ADR-0006 addendum) — what `archive::build` and the Manifest builder actually
     /// consume. Order was scan order before #82 and is now path order; nothing downstream
@@ -1456,6 +1507,108 @@ mod tests {
             1,
             "re-adding the same Custom path must not double-count it"
         );
+    }
+
+    #[test]
+    fn remove_custom_path_drops_an_active_entry_entirely() {
+        let home = Path::new("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+        let path = Path::new("/home/test/projects/notes.md");
+        selection.add_custom_path(path, home);
+        assert_eq!(selection.entries().len(), 1);
+
+        selection.remove_custom_path(path);
+
+        assert!(selection.is_empty());
+        assert!(selection
+            .entries_in_category(catalog::CUSTOM_PATHS.name)
+            .is_empty());
+    }
+
+    #[test]
+    fn remove_custom_path_drops_an_entry_that_is_currently_withheld() {
+        // Grilling confirmed removal must work on a Custom path drilled out (per-file
+        // deselected) rather than only an active one.
+        let home = Path::new("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+        let path = Path::new("/home/test/projects/notes.md");
+        selection.add_custom_path(path, home);
+        selection.deselect_entry(Path::new("projects/notes.md"));
+        assert!(selection.is_empty());
+        assert!(selection.is_deselected(Path::new("projects/notes.md")));
+
+        selection.remove_custom_path(path);
+
+        assert!(selection
+            .entries_in_category(catalog::CUSTOM_PATHS.name)
+            .is_empty());
+        assert!(
+            selection.deselected_paths().is_empty(),
+            "removing a withheld Custom path must also clear its per-file deselection mark"
+        );
+    }
+
+    #[test]
+    fn remove_custom_path_clears_a_root_deselection_at_the_removed_path() {
+        let home = Path::new("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+        // A directory-type Custom path deselected as a whole Drill-down root.
+        let path = Path::new("/home/test/dotfiles");
+        selection.add_custom_path(path, home);
+        selection.deselect_root(Path::new("dotfiles"));
+        assert!(selection.is_root_deselected(Path::new("dotfiles")));
+
+        selection.remove_custom_path(path);
+
+        assert!(
+            !selection.is_root_deselected(Path::new("dotfiles")),
+            "removing the Custom path must clear its own root-deselection mark too"
+        );
+        assert!(selection.deselected_roots().is_empty());
+    }
+
+    #[test]
+    fn remove_custom_path_leaves_no_stale_mark_for_a_later_re_add() {
+        // Regression guard: a leftover `deselected_roots` entry from before the removal must
+        // not silently withhold a brand-new Entry a later `add_custom_path` at the same path
+        // creates — `add_custom_path` has no `is_under_deselected_root` check of its own.
+        let home = Path::new("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+        let path = Path::new("/home/test/dotfiles");
+        selection.add_custom_path(path, home);
+        selection.deselect_root(Path::new("dotfiles"));
+        selection.remove_custom_path(path);
+
+        selection.add_custom_path(path, home);
+
+        assert_eq!(selection.entries().len(), 1);
+        assert!(!selection.is_root_deselected(Path::new("dotfiles")));
+    }
+
+    #[test]
+    fn remove_custom_path_is_a_no_op_for_a_path_never_added() {
+        let mut selection = SelectionModel::new(Vec::new());
+
+        selection.remove_custom_path(Path::new("/home/test/never-added.txt"));
+
+        assert!(selection.is_empty());
+        assert!(selection.deselected_paths().is_empty());
+        assert!(selection.deselected_roots().is_empty());
+    }
+
+    #[test]
+    fn remove_custom_path_invalidates_the_total_size_cache() {
+        let home = Path::new("/home/test");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let notes = tmp.path().join("notes.md");
+        std::fs::write(&notes, b"hello").expect("write file");
+        let mut selection = SelectionModel::new(Vec::new());
+        selection.add_custom_path(&notes, home);
+        assert_eq!(selection.total_size(), 5);
+
+        selection.remove_custom_path(&notes);
+
+        assert_eq!(selection.total_size(), 0);
     }
 
     /// A deep Drill-down tree (#48): several nested levels under one Category, so the
