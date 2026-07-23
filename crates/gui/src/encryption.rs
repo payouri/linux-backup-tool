@@ -51,6 +51,14 @@ impl EncryptionDecision {
         self.encryption.is_encrypted()
     }
 
+    /// The [`Encryption`] a run should be launched with (issue #102) — whatever this decision
+    /// currently holds, `Encryption::None` until a passphrase is committed. The RUN command
+    /// clones this out before handing it to the `spawn_blocking` worker, mirroring
+    /// `crates/tui`'s `BackupRequest::encryption` field.
+    pub fn encryption(&self) -> &Encryption {
+        &self.encryption
+    }
+
     /// Commits a passphrase — the encryption safe harbor (ADR-0007 D5). Once set, the whole
     /// Archive is encrypted, so no later WHAT edit can re-open the step or discard it.
     pub fn set_passphrase(&mut self, passphrase: SecretString) {

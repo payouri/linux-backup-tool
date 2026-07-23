@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import { EncryptionStep } from '@/components/EncryptionStep'
+import { RunScreen } from '@/components/RunScreen'
 import { SelectionSummary } from '@/components/SelectionSummary'
 import { SelectionTree } from '@/components/SelectionTree'
 import { WhereStep } from '@/components/WhereStep'
@@ -10,8 +11,8 @@ import { useWizardStepper } from '@/hooks/useWizardStepper'
 const queryClient = new QueryClient()
 
 /** Renders the current wizard step's body (issue #101: WHAT was already wired by #100; this
- * ticket adds encryption and WHERE, plus the stepper shell around all three). REVIEW is a
- * later ticket's scope (launching the run) — this ticket only needs it reachable, not built. */
+ * ticket adds encryption and WHERE, plus the stepper shell around all three). Issue #102 fills
+ * in REVIEW: launching the backup and watching it run (`RunScreen`). */
 function WizardBody() {
   const { currentStep } = useWizardStepper()
 
@@ -28,7 +29,7 @@ function WizardBody() {
     case 'where':
       return <WhereStep />
     case 'review':
-      return <p className="text-muted-foreground text-sm">Review — coming in a later build.</p>
+      return <RunScreen />
   }
 }
 

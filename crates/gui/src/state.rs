@@ -2,10 +2,10 @@
 //! Decision 2), owned here exactly as the ratatui `App` owns it (ADR-0005 Decision 1). The
 //! React frontend holds only derived/view state and reflects this via `TanStack` Query.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use linux_backup_core::scan::CategoryScan;
-use linux_backup_core::{RunContext, SelectionModel};
+use linux_backup_core::{CancelToken, RunContext, SelectionModel};
 
 use crate::encryption::EncryptionDecision;
 
@@ -52,3 +52,20 @@ impl EncryptionState {
         Self(Mutex::new(decision))
     }
 }
+
+/// The in-flight backup run's [`CancelToken`] (issue #102), `None` between runs. A `Mutex`
+/// rather than a bare `CancelToken` because a run doesn't exist until `run_backup` starts one
+/// — the separate `cancel_backup` command (ADR-0008 Decision 3: front-half-only cancellation
+/// lives on its own command, keeping `Progress` strictly one-way) needs somewhere to find the
+/// *current* run's token without the two commands sharing anything but this slot. Only ever
+/// holds one run's token at a time: the ADR-0008 run model is one `useMutation` per run, so a
+/// second `run_backup` cannot start while this is `Some`.
+///
+/// Wrapped in an `Arc` (unlike [`SelectionState`]/[`EncryptionState`]) so `run_backup` — an
+/// *async* command — can pull an owned, `'static` handle out of the `tauri::State<'_, _>` it's
+/// given (via `.inner().clone()`) before its `spawn_blocking().await`, then use that same handle
+/// again afterward to clear the slot. A bare `State<'_, T>` borrows the invoke call's lifetime,
+/// which cannot survive being held across an `.await` in a future Tauri requires to be
+/// `'static`; the owned `Arc` clone sidesteps that entirely.
+#[derive(Default, Clone)]
+pub struct RunCancelState(pub Arc<Mutex<Option<CancelToken>>>);

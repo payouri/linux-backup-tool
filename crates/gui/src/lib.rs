@@ -5,7 +5,9 @@
 //! one lazy `["selection-summary"]` query command. Issue #100 adds the lazy `["tree",
 //! prefix]` explorer and the seven Selection mutations. Issue #101 adds the encryption step
 //! (a managed gui-side `EncryptionDecision`, ADR-0007's ported "recorded context") and the
-//! WHERE step's collision pre-check.
+//! WHERE step's collision pre-check. Issue #102 adds the RUN model: an async `run_backup`
+//! command driving `core::backup` on a `spawn_blocking` worker, progress over a per-invocation
+//! `tauri::ipc::Channel` (`run.rs`), and the front-half-only `cancel_backup` command.
 //!
 //! `#[cfg(test)]` modules in this crate compile under `--cfg test`, so this allow only ever
 //! applies to them — see `core/src/lib.rs` for the same pattern.
@@ -15,6 +17,7 @@ mod commands;
 mod dto;
 mod encryption;
 mod error;
+mod run;
 mod run_context;
 mod state;
 mod tree;
@@ -24,12 +27,13 @@ pub use dto::{
 };
 pub use encryption::EncryptionDecision;
 pub use error::SerializableCoreError;
+pub use run::{BackupOutcomeDto, ManifestSummaryDto, PhaseDto, ProgressEventDto, RunOutcomeDto};
 pub use tree::{category_children, category_nodes, TreeNodeDto, TreeNodeKindDto};
 
 use linux_backup_core::scan::CategoryScan;
 use linux_backup_core::{scan, SelectionModel};
 
-use state::{EncryptionState, RunContextState, ScanCacheState, SelectionState};
+use state::{EncryptionState, RunCancelState, RunContextState, ScanCacheState, SelectionState};
 
 /// Builds the initial `SelectionModel` a fresh GUI window opens on: `scanned` filtered to
 /// each Category's Smart default — the exact derivation `tui`'s `seed_wizard`
@@ -51,6 +55,12 @@ fn seed_selection(scanned: &[CategoryScan]) -> SelectionModel {
 /// Returns an error if the real machine's `$HOME` cannot be resolved (see
 /// [`run_context::build_run_context`]) or if the Tauri runtime itself fails to start.
 pub fn run() -> anyhow::Result<()> {
+    // Installed once, before anything can panic (issue #102, ADR-0008 Decision 3): keeps a
+    // `spawn_blocking` worker panic diagnosable host-side even though its `Internal` outcome
+    // never leaks the raw message to the webview. Mirrors `crates/tui`'s single-install panic
+    // hook (ADR-0005 Decision 7).
+    run::install_panic_hook();
+
     let ctx = run_context::build_run_context()?;
     let scanned = scan::scan_taxonomy(&ctx);
     let selection = seed_selection(&scanned);
@@ -69,6 +79,7 @@ pub fn run() -> anyhow::Result<()> {
         .manage(RunContextState(ctx))
         .manage(ScanCacheState(scanned))
         .manage(EncryptionState::new(encryption_decision))
+        .manage(RunCancelState::default())
         .invoke_handler(tauri::generate_handler![
             commands::selection_summary,
             commands::tree,
@@ -84,6 +95,8 @@ pub fn run() -> anyhow::Result<()> {
             commands::choose_plaintext,
             commands::home_directory,
             commands::where_check,
+            run::run_backup_impl::run_backup,
+            run::cancel_backup,
         ])
         .run(context)
         .map_err(|err| anyhow::anyhow!("error while running the Tauri application: {err}"))

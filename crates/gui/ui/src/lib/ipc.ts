@@ -8,3 +8,13 @@ import { invoke as tauriInvoke } from '@tauri-apps/api/core'
  * own package from every test file.
  */
 export const invoke = tauriInvoke
+
+/**
+ * Re-exported alongside `invoke` (issue #102) so `useRun`'s progress channel construction goes
+ * through this same one seam — a test mocking `@/lib/ipc` supplies a fake `Channel` class
+ * instead of a real IPC-backed one, exactly as it supplies a fake `invoke`. Re-exported via
+ * `export {…} from` (not a `const` alias) so the name stays usable both as the value
+ * (`new Channel()`) and as the generic type (`Channel<ProgressEvent>`), matching the real
+ * `@tauri-apps/api/core` export's own dual nature.
+ */
+export { Channel } from '@tauri-apps/api/core'
