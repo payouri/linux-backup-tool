@@ -101,9 +101,11 @@ struct CustomInput {
     buffer: String,
     /// The highlighted candidate; clamped to the live candidate count on move.
     ac_selected: usize,
-    /// The candidate cap the most recent `render_custom_field` actually displayed (#87) — see
-    /// `WhereStep::visible_cap`'s twin doc for why `handle_field_key`'s `↓`/`↑` read this instead
-    /// of a `Rect` they never see.
+    /// The candidate cap the most recent `render_custom_field` actually displayed (#87) — a
+    /// deliberate, narrow exception to `App::update`'s "no size-dependent state" rule and
+    /// ADR-0005 D1's pure render, the same shape as this screen's own `size_cache` below. See
+    /// `WhereStep::visible_cap`'s twin doc for the full rationale; `handle_field_key`'s `↓`/`↑`
+    /// read this instead of a `Rect` they never see.
     visible_cap: Cell<usize>,
     /// The reveal-all-dotfiles toggle, flipped by `F3` (#51/#52), mirroring the WHERE field.
     show_hidden: bool,
@@ -373,8 +375,11 @@ impl WhatScreen {
                 if let Some(input) = self.custom_input.as_mut()
                     && !view.candidates.is_empty()
                 {
-                    let cap = view.candidates.len().min(input.visible_cap.get());
-                    input.ac_selected = (input.ac_selected + 1).min(cap.saturating_sub(1));
+                    input.ac_selected = path_autocomplete::clamp_to_visible(
+                        input.ac_selected + 1,
+                        view.candidates.len(),
+                        input.visible_cap.get(),
+                    );
                 }
             }
             KeyCode::Backspace => {

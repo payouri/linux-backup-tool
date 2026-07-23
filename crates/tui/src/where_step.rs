@@ -84,6 +84,13 @@ pub struct WhereStep {
     /// `↓`/`↑` never see the pane's `Rect`, so they read this instead to keep the highlight from
     /// advancing onto a row `candidate_lines` won't draw. Starts at `MAX_CANDIDATE_CAP` — today's
     /// uncapped ceiling — until the first render narrows it to the real pane height.
+    ///
+    /// This is a deliberate, narrow exception to both `App::update`'s "no size-dependent state"
+    /// rule and ADR-0005 D1's pure-render function: `render` is the only place the post-layout
+    /// inner height is known, so it caches that one fact via interior mutability for the next
+    /// key to read — the same shape as `WhatScreen`'s `size_cache` (`what_screen.rs`). If a
+    /// future change threads pane height into `update` some other way (e.g. an `Event::Resize`
+    /// handler), this cache should go with it.
     visible_cap: Cell<usize>,
     /// The reveal-all-dotfiles toggle (#52); the `F3` binding that flips it is #73's.
     show_hidden: bool,
@@ -201,8 +208,11 @@ impl WhereStep {
             KeyCode::Down => {
                 let view = self.autocomplete(getenv);
                 if !view.candidates.is_empty() {
-                    let cap = view.candidates.len().min(self.visible_cap.get());
-                    self.ac_selected = (self.ac_selected + 1).min(cap.saturating_sub(1));
+                    self.ac_selected = path_autocomplete::clamp_to_visible(
+                        self.ac_selected + 1,
+                        view.candidates.len(),
+                        self.visible_cap.get(),
+                    );
                 }
             }
             KeyCode::Enter => self.accept_or_commit(getenv),

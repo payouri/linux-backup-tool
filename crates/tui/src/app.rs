@@ -246,7 +246,9 @@ impl App {
     /// delivered only while a screen is polling and advances whichever flow is running (the RUN
     /// spinner or the restore flow's channel drain). Resizes are folded so the loop repaints;
     /// the reflow tier is recomputed from the frame at render time, so there is no
-    /// size-dependent state to store.
+    /// size-dependent state to store here — the one deliberate exception is the WHAT/WHERE
+    /// custom-path fields' `visible_cap` (#87), cached by `render` itself since it alone knows
+    /// the post-layout inner height (see [`crate::where_step::WhereStep`]'s `visible_cap` doc).
     #[must_use]
     pub fn update(mut self, event: Event) -> Self {
         // A poll tick advances whichever flow is running: the RUN spinner (so an indeterminate
