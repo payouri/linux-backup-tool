@@ -30,6 +30,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::TryRecvError;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use linux_backup_core::model::{DirectoryState, Entry, EntryType, SelectionModel};
@@ -42,8 +43,25 @@ use ratatui::Frame;
 
 use crate::glyphs::Glyphs;
 use crate::path_autocomplete::{self, Autocomplete, Getenv};
+use crate::pending_probe::PendingProbe;
 use crate::reflow::{self, BreadcrumbWidth};
 use crate::wizard::WizardState;
+
+/// One result a WHAT probe can resolve to — mirrors [`crate::run_screen::RunMessage`]'s shape
+/// (ADR-0009 D1): a single channel carries whichever op kind was in flight, so [`WhatScreen`]
+/// doesn't need a probe-kind-specific channel per op. No production probe is requested through
+/// this yet — which ops ride it is [#96](https://github.com/payouri/linux-backup-tool/issues/96);
+/// this ticket lands the spine only. Neither variant is constructed outside this module's own
+/// tests yet — see [`WhatScreen::set_pending_probe`].
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhatProbeResult {
+    /// A single subtree's on-disk size, keyed by its absolute path (a candidate for #96's
+    /// per-file `fs_probe::subtree_size` probe).
+    Size(PathBuf, u64),
+    /// The whole Selection's on-disk size (a candidate for #96's `total_size` probe).
+    TotalSize(u64),
+}
 
 /// The always-shown Custom-paths Category (CONTEXT.md's "Custom path", story 6) — its left-pane
 /// row is the entry point for the autocomplete add field (#50 / #75).
@@ -71,7 +89,11 @@ enum Pane {
 /// The persistent view state of the WHAT screen. The Category universe is captured once at
 /// construction so a Category toggled fully off (its Entries withheld, not dropped) keeps its
 /// row rather than vanishing from the left pane.
-#[derive(Debug, Clone, Default)]
+///
+/// Not `Clone`: [`Self::pending_probe`] owns a live worker channel that has no meaningful copy
+/// (mirroring [`crate::app::View`]'s own not-`Clone` rationale), so [`Wizard`](crate::wizard::Wizard)
+/// — which holds a `WhatScreen` — isn't `Clone` either.
+#[derive(Debug, Default)]
 pub struct WhatScreen {
     focus: Pane,
     category_cursor: usize,
@@ -89,6 +111,15 @@ pub struct WhatScreen {
     /// Memoized `absolute_path -> on-disk size` (#83) — see [`cached_subtree_size`]'s doc for
     /// why this needs interior mutability (`render` only ever holds `&WhatScreen`).
     size_cache: RefCell<HashMap<PathBuf, u64>>,
+    /// The single in-flight WHAT probe, if any (ADR-0009 D2): replaced, never queued, when a
+    /// new one is requested — see [`WhatScreen::tick`]. `None` outside a pending probe is also
+    /// when [`crate::app::App::needs_poll`] stops polling for WHAT. No production request path
+    /// exists yet (#96); this ticket lands the spine only.
+    pending_probe: Option<PendingProbe<WhatProbeResult>>,
+    /// Bumped once per poll tick while a probe is pending (mirroring `RunScreen`'s own
+    /// `spinner_tick`, `run_screen.rs`), so a future debounced spinner (#94) has a live frame
+    /// counter to animate on.
+    spinner_tick: usize,
 }
 
 /// The view state of the Custom-path add field — the buffer plus its autocomplete cursor and
@@ -160,6 +191,53 @@ impl WhatScreen {
     #[must_use]
     pub fn is_typing(&self) -> bool {
         self.custom_input.is_some()
+    }
+
+    /// Whether a WHAT probe is currently in flight (ADR-0009 D2) — the signal
+    /// [`crate::app::App::needs_poll`] checks to keep the runtime's poll loop alive for WHAT's
+    /// own slow ops, on top of the existing backup/restore disjuncts. `false` whenever nothing
+    /// is pending, which is also WHAT's steady state today: no production op requests a probe
+    /// yet (#96 wires the first one), so outside of a test-injected probe this never joins the
+    /// poll loop at all.
+    #[must_use]
+    pub fn has_pending_probe(&self) -> bool {
+        self.pending_probe.is_some()
+    }
+
+    /// Advances WHAT's own poll loop by one tick (ADR-0009 D2), mirroring
+    /// `drain_backup_worker`/`RunScreen::tick` (`run_screen.rs`): a non-blocking `try_recv` that,
+    /// on success, folds the resolved [`WhatProbeResult`] into the relevant cache and clears the
+    /// pending slot, plus a `spinner_tick` bump so a future debounced spinner (#94) has a live
+    /// frame to animate on. A disconnected channel (an abandoned worker) also clears the slot —
+    /// there is nothing further to wait on. A no-op when nothing is pending, so calling this on
+    /// every tick regardless of view is harmless (`App::update` does exactly that).
+    pub fn tick(&mut self) {
+        let Some(probe) = &self.pending_probe else {
+            return;
+        };
+        match probe.try_recv() {
+            Ok(result) => {
+                self.pending_probe = None;
+                self.apply_probe_result(result);
+            }
+            Err(TryRecvError::Empty) => {}
+            // The worker panicked, or its send raced a replacement that already cleared this
+            // slot — either way there is nothing further to wait on.
+            Err(TryRecvError::Disconnected) => self.pending_probe = None,
+        }
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+    }
+
+    /// Folds one resolved [`WhatProbeResult`] into its cache. `TotalSize` has no cache slot yet
+    /// (#96 decides where it lives); the variant exists so the channel can already carry it once
+    /// a producer lands.
+    fn apply_probe_result(&mut self, result: WhatProbeResult) {
+        match result {
+            WhatProbeResult::Size(path, size) => {
+                self.size_cache.borrow_mut().insert(path, size);
+            }
+            WhatProbeResult::TotalSize(_) => {}
+        }
     }
 
     /// The pure reducer for the WHAT step's own keys. Global chords (`Ctrl-→`/`Ctrl-←`, `1`–`4`,
@@ -1160,6 +1238,17 @@ fn scroll_offset(height: u16, cursor: usize) -> u16 {
         return 0;
     }
     u16::try_from(cursor - height + 1).unwrap_or(u16::MAX)
+}
+
+#[cfg(test)]
+impl WhatScreen {
+    /// Test-only: injects a probe directly into the pending slot, standing in for the request
+    /// path a real WHAT op will call once one is wired through (#96). Lets other modules' tests
+    /// (`app.rs`'s `needs_poll`/`Tick` coverage, via [`crate::wizard::Wizard::what_mut`]) set up
+    /// a pending-probe scenario without a production trigger to hang it off yet.
+    pub(crate) fn set_pending_probe(&mut self, probe: PendingProbe<WhatProbeResult>) {
+        self.pending_probe = Some(probe);
+    }
 }
 
 #[cfg(test)]
@@ -2180,5 +2269,94 @@ mod tests {
             "finding covering roots for 40,000 paths took {elapsed:?} — the O(roots × paths) \
              freeze (#110) is back"
         );
+    }
+
+    #[test]
+    fn has_pending_probe_defaults_to_false() {
+        // The steady state (ADR-0009 D2): no production op requests a probe yet, so a freshly
+        // built screen never joins the poll loop.
+        let screen = WhatScreen::default();
+        assert!(!screen.has_pending_probe());
+    }
+
+    #[test]
+    fn tick_drains_a_resolved_probe_into_the_size_cache_and_clears_the_slot() {
+        let mut screen = WhatScreen::default();
+        let path = PathBuf::from("/home/tester/big-file");
+        screen.set_pending_probe(PendingProbe::spawn({
+            let path = path.clone();
+            move || WhatProbeResult::Size(path, 4096)
+        }));
+        assert!(screen.has_pending_probe());
+
+        wait_for_drain(&mut screen);
+
+        assert!(
+            !screen.has_pending_probe(),
+            "expected the resolved probe to clear the pending slot"
+        );
+        assert_eq!(screen.size_cache.borrow().get(&path), Some(&4096));
+    }
+
+    #[test]
+    fn tick_is_a_no_op_without_a_pending_probe() {
+        let mut screen = WhatScreen::default();
+        let spinner_before = screen.spinner_tick;
+        screen.tick();
+        assert!(!screen.has_pending_probe());
+        assert_eq!(
+            screen.spinner_tick, spinner_before,
+            "the spinner must not advance outside a pending probe"
+        );
+    }
+
+    #[test]
+    fn a_new_pending_probe_replaces_rather_than_queues_the_old_one() {
+        let mut screen = WhatScreen::default();
+        let stale_path = PathBuf::from("/home/tester/stale");
+        let fresh_path = PathBuf::from("/home/tester/fresh");
+
+        // The stale probe blocks until released, so it is still unresolved (guaranteed "in
+        // flight") at the moment it is replaced below.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        screen.set_pending_probe(PendingProbe::spawn({
+            let stale_path = stale_path.clone();
+            move || {
+                let _ = release_rx.recv();
+                WhatProbeResult::Size(stale_path, 111)
+            }
+        }));
+        // Replacing the slot drops the stale `PendingProbe` — and its `Receiver` — outright;
+        // there is no queue holding both requests in flight (ADR-0009 D2).
+        screen.set_pending_probe(PendingProbe::spawn({
+            let fresh_path = fresh_path.clone();
+            move || WhatProbeResult::Size(fresh_path, 222)
+        }));
+        // Let the abandoned stale worker finish and attempt its now-nowhere `send`.
+        let _ = release_tx.send(());
+
+        wait_for_drain(&mut screen);
+
+        assert!(!screen.has_pending_probe());
+        assert_eq!(
+            screen.size_cache.borrow().get(&fresh_path),
+            Some(&222),
+            "expected the replacement probe's result to land in the cache"
+        );
+        assert_eq!(
+            screen.size_cache.borrow().get(&stale_path),
+            None,
+            "the replaced probe's result must never surface"
+        );
+    }
+
+    /// Ticks `screen` until its pending probe drains or a bounded deadline passes — avoids a
+    /// fixed `sleep` racing the worker thread's own scheduling.
+    fn wait_for_drain(screen: &mut WhatScreen) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while screen.has_pending_probe() && std::time::Instant::now() < deadline {
+            screen.tick();
+            std::thread::yield_now();
+        }
     }
 }

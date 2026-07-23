@@ -375,7 +375,10 @@ fn sensitive_set(selection: &SelectionModel) -> BTreeSet<PathBuf> {
 
 /// The wizard view: the persistent [`WizardState`], which step is current, and the transient
 /// gate banner. This owns the pure `handle_key` reducer; the render lives in [`crate::app`].
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: [`WhatScreen`] holds a live worker channel once a probe is pending (ADR-0009),
+/// which has no meaningful copy — see its own doc for the full rationale.
+#[derive(Debug)]
 pub struct Wizard {
     state: WizardState,
     current: WizardStep,
@@ -415,6 +418,14 @@ impl Wizard {
     #[must_use]
     pub fn what(&self) -> &WhatScreen {
         self.what.as_ref()
+    }
+
+    /// Forwards one poll tick into the WHAT step (ADR-0009 D2), regardless of which step is
+    /// currently active — WHAT's pending probe outlives a step jump away from it, so
+    /// `App::update`'s `Event::Tick` arm must keep draining it until it resolves even while the
+    /// wizard is showing a different step.
+    pub fn tick_what(&mut self) {
+        self.what.tick();
     }
 
     /// The encryption step's view state, for its render (build #69).
@@ -663,6 +674,17 @@ impl Wizard {
         if let Some(next) = WizardStep::Encryption.next() {
             self.current = next;
         }
+    }
+}
+
+#[cfg(test)]
+impl Wizard {
+    /// Test-only mutable access to the WHAT step's view state, so other modules' tests (e.g.
+    /// `app::needs_poll`/`Event::Tick` coverage) can set up a pending-probe scenario via
+    /// [`WhatScreen::set_pending_probe`] without a production request path to hang it off yet
+    /// (#96).
+    pub(crate) fn what_mut(&mut self) -> &mut WhatScreen {
+        &mut self.what
     }
 }
 

@@ -25,6 +25,7 @@ mod glyphs;
 mod help;
 mod keymap;
 mod path_autocomplete;
+mod pending_probe;
 mod reflow;
 mod restore_screen;
 mod run_screen;
