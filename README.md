@@ -1,6 +1,8 @@
 # linux-backup-tool
 
-An interactive Rust tool for backing up and restoring a Linux user's environment.
+An interactive Rust tool for backing up and restoring a Linux user's environment,
+offered through two front ends over one engine: a **terminal wizard** (`tui`) and a
+**desktop GUI** (`gui`, Tauri).
 
 Backs up program configs, SSH keys, KDE Plasma layouts, shell configs and plugins,
 user directories, installed-package manifests, and user-supplied custom paths — with
@@ -12,23 +14,31 @@ drive, and a manifest that records what was backed up so it can later be restore
 
 ## How it works
 
-`linux-backup` is a forward-only terminal wizard: it scans your machine, proposes a
-smart-default selection you refine, insists on encryption when the selection contains
-anything sensitive, lets you pick where the backup lands, and writes a single
-self-describing backup directory. Restore reads that directory back — verifying its
-integrity, re-rooting home-tagged files under the restoring user, and preserving
-ownership and permissions.
+Backup is a forward-only flow: it scans your machine, proposes a smart-default
+selection you refine, insists on encryption when the selection contains anything
+sensitive, lets you pick where the backup lands, and writes a single self-describing
+backup directory. Restore reads that directory back — verifying its integrity,
+re-rooting home-tagged files under the restoring user, and preserving ownership and
+permissions.
 
 ```
 WHAT ──▶ [encryption] ──▶ WHERE ──▶ REVIEW ──▶ RUN
 scan     auto-insist       pick       confirm    tar│zstd│age
 ```
 
+Both front ends walk this same flow over the one authoritative `core::SelectionModel`,
+so they agree on what "selected" means for identical inputs. The terminal wizard is
+right for headless/SSH boxes; the desktop GUI adds an explorer/tree view with real
+multi-select for drilling into large directories. Neither surface holds selection
+logic of its own — a behavior change in `core` shows up identically in both.
+
 Each backup produces one directory named `linux-backup-<host>-<timestamp>/` containing
 the compressed (optionally encrypted) archive and a `manifest.json` describing exactly
 what was captured.
 
-## Commands
+## Interfaces
+
+### Terminal — `linux-backup`
 
 ```
 usage: linux-backup backup
@@ -44,23 +54,37 @@ usage: linux-backup backup
 | `select` | The standalone WHAT screen — the interactive category/entry checklist, on its own. |
 | `where` | The standalone WHERE screen — the interactive output-location picker, on its own. |
 
+### Desktop — GUI
+
+A windowed Tauri app presenting the same wizard as point-and-click screens: an
+explorer/tree WHAT view with tri-state (All/Partial/None) directories and multi-select
+drill-down, the encryption and WHERE steps, a live backup RUN screen (phase +
+per-entry progress, front-half cancel), and a Restore screen (backup-dir pick,
+encrypted detection, collision confirmation, partial/ownership/`reinstall.sh`
+reporting). It ships on Linux as a **Flatpak** (canonical, with a pinned sandboxed
+WebKitGTK) and an **AppImage** fallback — see [`docs/gui-packaging.md`](docs/gui-packaging.md).
+Run it from source with `cargo tauri dev` (see [Building](#building)).
+
 ## Architecture
 
-A two-crate Cargo workspace with a compiler-enforced split
-([ADR-0001](docs/adr/0001-core-tui-split-no-dedup-trait.md)): all domain logic lives in
-`core`, which carries **zero UI dependencies**; `tui` is a thin view on top.
+A three-crate Cargo workspace with a compiler-enforced split
+([ADR-0001](docs/adr/0001-core-tui-split-no-dedup-trait.md),
+[ADR-0008](docs/adr/0008-gui-tauri-entry-point-core-boundary.md)): all domain logic
+lives in `core`, which carries **zero UI dependencies**; `tui` and `gui` are
+independent thin views on top, sharing no code with each other.
 
 ```
 crates/
 ├── core/   linux-backup-core — UI-free domain library (#![forbid(unsafe_code)])
-└── tui/    tui — inquire-based terminal wizard → binary `linux-backup`
+├── tui/    tui — inquire-based terminal wizard → binary `linux-backup`
+└── gui/    linux-backup-gui — Tauri desktop app (Rust backend + React frontend in ui/)
 ```
 
 `core` reads **nothing** from the ambient system: every run fact (`home`, output
 location, privilege, `host`, `user`, `uid`, `os`, `now`) arrives through an injected
-`RunContext` ([ADR-0004](docs/adr/0004-core-runcontext-injection.md)). `tui`'s `main`
-fills that context from the real machine; tests fill it with fixed values, which makes
-the round-trip seam fully deterministic.
+`RunContext` ([ADR-0004](docs/adr/0004-core-runcontext-injection.md)). Each front end's
+entry point fills that context from the real machine; tests fill it with fixed values,
+which makes the round-trip seam fully deterministic.
 
 ### `core` — the domain library
 
@@ -102,12 +126,42 @@ loops, rendering, and cursor state — every decision is delegated to `core`.
 | `restore_cmd` | Orchestrates `core::restore`, prompting for the passphrase *before* any file is touched. |
 | `system` | Builds a real `RunContext` from the actual machine (`$HOME`, hostname, uid/euid privilege, OS, wall clock). |
 
+### `gui` — the desktop app
+
+A [Tauri](https://tauri.app/) 2.x app depending on `core` only: a Rust backend under
+`crates/gui/src/` and a co-located React + Tailwind + shadcn + TanStack Query frontend
+under `crates/gui/ui/`. The backend owns the authoritative `SelectionModel` as managed
+Tauri state and exposes it over a JSON IPC boundary
+([ADR-0008](docs/adr/0008-gui-tauri-entry-point-core-boundary.md)); `core` stays
+synchronous and gains no serde derives.
+
+| Layer | Responsibility |
+| --- | --- |
+| `src/commands` | A thin 1:1 mirror of `SelectionModel`'s mutations plus lazy per-prefix `["tree", …]` / selection-summary queries. Mutations invalidate query keys rather than returning derived state; the command layer holds **no** selection logic. |
+| `src/{run,restore}` | The async run model: `core::backup`/`restore` run via `spawn_blocking`, progress streams over a per-invocation typed channel, cancellation flows through a `CancelToken`, and restore bridges the collision confirmation as a request→response over IPC. |
+| `src/{dto,error}` | `Serialize` view DTOs built from `core`'s plain accessors via `From`, and the single lossy `SerializableCoreError` — the only error type that crosses IPC. |
+| `ui/` | The React screens (explorer tree, wizard, RUN, Restore) reflecting `core` state via TanStack Query; the tree uses a virtualized, multi-select, keyboard-navigable component for 10k+ nodes. |
+
 ## Building
 
 ```sh
-cargo build --release          # binary at target/release/linux-backup
+cargo build --release          # terminal binary at target/release/linux-backup
 cargo run -p tui -- backup     # run the wizard from source
 ```
+
+The desktop GUI is driven through the Tauri CLI from `crates/gui/` (a dev-time
+`webkit2gtk-4.1` build dependency and Node.js are required; `cargo tauri dev` runs
+against host WebKitGTK):
+
+```sh
+cd crates/gui
+npm --prefix ui install        # first time only
+cargo tauri dev                # launch the GUI against source
+cargo tauri build --bundles appimage   # produce the AppImage fallback
+```
+
+For the canonical Flatpak build and the CI packaging pipeline, see
+[`docs/gui-packaging.md`](docs/gui-packaging.md).
 
 ### Development gates
 
