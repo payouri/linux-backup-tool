@@ -26,7 +26,7 @@
 //! the only I/O is the per-file size probe, which goes through `core`'s `fs_probe` rather than
 //! touching the disk directly (ADR-0005 D6).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -95,14 +95,32 @@ pub struct WhatScreen {
 /// reveal-hidden toggle. The engine over it is the shared [`crate::path_autocomplete`]; the run
 /// facts it needs (`home`, `privilege`, `getenv`) arrive per-call from [`crate::app`] rather than
 /// being stored, so this screen holds no ambient run state (ADR-0004).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct CustomInput {
     /// The literal buffer — `~`/`$VAR` preserved, expansion at the `tui` boundary (ADR-0004).
     buffer: String,
     /// The highlighted candidate; clamped to the live candidate count on move.
     ac_selected: usize,
+    /// The candidate cap the most recent `render_custom_field` actually displayed (#87) — see
+    /// `WhereStep::visible_cap`'s twin doc for why `handle_field_key`'s `↓`/`↑` read this instead
+    /// of a `Rect` they never see.
+    visible_cap: Cell<usize>,
     /// The reveal-all-dotfiles toggle, flipped by `F3` (#51/#52), mirroring the WHERE field.
     show_hidden: bool,
+}
+
+impl Default for CustomInput {
+    /// `visible_cap` starts at `MAX_CANDIDATE_CAP` — today's uncapped ceiling — until the field's
+    /// first render narrows it to the real pane height (#87); `#[derive(Default)]` would instead
+    /// zero it, wrongly pinning `↓`/`↑` to the first candidate before any render ever runs.
+    fn default() -> Self {
+        Self {
+            buffer: String::new(),
+            ac_selected: 0,
+            visible_cap: Cell::new(path_autocomplete::MAX_CANDIDATE_CAP),
+            show_hidden: false,
+        }
+    }
 }
 
 impl WhatScreen {
@@ -355,7 +373,8 @@ impl WhatScreen {
                 if let Some(input) = self.custom_input.as_mut()
                     && !view.candidates.is_empty()
                 {
-                    input.ac_selected = (input.ac_selected + 1).min(view.candidates.len() - 1);
+                    let cap = view.candidates.len().min(input.visible_cap.get());
+                    input.ac_selected = (input.ac_selected + 1).min(cap.saturating_sub(1));
                 }
             }
             KeyCode::Backspace => {
@@ -414,6 +433,7 @@ impl WhatScreen {
             Some(input) => path_autocomplete::compute(
                 &input.buffer,
                 input.ac_selected,
+                input.visible_cap.get(),
                 input.show_hidden,
                 home,
                 privilege,
@@ -948,6 +968,13 @@ fn render_custom_field(
     let Some(input) = &screen.custom_input else {
         return;
     };
+
+    // Cache the real, currently-known display cap (#87) before computing the view, so
+    // `custom_autocomplete`'s `compute` call — and any `↓`/`↑` press after this frame — clamp the
+    // highlight to what this same render is about to show.
+    input
+        .visible_cap
+        .set(path_autocomplete::candidate_cap(inner.height as usize));
 
     let dim = Style::default().add_modifier(Modifier::DIM);
     let view = screen.custom_autocomplete(home, privilege, getenv);
@@ -1897,6 +1924,43 @@ mod tests {
         );
         assert!(joined.contains("~/Doc"), "the live buffer: {joined}");
         assert!(joined.contains("Documents"), "a candidate row: {joined}");
+    }
+
+    #[test]
+    fn down_cannot_select_a_candidate_past_the_short_pane_display_cap() {
+        // #87: same clamp as the WHERE field's twin regression test, over the shared engine's
+        // second caller — a short pane's adaptive cap must keep `↓` from advancing the highlight
+        // onto a row `candidate_lines` won't draw.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        for i in 0..(path_autocomplete::MAX_CANDIDATE_CAP + 5) {
+            std::fs::create_dir(home.join(format!("dir{i:02}"))).expect("fixture dir");
+        }
+        let mut state = WizardState::new(SelectionModel::new(vec![]), Some(home.to_path_buf()));
+        let mut screen = WhatScreen::new(state.selection());
+        screen.custom_input = Some(CustomInput {
+            buffer: "~/".to_string(),
+            ..Default::default()
+        });
+        // Prime the display-cap cache the way the real redraw-on-event loop would: a render
+        // always precedes the next key (runtime.rs's `run_loop`).
+        render_field_lines(&screen, &state, home, 90, 14);
+        for _ in 0..(path_autocomplete::MAX_CANDIDATE_CAP + 5) {
+            screen.handle_field_key(
+                key(KeyCode::Down),
+                &mut state,
+                home,
+                Privilege::NonRoot,
+                &no_env,
+            );
+        }
+        let lines = render_field_lines(&screen, &state, home, 90, 14);
+        let joined = lines.join("\n");
+        assert_eq!(
+            joined.matches('←').count(),
+            1,
+            "exactly one visible row must carry the highlight cursor: {joined}"
+        );
     }
 
     #[test]

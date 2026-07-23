@@ -74,9 +74,15 @@ impl Autocomplete {
 /// Computes the live candidate listing for `buffer`, applying scope, dotfile hiding, prefix
 /// narrowing, and dirs-first ordering. The directory listing itself is `core`'s (ADR-0005 D6);
 /// everything here is presentation/policy over what it returns.
+///
+/// `display_cap` is the caller's most-recently-rendered [`candidate_cap`] (#87): `selected` is
+/// clamped to it in addition to the raw candidate count, so a candidate `candidate_lines` won't
+/// draw can never be the one `ghost`/`accept_ghost` act on — highlight and window never diverge,
+/// even right after a resize shrinks the pane before any `↓`/`↑` press re-clamps it.
 pub(crate) fn compute(
     buffer: &str,
     ac_selected: usize,
+    display_cap: usize,
     show_hidden: bool,
     home: &Path,
     privilege: Privilege,
@@ -127,7 +133,8 @@ pub(crate) fn compute(
 
     let total = matched.len();
     matched.truncate(MAX_CANDIDATE_CAP);
-    let selected = ac_selected.min(matched.len().saturating_sub(1));
+    let selectable = matched.len().min(display_cap);
+    let selected = ac_selected.min(selectable.saturating_sub(1));
     Autocomplete {
         candidates: matched,
         selected,

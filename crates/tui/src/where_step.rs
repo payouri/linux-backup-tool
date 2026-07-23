@@ -23,6 +23,7 @@
 //! lexical (matching `catalog::validate_custom_path`): an out-of-scope path offers no candidates
 //! and shows `⚠ outside ~`.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::KeyCode;
@@ -79,6 +80,11 @@ pub struct WhereStep {
     buffer: String,
     /// The highlighted autocomplete candidate; clamped to the live candidate count on move.
     ac_selected: usize,
+    /// The candidate cap the most recent `render` actually displayed (#87). `handle_typing`'s
+    /// `↓`/`↑` never see the pane's `Rect`, so they read this instead to keep the highlight from
+    /// advancing onto a row `candidate_lines` won't draw. Starts at `MAX_CANDIDATE_CAP` — today's
+    /// uncapped ceiling — until the first render narrows it to the real pane height.
+    visible_cap: Cell<usize>,
     /// The reveal-all-dotfiles toggle (#52); the `F3` binding that flips it is #73's.
     show_hidden: bool,
     chosen: Option<Chosen>,
@@ -103,6 +109,7 @@ impl WhereStep {
             mode: Mode::Picking,
             buffer: String::new(),
             ac_selected: 0,
+            visible_cap: Cell::new(path_autocomplete::MAX_CANDIDATE_CAP),
             show_hidden: false,
             chosen: None,
             home: ctx.home.clone(),
@@ -122,6 +129,7 @@ impl WhereStep {
             mode: Mode::Picking,
             buffer: String::new(),
             ac_selected: 0,
+            visible_cap: Cell::new(path_autocomplete::MAX_CANDIDATE_CAP),
             show_hidden: false,
             chosen: None,
             home: PathBuf::new(),
@@ -193,7 +201,8 @@ impl WhereStep {
             KeyCode::Down => {
                 let view = self.autocomplete(getenv);
                 if !view.candidates.is_empty() {
-                    self.ac_selected = (self.ac_selected + 1).min(view.candidates.len() - 1);
+                    let cap = view.candidates.len().min(self.visible_cap.get());
+                    self.ac_selected = (self.ac_selected + 1).min(cap.saturating_sub(1));
                 }
             }
             KeyCode::Enter => self.accept_or_commit(getenv),
@@ -275,6 +284,7 @@ impl WhereStep {
         path_autocomplete::compute(
             &self.buffer,
             self.ac_selected,
+            self.visible_cap.get(),
             self.show_hidden,
             &self.home,
             self.privilege,
@@ -351,6 +361,11 @@ impl WhereStep {
         };
 
         if self.mode == Mode::Typing {
+            // Cache the real, currently-known display cap (#87) before computing the view, so
+            // `autocomplete`'s `compute` call — and any `↓`/`↑` press after this frame — clamp the
+            // highlight to what this same render is about to show.
+            self.visible_cap
+                .set(path_autocomplete::candidate_cap(area.height as usize));
             let view = self.autocomplete(getenv);
             let ghost = self.ghost(&view);
             let mut field = vec![
@@ -476,6 +491,7 @@ mod tests {
             mode: Mode::Typing,
             buffer: String::new(),
             ac_selected: 0,
+            visible_cap: Cell::new(path_autocomplete::MAX_CANDIDATE_CAP),
             show_hidden: false,
             chosen: None,
             home: home.to_path_buf(),
@@ -811,6 +827,33 @@ mod tests {
             lines.iter().any(|l| l.contains("+3 more — keep typing")),
             "expected the adaptive-cap footer to read +3 more, got: {lines:?}"
         );
+    }
+
+    #[test]
+    fn down_cannot_select_a_candidate_past_the_short_pane_display_cap() {
+        // #87: a 14-row pane's adaptive cap (9) is below the 12 candidates on disk, so `↓` must
+        // stop at the last *displayed* row rather than walking on to a row `candidate_lines`
+        // truncates away — the bug left the cursor glyph rendering nowhere once that happened.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for i in 0..12 {
+            fs::create_dir(tmp.path().join(format!("dir{i:02}"))).expect("create dir");
+        }
+        let mut step = typing_step(tmp.path());
+        step.buffer = "~/".to_string();
+        // Prime the display-cap cache the way the real redraw-on-event loop would: a render
+        // always precedes the next key (runtime.rs's `run_loop`).
+        render_lines(&step, 0, 70, 14);
+        for _ in 0..12 {
+            step.handle_key(key(KeyCode::Down), &no_env);
+        }
+        let lines = render_lines(&step, 0, 70, 14);
+        let joined = lines.join("\n");
+        assert_eq!(
+            joined.matches('←').count(),
+            1,
+            "exactly one visible row must carry the highlight cursor: {joined}"
+        );
+        assert!(joined.contains("dir08"), "the clamped candidate: {joined}");
     }
 
     #[test]
