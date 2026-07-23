@@ -20,6 +20,9 @@ reversed, add a new ADR and mark the old one `Superseded by 000N` — don't edit
 - [`0008`](0008-gui-tauri-entry-point-core-boundary.md) — the second entry point is a Tauri GUI in
   `crates/gui` consuming a synchronous `core` over a JSON IPC boundary. Reaffirms 0001; the GUI
   analogue of 0005.
+- [`0009`](0009-what-step-worker-model-debounced-spinner.md) — the WHAT step gets a generic
+  `PendingProbe<T>` worker primitive and a 375ms debounced spinner for slow disk probes. Amends
+  0005's worker+channel+Tick pattern.
 
 ## Behavior — backup/restore policy and feature capture
 
