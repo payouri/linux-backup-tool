@@ -187,13 +187,10 @@ For the canonical Flatpak build and the CI packaging pipeline, see
 
 ### Development gates
 
-Every change must pass:
-
-```sh
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-```
+Five gates — `fmt`, `clippy`, `test`, the 1.95.0 MSRV floor, and the frontend's
+lint/test/type-check — mirroring the jobs in `.github/workflows/ci.yml` one-to-one. The exact
+commands live in [`AGENTS.md`](AGENTS.md#validation-gate) rather than being copied here, so the
+two can't drift.
 
 ## Domain model & decisions
 

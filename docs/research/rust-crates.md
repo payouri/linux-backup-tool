@@ -7,6 +7,22 @@ Bias: MVP simplicity, healthy/well-maintained crates.
 
 Versions and stats confirmed via `cargo search` and the crates.io API on **2026-07-14**.
 
+> **Partly superseded — read this first.** This note is a point-in-time survey, kept for its
+> reasoning, not as current guidance.
+>
+> - The **UI choice below is reversed.** `inquire` is recommended here and `ratatui` is filed
+>   under "runners-up (deliberately not chosen)"; the repo went the other way. `inquire` is no
+>   longer a dependency at all. See [ADR 0005](../adr/0005-ratatui-app-architecture-core-tui-boundary.md)
+>   (ratatui TUI) and [ADR 0008](../adr/0008-gui-tauri-entry-point-core-boundary.md) (Tauri GUI),
+>   neither of which existed when this was written.
+> - `secrecy` is pinned to **0.10**, not the 0.8 below — `age-core` 0.12 depends on 0.10, and two
+>   instances would make `SecretString` a different type at the API boundary.
+> - **Still current:** the tar → zstd → age composition notes, the friction call-outs, and the
+>   crate-vetting *pattern* (why-this-crate + health signal).
+>
+> The live record of dependency decisions is the `#` comment above each entry in the relevant
+> `Cargo.toml` — not this table. See [CODING_STANDARDS.md](../../CODING_STANDARDS.md#dependencies).
+
 ## Recommended crate set
 
 | Concern | Crate | Version | One-line rationale | Health (downloads / last release) |
