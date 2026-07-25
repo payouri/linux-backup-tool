@@ -56,12 +56,30 @@ jobs:
     # never drifts from what the manifest declares. Flathub's own generated images —
     # https://github.com/flathub-infra/actions-images — exist precisely to skip re-installing
     # the SDK on every run.
+    #
+    # Pinned by digest, not by the `gnome-48` tag, for the same reason every `uses:` here
+    # carries a commit SHA: the tag is mutable and gets rebuilt in place, so a tag reference
+    # is a promise that whoever controls the registry can rewrite — and this image is the one
+    # thing in the workflow that runs `--privileged`. Unlike the action pins, Dependabot does
+    # NOT update `container.image` (dependabot/dependabot-core#5819), so this is a hand-bumped
+    # pin. That costs nothing extra in practice: it has to move in lockstep with the
+    # manifest's own hand-pinned `runtime-version: '48'` anyway, so it rides along on a bump
+    # the maintainer already makes deliberately rather than adding a new maintenance axis.
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:50fea670968fd3ec4aeeb3a91d9d807d0af6eab3c3b44c33d4c40c311832c8fa # gnome-48
+      # flatpak-builder sandboxes every module build through bubblewrap, which needs to create
+      # nested user namespaces — unavailable in a stock container, hence `--privileged`.
       options: --privileged
     timeout-minutes: 45
     steps:
+      # `persist-credentials: false` because nothing here writes to the repo, and both jobs go
+      # on to execute untrusted code from the checked-out tree — every crate's `build.rs`, every
+      # npm lifecycle script, on a `pull_request` from a fork. Leaving the job's token in
+      # `.git/config` hands all of that a credential it has no reason to hold. The Flatpak build
+      # in particular never even sees `.git` (the manifest's `type: dir` source skips it).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The generated `cargo-sources.json` / `node-sources.json` are a lockfile-derived cache
       # (crates/gui/flatpak/.gitignore) regenerated fresh each run rather than committed, so a
@@ -76,11 +94,18 @@ jobs:
       # stable ref and (unlike floating on `master`) survives upstream restructuring the way
       # the `node/` generator's move from a standalone script to a `flatpak_node_generator`
       # pip package already has once.
+      #
+      # The three PyPI packages are `flatpak-cargo-generator.py`'s direct imports and carry
+      # exact `==` pins for the same reason: unpinned, they were the one input to the vendored
+      # source lists that could change between two runs of an unchanged commit. Exact pins, not
+      # `--require-hashes` — hashes would mean maintaining the full transitive closure by hand,
+      # and the `git+https` install below resolves its own dependencies from PyPI regardless, so
+      # hashing only these three would buy precision it cannot actually deliver.
       - name: Install source-generator tooling
         env:
           FLATPAK_BUILDER_TOOLS_REF: 737c0085912f9f7dabf9341d4608e2a77a51a73a
         run: |
-          pip3 install --user aiohttp pyyaml tomlkit
+          pip3 install --user aiohttp==3.14.3 pyyaml==6.0.3 tomlkit==0.15.1
           curl -sSfL -o /tmp/flatpak-cargo-generator.py \
             "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${FLATPAK_BUILDER_TOOLS_REF}/cargo/flatpak-cargo-generator.py"
           pip3 install --user \
@@ -108,7 +133,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # See the flatpak job's checkout for why credentials are not persisted.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
@@ -120,7 +148,9 @@ jobs:
       # `cargo tauri build`'s AppImage target shells out to patchelf to rewrite the payload's
       # interpreter and rpath.
       - name: Install patchelf
-        run: sudo apt-get install -y patchelf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends patchelf
 
       # Read from `.nvmrc` rather than repeated here, so local dev and this job cannot drift to
       # different Node majors — they already had (`.nvmrc` said 24, this said 22, and the
@@ -142,8 +172,13 @@ jobs:
       # `tauri-cli` is a build tool, not a project dependency — installed here rather than
       # added to `crates/gui/ui/package.json`'s devDependencies so this job's tooling choice
       # doesn't touch the frontend's committed lockfile.
+      # Pinned exactly, not `^2`: this is the bundler that produces the shipped artifact, so a
+      # floating range lets a fresh 2.x release change how the AppImage is assembled — or break
+      # the job — on a run where nothing in the repo moved. Bump deliberately alongside the
+      # `tauri` dependency in `crates/gui/Cargo.toml`; Dependabot's cargo ecosystem reads
+      # manifests, so it does not see this one.
       - name: Install tauri-cli
-        run: cargo install tauri-cli --version "^2" --locked
+        run: cargo install tauri-cli --version 2.11.4 --locked
 
       - name: Build the AppImage
         working-directory: crates/gui
@@ -154,3 +189,7 @@ jobs:
           name: linux-backup-gui-appimage
           path: target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
+          # This artifact is a build check, not a release channel — releases will carry their
+          # own attached assets. 14 days is long enough to pull one off a PR and try it, where
+          # the 90-day default keeps a bundle per run long after anyone would look at it.
+          retention-days: 14
