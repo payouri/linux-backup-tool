@@ -127,8 +127,18 @@ locally this could only be validated for:
   convention (`flatpak-node/npm-cache`, relative to the build root) was cross-checked against
   its provider source and README, not run end-to-end.
 
+**Rust toolchain**: the Flatpak does *not* use `org.freedesktop.Sdk.Extension.rust-stable`. That
+extension ships rustc 1.89, under the workspace's `rust-version = "1.95"` floor (which `sysinfo`
+alone already forces), so `cargo build` refused to start; no branch of it carries a 1.95+ rustc.
+The manifest vendors the official standalone Rust tarball instead — pinned by version and sha256,
+fetched by `flatpak-builder` outside the sandbox, unpacked with `install.sh` into the build prefix
+so the compile stays offline. It tracks stable (currently 1.97.1) rather than 1.95.0, matching the
+AppImage job so both shipped bundles come out of the same compiler; 1.95 is the floor CI's `msrv`
+job enforces, not the version releases are built with.
+
 **Only CI can confirm**: that `org.gnome.Platform`/`org.gnome.Sdk`//48 and the
-`rust-stable`/`node24` SDK extension branches actually resolve together; that the generated
+`node24` SDK extension branch actually resolve together; that the vendored Rust tarball's
+`install.sh --components=…` invocation lands a working toolchain on `PATH`; that the generated
 `cargo-sources.json`/`node-sources.json` — with the `CARGO_HOME`/`--cache` wiring above —
 produce a build that completes offline inside the sandbox; that the resulting Flatpak
 actually launches the GUI; and that `cargo tauri build --bundles appimage` (with the

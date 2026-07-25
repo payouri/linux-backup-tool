@@ -24,12 +24,17 @@ id: tools.linux_backup.gui
 runtime: org.gnome.Platform
 runtime-version: '48'
 sdk: org.gnome.Sdk
-# The freedesktop-sdk generation GNOME 48 (March 2025) was built against, per that runtime's
-# own bundled extension set — GNOME 49's Sept-2025 cut is the first to move onto 25.08.
-# Unverified locally (see header note): if `flatpak-builder` reports either extension branch
-# unavailable for org.gnome.Platform//48, bump both to '25.08' in lockstep.
+# One SDK extension, on the freedesktop-sdk generation GNOME 48 (March 2025) was built against
+# per that runtime's own bundled extension set — GNOME 49's Sept-2025 cut is the first to move
+# onto 25.08. Unverified locally (see header note): if `flatpak-builder` reports this extension
+# branch unavailable for org.gnome.Platform//48, bump the runtime and it together.
+#
+# `rust-stable` is deliberately absent. It ships rustc 1.89, below this workspace's 1.95 floor
+# (`rust-version` in the root Cargo.toml, which `sysinfo` alone already forces), so `cargo build`
+# refused to start — and no newer branch of that extension carries a 1.95+ rustc. The toolchain
+# is vendored as a checksummed `archive` source instead, which is also what makes the compiler
+# version reproducible rather than whatever the extension happens to hold on build day.
 sdk-extensions:
-  - org.freedesktop.Sdk.Extension.rust-stable
   # Node 24, matching `crates/gui/ui/.nvmrc` and the AppImage job's `setup-node` — the two
   # packaging paths build the identical frontend, so a Node-major split between them would
   # mean shipping Flatpak and AppImage bundles built by different toolchains. Available on
@@ -70,7 +75,10 @@ modules:
   - name: linux-backup-gui
     buildsystem: simple
     build-options:
-      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node24/bin
+      # The vendored toolchain's bin comes first and no longer includes the SDK's rust — see the
+      # `sdk-extensions` note. `$FLATPAK_BUILDER_BUILDDIR` is not expanded here (this is a plain
+      # string), hence the literal build-directory path, same convention as CARGO_HOME below.
+      append-path: /run/build/linux-backup-gui/rust/bin:/usr/lib/sdk/node24/bin
       env:
         # `cargo`/`npm` must never reach out during the sandboxed build; both are fed from
         # the vendored sources copied in below. A network access here would fail anyway
@@ -87,6 +95,14 @@ modules:
         # below), per Tauri's documented Flatpak recipe.
         CARGO_HOME: /run/build/linux-backup-gui/cargo
     build-commands:
+      # Unpack the vendored toolchain into the build dir before anything compiles. Only the three
+      # components a release build needs — the tarball also carries docs, rust-analyzer, clippy
+      # and rustfmt, none of which this build invokes. `--disable-ldconfig` because this is a
+      # throwaway build prefix, not a system install, so there is no cache worth refreshing.
+      # The `rust-std` component name embeds the target triple, hence `$(uname -m)`, which keeps
+      # the one command correct for both arches the sources below cover.
+      - cd rust-toolchain && ./install.sh --prefix=/run/build/linux-backup-gui/rust
+        --components=rustc,cargo,rust-std-$(uname -m)-unknown-linux-gnu --disable-ldconfig
       # The frontend build has to happen before `cargo build`: `crates/gui/build.rs`
       # (`tauri-build`) validates at Rust compile time that `build.frontendDist`
       # (`ui/dist/`) exists and Tauri embeds whatever is there — see
@@ -128,3 +144,23 @@ modules:
       # changes, exactly like any other lockfile-derived cache.
       - cargo-sources.json
       - node-sources.json
+      # Rust 1.97.1 (current stable), pinned by version + sha256 rather than tracking a channel.
+      # flatpak-builder fetches sources outside the build sandbox, so vendoring the toolchain here
+      # keeps the compile itself fully offline, exactly like the cargo/npm sources above. Listed
+      # last, after the `type: dir` copy, so nothing can overwrite the unpacked toolchain.
+      #
+      # Deliberately stable-and-pinned rather than 1.95.0-to-match-the-floor: the AppImage job
+      # builds on stable too, and the two shipped bundles should come out of the same compiler.
+      # The 1.95 floor is a minimum enforced by CI's `msrv` job, not the version releases are
+      # built with. Bump this and the AppImage's toolchain together.
+      - type: archive
+        url: https://static.rust-lang.org/dist/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz
+        sha256: 88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f
+        dest: rust-toolchain
+        only-arches: [x86_64]
+      # Untested by CI, which builds x86_64 only; carried so an aarch64 Flathub build resolves.
+      - type: archive
+        url: https://static.rust-lang.org/dist/rust-1.97.1-aarch64-unknown-linux-gnu.tar.xz
+        sha256: 9a7a2c336b4787f1b72f6bab7c35d5b7af2fd03cbd39b4fc721466a70d402a7d
+        dest: rust-toolchain
+        only-arches: [aarch64]
