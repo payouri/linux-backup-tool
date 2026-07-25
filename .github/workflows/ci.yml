@@ -69,7 +69,13 @@ jobs:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.95.0
+      # `toolchain:` must be spelled out. dtolnay/rust-toolchain normally takes the version from
+      # the ref you call it by (`@1.95.0`), but pinning to a commit SHA leaves nothing to read it
+      # from and the input falls back to its `stable` default -- which is what this job silently
+      # did before, re-running the `test` job's toolchain and enforcing no floor at all.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; toolchain pinned below
+        with:
+          toolchain: 1.95.0
       - uses: ./.github/actions/tauri-linux-deps
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo check --workspace --all-targets --locked

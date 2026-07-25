@@ -1,6 +1,6 @@
 # MSRV mirrors the toolchain this workspace is developed against; kept in sync with
 # `rust-version` in the root Cargo.toml.
-msrv = "1.88"
+msrv = "1.95"
 
 # AGENTS.md: "no unwrap()/expect()/panic!() outside tests and main". Enforced here rather
 # than left as convention alone, same spirit as core/src/lib.rs's `forbid(unsafe_code)`.

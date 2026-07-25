@@ -5,7 +5,11 @@ members = ["crates/core", "crates/gui", "crates/tui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+# The real floor, not an aspiration: `sysinfo` requires 1.95, so any lower value here was
+# already unbuildable. CI's `msrv` job compiles against exactly this version — keep the two
+# in step, and see docs/gui-packaging.md for why the Flatpak vendors its own toolchain
+# rather than using the Flatpak SDK's rustc, which is older than this floor.
+rust-version = "1.95"
 
 [workspace.lints.clippy]
 # Enforce AGENTS.md's no-unwrap/expect/panic rule (disallowed lists live in clippy.toml).
