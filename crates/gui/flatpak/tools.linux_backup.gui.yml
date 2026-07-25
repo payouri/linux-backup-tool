@@ -20,7 +20,7 @@
 # version pins, module build commands, and vendored-source wiring are unverified beyond
 # structural YAML validity and a manual cross-check against Tauri's documented Flatpak
 # recipe. CI's first `flatpak-builder` run is authoritative.
-id: tools.linux-backup.gui
+id: tools.linux_backup.gui
 runtime: org.gnome.Platform
 runtime-version: '48'
 sdk: org.gnome.Sdk
@@ -95,12 +95,12 @@ modules:
       - npm run build --prefix crates/gui/ui
       - cargo build --release --offline --manifest-path crates/gui/Cargo.toml
       - install -Dm755 target/release/linux-backup-gui /app/bin/linux-backup-gui
-      - install -Dm644 crates/gui/flatpak/tools.linux-backup.gui.desktop
-        /app/share/applications/tools.linux-backup.gui.desktop
-      - install -Dm644 crates/gui/flatpak/tools.linux-backup.gui.metainfo.xml
-        /app/share/metainfo/tools.linux-backup.gui.metainfo.xml
+      - install -Dm644 crates/gui/flatpak/tools.linux_backup.gui.desktop
+        /app/share/applications/tools.linux_backup.gui.desktop
+      - install -Dm644 crates/gui/flatpak/tools.linux_backup.gui.metainfo.xml
+        /app/share/metainfo/tools.linux_backup.gui.metainfo.xml
       - install -Dm644 crates/gui/icons/icon.png
-        /app/share/icons/hicolor/32x32/apps/tools.linux-backup.gui.png
+        /app/share/icons/hicolor/32x32/apps/tools.linux_backup.gui.png
     sources:
       # The whole repo, offline-vendored-deps and all — `type: dir` is the standard trick for
       # building from a local checkout in CI rather than fetching a tagged release over the

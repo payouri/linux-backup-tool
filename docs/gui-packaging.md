@@ -7,7 +7,7 @@ section (built by [#104](https://github.com/payouri/linux-backup-tool/issues/104
 ## Two ship formats, one canonical
 
 - **Flatpak is the canonical distributable.** The manifest —
-  [`crates/gui/flatpak/tools.linux-backup.gui.yml`](../crates/gui/flatpak/tools.linux-backup.gui.yml)
+  [`crates/gui/flatpak/tools.linux_backup.gui.yml`](../crates/gui/flatpak/tools.linux_backup.gui.yml)
   — targets `org.gnome.Platform`/`org.gnome.Sdk`, which ships a pinned, sandboxed
   `webkit2gtk-4.1` (plus `javascriptcoregtk-4.1`, `gtk3`, `soup3` at matching versions). This is
   what resolves the cross-distro WebKitGTK-version risk the [stack
@@ -43,7 +43,7 @@ flatpak-node-generator npm crates/gui/ui/package-lock.json \
 flatpak-builder --force-clean --user \
   --repo=crates/gui/flatpak/repo \
   crates/gui/flatpak/build \
-  crates/gui/flatpak/tools.linux-backup.gui.yml
+  crates/gui/flatpak/tools.linux_backup.gui.yml
 ```
 
 `crates/gui/flatpak/cargo-sources.json` / `node-sources.json` are gitignored — they're a
@@ -94,7 +94,7 @@ is out of scope for #104 (packaging) — tracked as a follow-up for whoever pick
 
 ## HITL: no repo license yet
 
-`tools.linux-backup.gui.metainfo.xml` deliberately omits `<project_license>` — the repo has
+`tools.linux_backup.gui.metainfo.xml` deliberately omits `<project_license>` — the repo has
 no `LICENSE` file and no Cargo `license` field to draw one from, so inventing one (even a
 plausible-looking placeholder like `MIT`) would be a false claim about terms nobody has
 actually chosen, not a packaging detail. This is a repo-level decision for a human to make,

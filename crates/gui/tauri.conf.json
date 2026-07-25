@@ -2,9 +2,9 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "linux-backup-gui",
   "version": "0.1.0",
-  "identifier": "tools.linux-backup.gui",
+  "identifier": "tools.linux_backup.gui",
   "build": {
-    "frontendDist": "../ui/dist",
+    "frontendDist": "ui/dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build"
@@ -24,6 +24,7 @@
   "bundle": {
     "active": true,
     "targets": ["appimage"],
+    "icon": ["icons/icon.png"],
     "category": "Utility",
     "shortDescription": "Back up and restore a Linux user's environment",
     "longDescription": "linux-backup captures a Linux user's environment - program configs, SSH keys, KDE Plasma layout, shell setup, user directories, installed-package manifests, and hand-picked custom paths - into one portable, optionally encrypted archive, and restores it back."

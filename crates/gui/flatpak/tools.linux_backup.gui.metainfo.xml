@@ -7,7 +7,7 @@
   on later without touching the manifest.
 -->
 <component type="desktop-application">
-  <id>tools.linux-backup.gui</id>
+  <id>tools.linux_backup.gui</id>
   <name>linux-backup</name>
   <summary>Back up and restore a Linux user's environment</summary>
   <metadata_license>CC0-1.0</metadata_license>
@@ -23,7 +23,7 @@
       built on the same selection engine.
     </p>
   </description>
-  <launchable type="desktop-id">tools.linux-backup.gui.desktop</launchable>
+  <launchable type="desktop-id">tools.linux_backup.gui.desktop</launchable>
   <content_rating type="oars-1.1" />
   <releases>
     <release version="0.1.0" date="2026-07-22">
