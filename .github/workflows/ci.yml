@@ -58,6 +58,39 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --workspace --all-targets --locked
 
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # `crates/gui/ui` is a React app with its own lint (oxlint), type-check (`tsc -b`, run by
+    # `npm run build`) and test (vitest) toolchain. No cargo gate reaches any of it, and
+    # `packaging.yml` only builds the frontend on GUI-path changes as a step towards an
+    # artifact -- so without this job a broken or failing frontend lands green.
+    # Belongs here rather than in `packaging.yml` for the reason that workflow's own header
+    # draws: these are fast source gates ("the change is wrong"), not artifact builds.
+    env:
+      # The workflow-level `-D warnings` is for rustc; nothing in this job runs it.
+      RUSTFLAGS: ""
+    defaults:
+      run:
+        working-directory: crates/gui/ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same three inputs as `packaging.yml`'s appimage job, for the same reason: `.nvmrc` is
+      # the single source of the Node major, and both paths are repo-root-relative regardless
+      # of the `working-directory` above.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: crates/gui/ui/.nvmrc
+          cache: npm
+          cache-dependency-path: crates/gui/ui/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test
+      # Type-check and bundle in one step -- `build` is `tsc -b && vite build`. Overwrites the
+      # tracked `dist/index.html` placeholder, which is fine on a throwaway runner checkout.
+      - run: npm run build
+
   msrv:
     name: msrv (1.95)
     runs-on: ubuntu-latest
