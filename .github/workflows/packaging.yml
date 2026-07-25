@@ -7,11 +7,38 @@ name: Packaging
 # mode is "the ship artifact is broken", not "the change is wrong" — the distinction `ci.yml`
 # already draws between `fmt`/`clippy`/`test` and the separate `msrv` job.
 
+# Both jobs build exactly one thing — the GUI app — so the trigger is narrowed to what can
+# change it: the Flatpak module compiles `--manifest-path crates/gui/Cargo.toml` and the
+# AppImage job runs `cargo tauri build` from `crates/gui`, neither of which ever compiles
+# `crates/tui`. A tui-only, docs-only, or `ci.yml`-only change therefore produces a
+# byte-identical artifact, and paying ~45 min of Flatpak build for it buys nothing. Workspace
+# manifests and `.cargo/` stay in the list because they *can* change the produced binary, as
+# does this workflow itself and the build-dependency action it calls.
+#
+# Duplicated per event rather than shared: GitHub's workflow parser has no support for YAML
+# anchors. If these jobs ever become required status checks, revisit — a filtered-out workflow
+# leaves its checks permanently pending rather than passing.
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    paths:
+      - 'crates/core/**'
+      - 'crates/gui/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.github/workflows/packaging.yml'
+      - '.github/actions/tauri-linux-deps/**'
   push:
     branches: [trunk]
+    paths:
+      - 'crates/core/**'
+      - 'crates/gui/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.github/workflows/packaging.yml'
+      - '.github/actions/tauri-linux-deps/**'
 
 concurrency:
   group: packaging-${{ github.workflow }}-${{ github.ref }}
