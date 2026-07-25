@@ -128,7 +128,7 @@ locally this could only be validated for:
   its provider source and README, not run end-to-end.
 
 **Only CI can confirm**: that `org.gnome.Platform`/`org.gnome.Sdk`//48 and the
-`rust-stable`/`node20` SDK extension branches actually resolve together; that the generated
+`rust-stable`/`node24` SDK extension branches actually resolve together; that the generated
 `cargo-sources.json`/`node-sources.json` — with the `CARGO_HOME`/`--cache` wiring above —
 produce a build that completes offline inside the sandbox; that the resulting Flatpak
 actually launches the GUI; and that `cargo tauri build --bundles appimage` (with the

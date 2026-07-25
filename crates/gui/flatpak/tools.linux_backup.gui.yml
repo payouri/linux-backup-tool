@@ -30,7 +30,12 @@ sdk: org.gnome.Sdk
 # unavailable for org.gnome.Platform//48, bump both to '25.08' in lockstep.
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-  - org.freedesktop.Sdk.Extension.node20
+  # Node 24, matching `crates/gui/ui/.nvmrc` and the AppImage job's `setup-node` — the two
+  # packaging paths build the identical frontend, so a Node-major split between them would
+  # mean shipping Flatpak and AppImage bundles built by different toolchains. Available on
+  # the 24.08 extension branch this runtime uses (verified against Flathub's branch list),
+  # so it needs no runtime bump.
+  - org.freedesktop.Sdk.Extension.node24
 
 command: linux-backup-gui
 
@@ -65,7 +70,7 @@ modules:
   - name: linux-backup-gui
     buildsystem: simple
     build-options:
-      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node20/bin
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node24/bin
       env:
         # `cargo`/`npm` must never reach out during the sandboxed build; both are fed from
         # the vendored sources copied in below. A network access here would fail anyway

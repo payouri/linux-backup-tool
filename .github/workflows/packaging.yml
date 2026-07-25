@@ -122,9 +122,14 @@ jobs:
       - name: Install patchelf
         run: sudo apt-get install -y patchelf
 
+      # Read from `.nvmrc` rather than repeated here, so local dev and this job cannot drift to
+      # different Node majors — they already had (`.nvmrc` said 24, this said 22, and the
+      # Flatpak manifest's SDK extension said 20, three toolchains for one frontend). The
+      # manifest's `node24` extension is the one copy that has to stay in sync by hand; it
+      # names an SDK extension, not a version string, so it can't read this file.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version-file: crates/gui/ui/.nvmrc
           cache: npm
           cache-dependency-path: crates/gui/ui/package-lock.json
 
