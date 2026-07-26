@@ -34,23 +34,27 @@ The Category for bulk XDG data directories (Documents, Downloads, …). Default-
 ## Selection & smart defaults
 
 **Selection**:
-The user's chosen set of Categories, Custom paths, and Drill-down deselections for a run. The core's authoritative model of what will be backed up; the TUI is a thin view over it.
+The user's chosen set of Categories, Custom paths, and Drill-down deselections for a Run. The single authoritative model of what will be backed up; both interfaces are thin views over it and neither holds a Selection of its own.
 _Avoid_: choices, config, options
 
 **Smart default**:
-A pre-computed starting state the user can override — which Categories start checked, and the encryption Auto-insist. Defaults are computed fresh each run (never persisted for encryption).
+A pre-computed starting state the user can override — which Categories start checked, and the encryption Auto-insist. Defaults are computed fresh each Run (never persisted for encryption).
 _Avoid_: preset, recommendation
 
 **Drill-down**:
-Descending from a checked Category through its Entries — and recursively into subdirectories to any depth — to deselect individual Entries or whole subtrees (the heavy Plasma `icons/`/`wallpapers/` case). Deselections persist in the Profile.
+The activity of descending from a checked Category through its Entries — and recursively into subdirectories to any depth — to deselect individual Entries or whole subtrees (the heavy Plasma `icons/`/`wallpapers/` case). Deselections persist in the Profile. Performed in the Explorer.
 _Avoid_: expand, detail view
+
+**Explorer**:
+The navigable tree surface a Drill-down happens in, presenting Categories and their Entries to any depth with each node's Partial selection state. One concept, two renderings — a pane in the terminal app, a tree in the desktop app.
+_Avoid_: browser, file picker, tree view (for the surface itself)
 
 **Subtree deselection**:
 A Drill-down deselection applied to a directory at any depth, excluding every Entry beneath it (prefix-based — it prunes the whole subtree). The coarser of the two deselection granularities; the other is a single-Entry deselection. Exclusion is prefix-wins: re-inclusion cancels a deselection only at the exact node it was applied — there is no per-child carve-out of an excluded parent. Persisted (for historical reasons) in the Profile's `deselected_roots`, whose "root" now means any subtree, not only an allowlist root.
 _Avoid_: exclude rule, ignore pattern, negation
 
 **Partial selection**:
-A directory node whose descendants are a mix of selected and withheld Entries — the middle of the three-valued All / Partial / None state a Drill-down view shows for a node. Derived from the Selection, never stored.
+A directory node whose descendants are a mix of selected and withheld Entries — the middle of the three-valued All / Partial / None state the Explorer shows for a node. Derived from the Selection, never stored.
 _Avoid_: indeterminate, mixed, half-checked
 
 **Hide-empty**:
@@ -71,14 +75,58 @@ _Avoid_: secret scan, lint
 The policy that forces whole-archive encryption on when the Selection contains anything Sensitive. Overridable, but only behind a second confirmation naming the categories about to land in plaintext.
 _Avoid_: force-encrypt, require
 
+## The wizard
+
+**Wizard**:
+The ordered walk that assembles a backup Run: WHAT (the Selection), encryption, WHERE (the Output location), then Review. Both interfaces present the same four Steps in the same order.
+_Avoid_: flow, setup, onboarding
+
+**Step**:
+One stage of the Wizard — WHAT, encryption, WHERE, or Review. Named in caps when it stands for the stage itself (a "WHAT edit"), lowercase when read as prose. Distinct from a Phase, which belongs to a Run in progress.
+_Avoid_: page, screen, tab, phase
+
+**Completion frontier**:
+The furthest Step the user has completed. Everything behind it is revisitable at will; everything beyond it is locked until the current Step is satisfied — which is why editing WHAT can pull the frontier back.
+_Avoid_: progress, furthest step, unlocked steps
+
+**Invalidation**:
+The rule that a WHAT edit exposing new Sensitive content reopens an already-settled encryption decision, marking that Step unsatisfied rather than silently keeping a decision the user made about different content. Targeted, never a blanket reset of later Steps.
+_Avoid_: reset, dirty, stale
+
+## Runs
+
+**Run**:
+One invocation of backup or restore, from launch to Run outcome. The unit a Phase, a Cancellation, and a Run outcome all belong to; also the unit the Profile and the Smart defaults are computed per.
+_Avoid_: job, task, operation, session, execution
+
+**Phase**:
+A coarse, user-visible stage of a Run in progress — Scanning, Compressing, Encrypting, Finalizing for a backup (Encrypting only when the Backup is actually encrypted); Verifying archive, Restoring for a restore. Deliberately coarser than the internal steps it covers. Distinct from a Step, which belongs to the Wizard.
+_Avoid_: stage, step, state, progress
+
+**Run outcome**:
+How a Run ended: Success, Cancelled, or Failed. Exactly one per Run, and always reported — a Run never simply stops.
+_Avoid_: result, status, exit code
+
+**Cancellation**:
+The user abandoning a Run in progress. A cancelled backup leaves nothing behind — the Backup dir is removed exactly as it is on a failure — so a Cancellation is never a partial Backup.
+_Avoid_: abort, stop, interrupt
+
+**Point of no return**:
+The moment a backup Run starts committing Archive bytes. A Cancellation before it abandons the Run; after it the request is not honored and the Run finishes to Success, because there is no way to stop cleanly and nothing half-written is worth keeping.
+_Avoid_: commit point, deadline
+
+**Occupied Backup dir**:
+A Backup dir that already exists where this Run's would be written. A hard refusal before any filesystem work — never merged into, never overwritten. The one collision-shaped case that is *not* a Collision, which is a restore-time concept.
+_Avoid_: collision, conflict, duplicate
+
 ## On-disk artifacts
 
 **Backup**:
-The on-disk result of a run: a Backup dir containing one Archive and one Manifest. The unit `restore` consumes.
+The on-disk result of a Run: a Backup dir containing one Archive and one Manifest. The unit `restore` consumes.
 _Avoid_: snapshot (reserved for the v1 dedup store), dump
 
 **Backup dir**:
-The per-run directory `<location>/linux-backup-<host>-<timestamp>/` that holds the Archive and Manifest. Created fresh each run; it is the **collision unit** — the run refuses if it already exists.
+The per-Run directory `<location>/linux-backup-<host>-<timestamp>/` that holds the Archive and Manifest. Created fresh each Run, never merged into or written over — an Occupied Backup dir is refused.
 _Avoid_: backup folder, output folder
 
 **Archive**:
@@ -103,6 +151,26 @@ _Avoid_: recovery, unpack, extract (except for the tar step)
 Best-effort portability: an Entry tagged `root: "home"` is re-based under the restoring user's `$HOME`; `root: "absolute"` is restored verbatim. This is what makes cross-machine/cross-user Restore possible.
 _Avoid_: remapping, relocation
 
+**Backup recognition**:
+Reading a directory the user has picked to answer two questions before anything else happens: is this a Backup dir, and is it encrypted. What lets the passphrase prompt appear only when the Backup actually needs one.
+_Avoid_: validation, probe, detection, scan (that belongs to backup)
+
+**Collision**:
+An existing file where a restored Entry would land. Always negotiated, never a refusal: the user is asked once for the whole list and answers yes or no for all of it.
+_Avoid_: conflict, clash, overwrite (that's the answer, not the situation)
+
+**Skipped collision**:
+A Collision the user declined, leaving the existing file untouched. A deliberate outcome recorded in the Restore's report — never a failure. The chosen one of the three ways an Entry can go unwritten: a Skipped collision is asked for, a restore failure is not, and a Vanished Entry never reached the Archive at all.
+_Avoid_: rejected, refused, ignored
+
+**Restore failure**:
+One Entry that could not be written, recorded and reported without ending the Run. The asymmetry that defines Restore: a backup aborts on its first error, a Restore carries on and hands back the list.
+_Avoid_: error, partial failure
+
+**Ownership restore**:
+Putting each restored file back under the uid/gid the Manifest recorded for it — attempted only when the Restore runs as root. A non-root Restore leaves every file owned by the restoring user and says so, rather than failing. The ownership half of what Re-rooting does for paths.
+_Avoid_: chown, permissions (those are modes, restored separately), uid mapping
+
 **Package list**:
 A Category and a Manifest section: per-package-manager inventories (pacman, yay/AUR, flatpak, snap, cargo, npm globals) captured as names (versions informational only).
 _Avoid_: package inventory (use "Package list"), app list
@@ -112,11 +180,11 @@ The `reinstall.sh` a Restore writes from the Package lists — unpinned, never a
 _Avoid_: install script, provisioning
 
 **Vanished**:
-An Entry that existed at scan time but was gone (ENOENT) by the time it was read — a benign cache/temp race. Skipped-with-note, recorded in the Manifest's `vanished` array; never aborts a run. Distinct from a real read error, which aborts.
+An Entry that existed at scan time but was gone (ENOENT) by the time it was read — a benign cache/temp race. Skipped-with-note, recorded in the Manifest's `vanished` array; never aborts a Run. Distinct from a real read error, which aborts.
 _Avoid_: missing, skipped, lost
 
 ## Persistence
 
 **Profile**:
-The single remembered state (`profile.toml`) that pre-fills the next run's Selection — Categories, Custom paths, Drill-down deselections, and last Output location. Overwritten each run. Encryption is never persisted.
+The single remembered state (`profile.toml`) that pre-fills the next Run's Selection — Categories, Custom paths, Drill-down deselections, and last Output location. Overwritten each Run. Encryption is never persisted.
 _Avoid_: config, settings, preferences, saved state
