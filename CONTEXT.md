@@ -104,15 +104,15 @@ A coarse, user-visible stage of a Run in progress — Scanning, Compressing, Enc
 _Avoid_: stage, step, state, progress
 
 **Run outcome**:
-How a Run ended: Success, Cancelled, or Failed. Exactly one per Run, and always reported — a Run never simply stops.
+How a Run ended. A backup reports Success, Cancelled, or Failed; a restore reports Success or Failed and carries its Cancellation as a flag on a Success rather than as an outcome of its own. Either may instead report Internal — an unexpected crash, stated plainly and without alarming detail. Exactly one per Run, and always reported: a Run never simply stops.
 _Avoid_: result, status, exit code
 
 **Cancellation**:
-The user abandoning a Run in progress. A cancelled backup leaves nothing behind — the Backup dir is removed exactly as it is on a failure — so a Cancellation is never a partial Backup.
+The user abandoning a Run in progress, taken at the Run's own checkpoints rather than interrupting work already underway. A cancelled backup leaves nothing behind — its Backup dir is removed exactly as on a failure — while a cancelled Restore keeps every file that already landed and reports itself partial. Offered in the desktop app only; the terminal app has no cancel affordance yet.
 _Avoid_: abort, stop, interrupt
 
 **Point of no return**:
-The moment a backup Run starts committing Archive bytes. A Cancellation before it abandons the Run; after it the request is not honored and the Run finishes to Success, because there is no way to stop cleanly and nothing half-written is worth keeping.
+The moment a backup Run starts committing Archive bytes: everything before it is cancellable, nothing after it is. The desktop app withdraws the cancel affordance as the Run crosses it, rather than leaving a control that would appear to cancel and change nothing. A Restore has no point of no return — it stays cancellable to its last Entry, because it never promised all-or-nothing in the first place.
 _Avoid_: commit point, deadline
 
 **Occupied Backup dir**:

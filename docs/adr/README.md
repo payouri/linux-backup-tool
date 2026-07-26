@@ -30,3 +30,6 @@ reversed, add a new ADR and mark the old one `Superseded by 000N` — don't edit
   best-effort and reports per-file failures.
 - [`0003`](0003-plasma-raw-config-copy-not-konsave.md) — Plasma capture copies raw config via a
   curated allowlist; no `konsave` dependency.
+- [`0010`](0010-cancellation-asymmetry-point-of-no-return.md) — cancellation inherits 0002's
+  asymmetry: backup cancels only before its point of no return and leaves nothing behind; restore
+  cancels throughout and keeps what landed. Extends 0002.

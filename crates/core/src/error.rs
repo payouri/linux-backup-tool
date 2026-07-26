@@ -24,8 +24,8 @@ pub enum CoreError {
     #[error("run cancelled")]
     Cancelled,
 
-    /// The target Backup dir already exists. Per story 33 / ADR "collision unit", a
-    /// backup run must refuse rather than silently overwrite a previous one.
+    /// The target Backup dir already exists: an Occupied Backup dir (story 33). A backup
+    /// run must refuse rather than silently overwrite a previous one.
     #[error("backup dir already exists: {0}")]
     BackupDirExists(PathBuf),
 

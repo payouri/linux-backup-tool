@@ -273,8 +273,8 @@ pub fn ensure_writable(path: &Path) -> Result<(), CoreError> {
     }
 }
 
-/// Refuse if the computed Backup dir name already exists at `location` (story 33 — the
-/// Backup dir is the collision unit). Returns the Backup dir's full path on success.
+/// Refuse if the computed Backup dir name already exists at `location` (story 33 — an
+/// Occupied Backup dir). Returns the Backup dir's full path on success.
 pub fn ensure_backup_dir_available(
     location: &Path,
     backup_dir_name: &str,
@@ -756,7 +756,7 @@ mod tests {
         assert!(matches!(err, Err(CoreError::LocationNotWritable(p)) if p == locked));
     }
 
-    // --- ensure_backup_dir_available (collision refusal) ----------------------------
+    // --- ensure_backup_dir_available (Occupied Backup dir refusal) ----------------------------
 
     #[test]
     fn fresh_backup_dir_name_is_available() {
@@ -822,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_selection_refuses_backup_dir_collision() {
+    fn resolve_selection_refuses_an_occupied_backup_dir() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("linux-backup-host-1")).unwrap();
         let err = resolve_selection(tmp.path(), "linux-backup-host-1", 10, None).unwrap_err();

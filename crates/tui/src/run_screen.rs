@@ -57,7 +57,7 @@ pub enum RunMessage {
     /// A `CoreError`'s rendered message plus whether the run's fail-fast cleanup ran — the
     /// worker maps the typed error to its `Display` string at the thread boundary so the
     /// channel carries a plain, `Send` payload. `cleaned_up` is decided from the error variant
-    /// there too, since most `CoreError`s run ADR-0002 cleanup but a collision refusal
+    /// there too, since most `CoreError`s run ADR-0002 cleanup but an Occupied Backup dir
     /// (`BackupDirExists`) touched nothing to clean.
     Failed {
         message: String,
@@ -102,7 +102,7 @@ pub fn spawn(req: BackupRequest) -> BackupWorker {
         ) {
             Ok(outcome) => RunMessage::Done(Box::new(outcome)),
             Err(error) => RunMessage::Failed {
-                // A collision refusal never created a Backup dir, so no partial backup was
+                // An Occupied Backup dir refusal never created one, so no partial backup was
                 // removed; every other `CoreError` fires after the fresh dir exists and runs
                 // ADR-0002 fail-fast cleanup.
                 cleaned_up: !matches!(error, CoreError::BackupDirExists(_)),
@@ -198,7 +198,7 @@ enum RunActivity {
 
 /// A terminal failure: the primary line (a `CoreError`'s message, or the worker-stopped
 /// notice) and whether the fail-fast cleanup left nothing behind. Most `CoreError`s run
-/// ADR-0002 cleanup, but a collision refusal created nothing to clean and an abandoned worker
+/// ADR-0002 cleanup, but an Occupied Backup dir refusal created nothing to clean and an abandoned worker
 /// (panic/disconnect) can't promise cleanup ran at all.
 #[derive(Debug)]
 struct RunFailure {
@@ -744,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn a_collision_failure_does_not_claim_the_partial_backup_was_removed() {
+    fn an_occupied_backup_dir_does_not_claim_the_partial_backup_was_removed() {
         // A `BackupDirExists` refusal created nothing, so the reassurance must not claim a
         // partial backup was removed (which would read as "your existing Backup dir was
         // deleted").
@@ -760,7 +760,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("already exists")));
         assert!(
             !lines.iter().any(|l| l.contains("was removed")),
-            "a collision refusal must not claim the partial backup was removed"
+            "an Occupied Backup dir refusal must not claim the partial backup was removed"
         );
     }
 

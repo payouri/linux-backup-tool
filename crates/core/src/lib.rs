@@ -60,7 +60,7 @@ pub struct BackupOutcome {
 ///
 /// Computes the Backup dir name (`linux-backup-<host>-<timestamp>`, from `ctx` alone —
 /// never the ambient clock/hostname, per ADR-0004) under `ctx.output_location`, and
-/// refuses if it already exists (story 33: the Backup dir is the collision unit). Builds
+/// refuses if it already exists (story 33: an Occupied Backup dir is refused). Builds
 /// the Archive and Manifest from `selection`'s Entries, applying `encryption` to both (all
 /// -or-nothing, per CONTEXT.md's Manifest entry).
 ///
@@ -101,7 +101,7 @@ pub fn backup(
         return Err(CoreError::EmptySelection);
     }
 
-    // Delegate the collision check to `location::ensure_backup_dir_available` (#27) rather
+    // Delegate the Occupied-Backup-dir check to `location::ensure_backup_dir_available` (#27) rather
     // than re-testing `.exists()` here, so there's one implementation of story 33's
     // refusal instead of two that could drift apart.
     let backup_dir =
@@ -197,7 +197,7 @@ fn run_backup(
 /// `linux-backup-<host>-<timestamp>`, built entirely from `ctx` (ADR-0004) so it's
 /// deterministic under a fixed `RunContext` in tests.
 ///
-/// `pub` so the WHERE screen (`crates/tui`, #32) can pre-check the Backup-dir collision
+/// `pub` so the WHERE screen (`crates/tui`, #32) can pre-check for an Occupied Backup dir
 /// (story 33) against the *same* name [`backup`] will later compute, rather than
 /// duplicating the format string and risking drift between the pre-flight check and the
 /// real run.
