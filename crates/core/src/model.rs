@@ -247,18 +247,88 @@ impl SelectionModel {
     /// root/non-root rule (`catalog::validate_custom_path`) by the caller: this owns only the
     /// Entry construction and insertion, not the privilege policy (which needs the injected
     /// `RunContext.privilege` the caller holds). Re-adding a path already actively selected is
-    /// a no-op rather than a duplicate, so the running total can't double-count one Custom path.
+    /// a no-op rather than a duplicate, so the running total can't double-count one Custom
+    /// path. Re-adding a path that is currently `withheld` (Drill-down toggled off, #106)
+    /// **reactivates** it instead of no-op'ing or duplicating: typing a path and pressing
+    /// Enter is an explicit "I want this backed up", so it routes through the model's own
+    /// reversal paths (`reselect_root` for a directory Custom path, `reselect_entry`
+    /// otherwise) rather than a raw re-insert, so nothing is left stranded contradicting
+    /// `is_under_deselected_root`. Re-adding a path withheld only by a deselected *ancestor*
+    /// root still won't reactivate — prefix-wins with no carve-outs (ADR-0006 Decision 2).
+    ///
+    /// The guard is keyed on `relative_path`, matching every sibling mutator, rather than the
+    /// `absolute_path` scan this used to be: a colliding key (e.g. an Absolute-rooted `/foo`
+    /// and a Home-rooted `~/foo`) now no-ops instead of silently overwriting the Category
+    /// Entry already there. The Entry is built (one `lstat` via `EntryType::classify`) before
+    /// the lookup, so the no-op path costs that probe it used to skip — negligible at one add
+    /// per keypress.
     pub fn add_custom_path(&mut self, absolute_path: &Path, home: &Path) {
-        if self
-            .entries
-            .values()
-            .any(|entry| entry.absolute_path == absolute_path)
-        {
+        let entry = custom_entry(absolute_path, home);
+        let key = entry.relative_path.clone();
+        if self.entries.contains_key(&key) {
             return;
         }
-        let entry = custom_entry(absolute_path, home);
-        self.entries.insert(entry.relative_path.clone(), entry);
+        if self.withheld.contains_key(&key) {
+            match entry.entry_type {
+                EntryType::Directory => self.reselect_root(&key),
+                _ => self.reselect_entry(&key),
+            }
+            return;
+        }
+        self.entries.insert(key, entry);
         self.total_size_cache.set(None);
+    }
+
+    /// Removes a Custom path from the Selection entirely (CONTEXT.md's "Custom path", #106) —
+    /// the "forget it" verb, distinct from a Drill-down withhold's "not this run". Keyed on
+    /// `relative_path`, not `absolute_path`: every sibling mutator (`deselect_entry`,
+    /// `deselect_root`, `reselect_root`) already keys that way, it is a direct `O(log n)`
+    /// `BTreeMap` lookup rather than a scan, and it is the only path an Explorer row carries —
+    /// re-rooting from a relative path would be wrong for an Absolute-rooted Custom path.
+    ///
+    /// No-op unless the Entry at that key belongs to [`catalog::CUSTOM_PATHS`]: keys are
+    /// unique per map but not unique to the Custom-paths Category (a Programs Entry, or an
+    /// Absolute-rooted path colliding with a Home-rooted one, can occupy the slot), so an
+    /// unguarded removal could silently delete a Category Entry recoverable only by
+    /// re-scanning. Checks `entries` before `withheld` — `custom_entry` never expands a
+    /// directory into per-file Entries, so a directory Custom path is one Entry with no
+    /// children of its own, and it sits in exactly one of the two maps.
+    ///
+    /// `deselected` residue is cleared unconditionally: the Entry is gone and no other Entry
+    /// can hold the same key in the same map, so nothing can be stranded. `deselected_roots`
+    /// residue is pruned only when nothing active or withheld remains under the key —
+    /// reusing the retain-if-still-covers pass `deselect_category` already performs, via the
+    /// same [`prefix_range_nonempty`] helper — so removing a directory Custom path that still
+    /// shares its prefix with other Categories' Entries leaves those Entries exactly as the
+    /// user last saw them (withheld, with the root deselection that excludes them intact)
+    /// rather than silently re-selecting them.
+    ///
+    /// No validation: the add-time root/non-root privilege rule
+    /// (`catalog::validate_custom_path`) is an add-time policy needing the injected
+    /// `RunContext.privilege` the caller holds. Removal only deletes what the Category guard
+    /// already proved is present, so it is unconditional.
+    pub fn remove_custom_path(&mut self, relative_path: &Path) {
+        let holds_custom = |map: &BTreeMap<PathBuf, Entry>| {
+            map.get(relative_path)
+                .is_some_and(|entry| entry.category == catalog::CUSTOM_PATHS.name)
+        };
+        let removed = if holds_custom(&self.entries) {
+            self.entries.remove(relative_path)
+        } else if holds_custom(&self.withheld) {
+            self.withheld.remove(relative_path)
+        } else {
+            None
+        };
+        if removed.is_none() {
+            return;
+        }
+        self.total_size_cache.set(None);
+        self.deselected.remove(relative_path);
+        if !prefix_range_nonempty(&self.entries, relative_path)
+            && !prefix_range_nonempty(&self.withheld, relative_path)
+        {
+            self.deselected_roots.remove(relative_path);
+        }
     }
 
     /// The active (non-deselected) Entries, in path order (the `BTreeMap` key order — #82's
@@ -1455,6 +1525,132 @@ mod tests {
             selection.entries().len(),
             1,
             "re-adding the same Custom path must not double-count it"
+        );
+    }
+
+    #[test]
+    fn re_adding_a_withheld_custom_path_reactivates_it() {
+        // #106's folded-in dedupe fix: the guard now also consults `withheld`, and typing the
+        // path again is an explicit "I want this backed up" that reverses the withhold rather
+        // than either no-op'ing or inserting a duplicate Entry.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let file_path = home.join("notes.md");
+        std::fs::write(&file_path, b"hello").expect("write file");
+        let mut selection = SelectionModel::new(Vec::new());
+
+        selection.add_custom_path(&file_path, home);
+        selection.deselect_entry(Path::new("notes.md"));
+        assert!(selection.entries().is_empty());
+
+        selection.add_custom_path(&file_path, home);
+
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(selection.entries()[0].relative_path, Path::new("notes.md"));
+        assert!(!selection.is_deselected(Path::new("notes.md")));
+        assert_eq!(
+            selection
+                .entries_in_category(catalog::CUSTOM_PATHS.name)
+                .len(),
+            1,
+            "reactivating must not leave a second, duplicate Entry behind"
+        );
+    }
+
+    #[test]
+    fn remove_custom_path_drops_an_active_entry() {
+        let mut selection =
+            SelectionModel::new(vec![entry(catalog::CUSTOM_PATHS.name, false, "notes.md")]);
+
+        selection.remove_custom_path(Path::new("notes.md"));
+
+        assert!(selection.entries().is_empty());
+        assert!(selection
+            .entries_in_category(catalog::CUSTOM_PATHS.name)
+            .is_empty());
+    }
+
+    #[test]
+    fn remove_custom_path_drops_a_withheld_entry() {
+        let mut selection =
+            SelectionModel::new(vec![entry(catalog::CUSTOM_PATHS.name, false, "notes.md")]);
+        selection.deselect_entry(Path::new("notes.md"));
+        assert!(!selection
+            .entries_in_category(catalog::CUSTOM_PATHS.name)
+            .is_empty());
+
+        selection.remove_custom_path(Path::new("notes.md"));
+
+        assert!(selection
+            .entries_in_category(catalog::CUSTOM_PATHS.name)
+            .is_empty());
+        assert!(selection.deselected_paths().is_empty());
+    }
+
+    #[test]
+    fn remove_custom_path_prunes_an_orphaned_root() {
+        let mut selection =
+            SelectionModel::new(vec![entry(catalog::CUSTOM_PATHS.name, false, "myproj")]);
+        selection.deselect_root(Path::new("myproj"));
+        assert!(selection.is_root_deselected(Path::new("myproj")));
+
+        selection.remove_custom_path(Path::new("myproj"));
+
+        assert!(
+            selection.deselected_roots().is_empty(),
+            "a lone directory Custom path must prune its own Subtree deselection on removal"
+        );
+        assert!(selection
+            .entries_in_category(catalog::CUSTOM_PATHS.name)
+            .is_empty());
+    }
+
+    #[test]
+    fn remove_custom_path_retains_a_still_covering_root() {
+        let mut selection = SelectionModel::new(vec![
+            entry(catalog::CUSTOM_PATHS.name, false, ".config"),
+            entry(catalog::PROGRAM_CONFIGS.name, false, ".config/foo.conf"),
+        ]);
+        selection.deselect_root(Path::new(".config"));
+        assert!(selection.is_root_deselected(Path::new(".config")));
+
+        selection.remove_custom_path(Path::new(".config"));
+
+        // The Custom path Entry itself is gone...
+        assert!(selection
+            .entries_in_category(catalog::CUSTOM_PATHS.name)
+            .is_empty());
+        // ...but the root deselection survives because a Programs Entry still falls under it,
+        // leaving that Category exactly as the user last saw it: withheld, not silently
+        // re-selected just because the Custom path that shared its prefix was cleared.
+        assert!(selection.is_root_deselected(Path::new(".config")));
+        assert_eq!(
+            selection
+                .entries_in_category(catalog::PROGRAM_CONFIGS.name)
+                .len(),
+            1
+        );
+        assert!(selection.entries().is_empty());
+    }
+
+    #[test]
+    fn remove_custom_path_ignores_a_non_custom_entry() {
+        let mut selection = SelectionModel::new(vec![entry(
+            catalog::PROGRAM_CONFIGS.name,
+            false,
+            ".config/foo.conf",
+        )]);
+
+        selection.remove_custom_path(Path::new(".config/foo.conf"));
+
+        assert_eq!(
+            selection.entries().len(),
+            1,
+            "the Category guard must not let remove_custom_path delete another Category's Entry"
+        );
+        assert_eq!(
+            selection.entries()[0].category,
+            catalog::PROGRAM_CONFIGS.name
         );
     }
 
