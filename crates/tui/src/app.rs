@@ -372,12 +372,14 @@ impl App {
                     );
                     self.view = View::Wizard(wizard);
                 } else {
-                    // This is the only path that can newly open the WHAT Custom-path field (a
-                    // `→`/`Enter` on the Custom-paths row), so the privilege-aware `~/`/`/`
-                    // prefill (#85) is primed right after. `prime_*` self-guards on an empty
-                    // buffer: it fills the field the frame it opens and is otherwise a no-op —
-                    // including when a step-motion chord (the one key that re-enters this branch
-                    // while the field is open) must not clobber what the user has typed.
+                    // A `→`/`Enter` on the Custom-paths row, a bare `a` from anywhere on WHAT, or
+                    // a Category-emptying `r` (#106/#107/#148) can each newly open the WHAT
+                    // Custom-path field from inside the pure reducer, so the privilege-aware
+                    // `~/`/`/` prefill (#85) is primed right after every key on this path.
+                    // `prime_*` self-guards on an empty buffer: it fills the field the frame it
+                    // opens and is otherwise a no-op — including when a step-motion chord (which
+                    // also re-enters this branch while the field is open) must not clobber what
+                    // the user has typed.
                     let mut wizard = wizard.handle_key(key);
                     wizard.prime_what_custom_path(self.run_context.privilege);
                     self.view = View::Wizard(wizard);
@@ -857,6 +859,11 @@ fn render_footer(frame: &mut Frame, area: Rect, wizard: &Wizard, tier: ReflowTie
     // `Enter start backup` rather than the `Ctrl-→ next` the earlier steps show (#61).
     let hints = if wizard.current() == WizardStep::Review {
         crate::keymap::wizard_review_footer(tier)
+    } else if wizard.current() == WizardStep::What && !wizard.what().is_typing() {
+        // The WHAT step's own footer (#106/#107/#148) adds `a add · r remove` to the standard
+        // hints — but only while the Custom-path field is closed; while it's open, the field
+        // owns plain keys and `a`/`r` are inert, so the generic step footer stands instead.
+        crate::keymap::what_step_footer(wizard.state().step_complete(wizard.current()), tier)
     } else {
         crate::keymap::wizard_step_footer(wizard.state().step_complete(wizard.current()), tier)
     };

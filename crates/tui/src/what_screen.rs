@@ -25,6 +25,17 @@
 //! the model, never inside it (ADR-0005 D1). The reducer and render are pure over that state;
 //! the only I/O is the per-file size probe, which goes through `core`'s `fs_probe` rather than
 //! touching the disk directly (ADR-0005 D6).
+//!
+//! **Custom paths (#106/#107/#148) opt out of the recursive explorer above** — its column is a
+//! flat, non-drilling list built by [`custom_path_rows`], since a Custom path is always exactly
+//! one Entry with no allowlist-derived children to descend into (ADR-0006's dated addendum).
+//! `→`/`Enter` there open the add field only when the Category is empty
+//! ([`custom_paths_is_empty`], withheld-inclusive so a withheld-only Category still routes to
+//! its rows); otherwise, like every other Category, they move focus into the Explorer. `a` adds
+//! a Custom path from anywhere in this step; `r` removes the focused Custom-paths row and is
+//! silently inert everywhere else (`self.focus != Explorer` or the shown Category isn't Custom
+//! paths). Emptying the Category via `r` re-opens the add field and resets focus to
+//! `Pane::Categories` so `Esc` lands back on a live row rather than an empty pane.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -35,7 +46,7 @@ use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use linux_backup_core::model::{DirectoryState, Entry, EntryType, SelectionModel};
+use linux_backup_core::model::{DirectoryState, Entry, EntryRoot, EntryType, SelectionModel};
 use linux_backup_core::{catalog, fs_probe, location, Privilege};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -257,11 +268,11 @@ impl WhatScreen {
     }
 
     /// Recomputes the cached `category_rows` from the current categories and selection state
-    /// (#112). Called eagerly at four choke points (`sync_categories`, `toggle`, `select_scope`,
-    /// `commit_custom_path`) rather than on every render. Folds `category_state`'s prior
-    /// double-scan into a single pass over entries.
+    /// (#112). Called eagerly at five choke points (`sync_categories`, `toggle`, `select_scope`,
+    /// `commit_custom_path`, `remove_focused_custom_path`) rather than on every render. Folds
+    /// `category_state`'s prior double-scan into a single pass over entries.
     ///
-    /// Those four are exactly the points where the Selection can have changed under this screen,
+    /// Those five are exactly the points where the Selection can have changed under this screen,
     /// so this is also where [`Self::selection_generation`] is bumped — keeping the two caches on
     /// one invalidation path rather than two that can drift apart.
     fn recompute_category_rows(&mut self, selection: &SelectionModel) {
@@ -377,6 +388,14 @@ impl WhatScreen {
             KeyCode::Tab | KeyCode::BackTab => self.toggle_focus(),
             KeyCode::Char('a') if ctrl => self.select_scope(state, true),
             KeyCode::Char('d') if ctrl => self.select_scope(state, false),
+            // `a` adds a Custom path from anywhere in the WHAT step (#106/#107/#148) — the
+            // app's first bare-letter binding, checked after the `Ctrl-a`/`Ctrl-d` scope-select
+            // arms above so it never shadows them.
+            KeyCode::Char('a') => self.open_add_field(),
+            // `r` removes the focused Custom-paths row; pane-scoped and silently inert
+            // everywhere else (checked inside `remove_focused_custom_path`, which states its
+            // own scope rather than leaning on `core`'s Category guard two crates away).
+            KeyCode::Char('r') => self.remove_focused_custom_path(state),
             KeyCode::Up => self.move_up(1),
             KeyCode::Down => self.move_down(state, 1),
             KeyCode::PageUp => self.move_up(PAGE),
@@ -393,10 +412,15 @@ impl WhatScreen {
                 self.toggle_focus();
             }
             KeyCode::Left | KeyCode::Backspace if self.focus == Pane::Explorer => self.climb(),
-            // On the Categories pane, `→`/`Enter` opens the Custom-path add field when the
-            // Custom-paths row is focused (#50), else moves focus into the explorer it drives.
+            // On the Categories pane, `→`/`Enter` opens the Custom-path add field only when the
+            // Custom-paths Category is empty (#106/#107/#148) — otherwise it moves focus into
+            // the explorer, exactly like every other Category, so the rows `r` can act on are
+            // actually reachable. `custom_paths_is_empty` is withheld-inclusive and shared with
+            // the `[+]` affordance gating in `category_rows`, so the two can't drift.
             KeyCode::Right | KeyCode::Enter => {
-                if self.current_category() == Some(CUSTOM_PATHS) {
+                if self.current_category() == Some(CUSTOM_PATHS)
+                    && custom_paths_is_empty(state.selection())
+                {
                     self.custom_input = Some(CustomInput::default());
                 } else {
                     self.focus = Pane::Explorer;
@@ -405,6 +429,45 @@ impl WhatScreen {
             _ => {}
         }
         self.clamp(state);
+    }
+
+    /// `a`: opens the Custom-path add field from wherever the user currently is (#106/#107/
+    /// #148) — unlike the Categories-pane `→`/`Enter` special case, this never depends on
+    /// which row is focused. Deliberately does not touch `focus`/`breadcrumb`: committing (or
+    /// `Esc`-cancelling) leaves the user exactly where `a` was pressed, mid-Drill-down in
+    /// whatever Category they were in (`commit_custom_path` already never navigates).
+    fn open_add_field(&mut self) {
+        self.custom_input = Some(CustomInput::default());
+    }
+
+    /// `r`: removes the Entry at the focused Custom-paths row (#106/#107/#148) — pane-scoped,
+    /// silently inert unless `self.focus == Pane::Explorer` and the shown Category is Custom
+    /// paths, mirroring the `a` special case's own scope guard rather than leaning on `core`'s
+    /// Category guard two crates away. No subtree sweep: exactly the focused row's Entry.
+    ///
+    /// Emptying the Category this way re-opens the add field, focused, and resets the
+    /// underlying pane focus to `Categories` — without the reset, `Esc` would close the field
+    /// onto the now-empty Explorer, the app's first focusable blank pane where every key
+    /// (`↑↓`, `Space`, the scope chords, `r` itself) is inert. With it, `Esc` lands back on the
+    /// Custom-paths row showing its `[+]` glyph: exactly the state a fresh wizard opens in.
+    fn remove_focused_custom_path(&mut self, state: &mut WizardState) {
+        if self.focus != Pane::Explorer || self.current_category() != Some(CUSTOM_PATHS) {
+            return;
+        }
+        let rows = self.explorer_rows(state);
+        let Some(row) = rows.get(self.explorer_cursor) else {
+            return;
+        };
+        state.selection_mut().remove_custom_path(&row.node_path);
+        self.sync_categories(state.selection());
+        // Unconditional, unlike the `grew` guard inside `sync_categories`: a removal can never
+        // grow the category set, so leaning on that guard would leave both the `category_rows`
+        // and `explorer_cache` (#112) holding the row the user just removed.
+        self.recompute_category_rows(state.selection());
+        if custom_paths_is_empty(state.selection()) {
+            self.custom_input = Some(CustomInput::default());
+            self.focus = Pane::Categories;
+        }
     }
 
     fn toggle_focus(&mut self) {
@@ -530,6 +593,11 @@ impl WhatScreen {
     /// The rows of the directory the explorer currently shows, derived from the Selection (no
     /// stored tree) and memoized in [`Self::explorer_cache`].
     ///
+    /// Custom paths (#106/#107/#148) deliberately opt out of the recursive grouped explorer:
+    /// it renders its own flat, non-drilling list instead, since a Custom path is always
+    /// exactly one Entry with no allowlist-derived children. The memoization is the same
+    /// either way — a flat list is derived from the Selection under the same key.
+    ///
     /// The derivation is `O(log n + k)` in the breadcrumb's own Subtree (#83), but `k` is the
     /// whole Category at a Category's top level and 20k+ in a real wide directory, and a single
     /// keypress used to run it three times over (`active_len`, `clamp`, then `render`). Cursor
@@ -545,18 +613,16 @@ impl WhatScreen {
         {
             return Rc::clone(&cache.rows);
         }
-        let rows = Rc::new(
-            category
-                .map(|category| {
-                    explorer_rows(
-                        state.selection(),
-                        category,
-                        &self.breadcrumb,
-                        &self.size_cache,
-                    )
-                })
-                .unwrap_or_default(),
-        );
+        let rows = Rc::new(match category {
+            Some(CUSTOM_PATHS) => custom_path_rows(state.selection(), &self.size_cache),
+            Some(category) => explorer_rows(
+                state.selection(),
+                category,
+                &self.breadcrumb,
+                &self.size_cache,
+            ),
+            None => Vec::new(),
+        });
         *self.explorer_cache.borrow_mut() = Some(ExplorerCache {
             generation: self.selection_generation,
             category,
@@ -787,6 +853,16 @@ struct CategoryRow {
     add_affordance: bool,
 }
 
+/// Whether the Custom-paths Category holds no Entry at all — **withheld-inclusive** (reads
+/// `entries_in_category`, not the active-only Selection), which is load-bearing (#106/#107/
+/// #148): a Category holding only withheld Custom paths must count as non-empty, so `→` lands
+/// on rows `r` can still act on rather than opening the add field and putting them permanently
+/// out of reach. Shared by the Categories-pane `→`/`Enter` arm and the `[+]` affordance gating
+/// below, so the field-opens condition and the affordance advertising it cannot drift apart.
+fn custom_paths_is_empty(selection: &SelectionModel) -> bool {
+    selection.entries_in_category(CUSTOM_PATHS).is_empty()
+}
+
 /// The tri-state of a whole Category, from its active-vs-total Entry split — the left pane's
 /// analogue of a directory node's [`SelectionModel::directory_state`].
 #[cfg(test)]
@@ -865,9 +941,21 @@ fn set_category(state: &mut WizardState, category: &str, select: bool) {
 /// count, a file its size, an empty directory a dimmed `—`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NodeKind {
-    Directory { children: usize },
+    Directory {
+        children: usize,
+    },
     EmptyDirectory,
-    File { size: u64 },
+    File {
+        size: u64,
+    },
+    /// A directory Custom path (#106/#107/#148) — real, non-empty on disk, but its size is
+    /// unknown here: `fs_probe::subtree_size` doesn't walk (#147), so the flat Custom-paths
+    /// list can only show `—`, same as [`Self::EmptyDirectory`]'s glyph but *not* the same
+    /// meaning, so this stays its own variant rather than reusing that one — reusing it is
+    /// what caused the bug this variant fixes for free: a Custom-path directory used to render
+    /// as `EmptyDirectory` (dimmed, "no children") because the has-children signal only ever
+    /// came from same-Category Entries, which a Custom directory Entry never has.
+    DirectoryUnknownSize,
 }
 
 /// One row of the single-directory explorer, derived from the flat Entries under the current
@@ -894,7 +982,7 @@ impl ExplorerRow {
     fn metric(&self) -> String {
         match &self.kind {
             NodeKind::Directory { children } => format!("{children} items"),
-            NodeKind::EmptyDirectory => "—".to_string(),
+            NodeKind::EmptyDirectory | NodeKind::DirectoryUnknownSize => "—".to_string(),
             NodeKind::File { size } => format_size(*size),
         }
     }
@@ -1056,6 +1144,81 @@ fn explorer_rows(
     rows
 }
 
+/// The Custom-paths Explorer column (#106/#107/#148): a flat list of every added Custom path,
+/// active and withheld — no drill-down, no grouping by path component. A Custom path is always
+/// exactly one Entry with no allowlist-derived children of its own, so the recursive
+/// [`explorer_rows`] machinery (grouping, breadcrumb depth, `→`/`Enter` descent) has nothing to
+/// do here; ADR-0006's dated addendum records this as a deliberate opt-out, not an oversight.
+/// Withheld Entries stay visible (unchecked) alongside active ones, matching #106's "`r` must
+/// work on a withheld path" requirement.
+fn custom_path_rows(
+    selection: &SelectionModel,
+    size_cache: &RefCell<HashMap<PathBuf, u64>>,
+) -> Vec<ExplorerRow> {
+    let root = PathBuf::new();
+    let mut rows: Vec<ExplorerRow> = selection
+        .active_entries_under(&root)
+        .filter(|entry| entry.category == CUSTOM_PATHS)
+        .map(|entry| custom_path_row(entry, DirectoryState::All, size_cache))
+        .chain(
+            selection
+                .withheld_entries_under(&root)
+                .filter(|entry| entry.category == CUSTOM_PATHS)
+                .map(|entry| custom_path_row(entry, DirectoryState::None, size_cache)),
+        )
+        .collect();
+    // Sorted on the rendered label (#107 decision 10): root-scoped (`/`) rows group ahead of
+    // home-scoped (`~/`) ones for free (ASCII `/` < `~`), and the order is always explainable
+    // from what's on screen. The dirs-first split the grouped explorer uses carries no meaning
+    // in a list of hand-picked paths, so it is deliberately dropped here.
+    rows.sort_by_key(|row| row.label.to_lowercase());
+    rows
+}
+
+/// Builds one flat Custom-paths row from `entry`: a tilde-collapsed (Home root) or `/`-rooted
+/// (Absolute root) full path, directories keeping a trailing `/` — derived purely from the
+/// Entry's own `root`/`relative_path` (#107), so no `home` needs threading into this builder
+/// (ADR-0004's no-ambient-reads boundary stays intact). This round-trips with what the user
+/// typed (the add field prefills `~/` non-root, `/` root) and stays honest about an Absolute
+/// root: a bare `relative_path` would render `/etc/hosts` as `etc/hosts`, indistinguishable from
+/// a Home-rooted `~/etc/hosts`.
+fn custom_path_row(
+    entry: &Entry,
+    state: DirectoryState,
+    size_cache: &RefCell<HashMap<PathBuf, u64>>,
+) -> ExplorerRow {
+    let root_prefix = match entry.root {
+        EntryRoot::Home => "~/",
+        EntryRoot::Absolute => "/",
+    };
+    let is_directory = entry.entry_type == EntryType::Directory;
+    let mut label = format!("{root_prefix}{}", entry.relative_path.display());
+    if is_directory {
+        label.push('/');
+    }
+    let kind = if is_directory {
+        // Real directory sizes are out of scope (#147: `fs_probe::subtree_size` doesn't walk) —
+        // this also fixes an existing bug for free: a directory Custom path used to render as
+        // `EmptyDirectory` because the has-children signal only ever came from same-Category
+        // Entries.
+        NodeKind::DirectoryUnknownSize
+    } else {
+        NodeKind::File {
+            size: cached_subtree_size(size_cache, &entry.absolute_path),
+        }
+    };
+    ExplorerRow {
+        label,
+        component: entry.relative_path.as_os_str().to_os_string(),
+        node_path: entry.relative_path.clone(),
+        // File rows only, matching the grouped explorer's rule (#94): a directory Custom path
+        // renders as `DirectoryUnknownSize` and so has no probe to key a spinner against.
+        absolute_path: (!is_directory).then(|| entry.absolute_path.clone()),
+        kind,
+        state,
+    }
+}
+
 /// A memoized wrapper over `fs_probe::subtree_size` (#83): a file row's size is `stat`'d once
 /// and reused for the life of the [`WhatScreen`] it belongs to, rather than re-`stat`'d on every
 /// redraw/keypress `explorer_rows` runs for. `render` takes `&WhatScreen` (ADR-0005 D1's pure
@@ -1093,7 +1256,7 @@ fn set_node(state: &mut WizardState, row: &ExplorerRow, select: bool) {
                 selection.deselect_entry(&row.node_path);
             }
         }
-        NodeKind::Directory { .. } | NodeKind::EmptyDirectory => {
+        NodeKind::Directory { .. } | NodeKind::EmptyDirectory | NodeKind::DirectoryUnknownSize => {
             if select {
                 selection.reselect_root(&row.node_path);
             } else {
@@ -2199,6 +2362,9 @@ mod tests {
 
     #[test]
     fn right_on_the_custom_paths_row_opens_the_add_field() {
+        // #106/#107/#148 re-scope: → unconditionally opening the field was only ever right for
+        // an *empty* Custom-paths Category (the story this fixture exercises — `nested_selection`
+        // has none). A non-empty row's behavior is pinned separately below.
         let mut state = state_of(nested_selection());
         let mut screen = WhatScreen::new(state.selection());
         screen.category_cursor = custom_paths_index(&screen);
@@ -2206,10 +2372,27 @@ mod tests {
         screen.handle_key(key(KeyCode::Right), &mut state);
         assert!(
             screen.is_typing(),
-            "→ on the Custom paths row opens the field"
+            "→ on the empty Custom paths row opens the field"
         );
         // Focus stays on Categories, not the explorer, while the field is open.
         assert_eq!(screen.focus, Pane::Categories);
+    }
+
+    #[test]
+    fn right_on_a_non_empty_custom_paths_row_moves_focus_into_the_explorer() {
+        let mut selection = nested_selection();
+        selection.add_custom_path(Path::new("/home/tester/notes.md"), Path::new(HOME));
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+
+        screen.handle_key(key(KeyCode::Right), &mut state);
+
+        assert!(
+            !screen.is_typing(),
+            "→ on a non-empty Custom paths row must not open the add field"
+        );
+        assert_eq!(screen.focus, Pane::Explorer);
     }
 
     #[test]
@@ -2221,6 +2404,235 @@ mod tests {
         screen.handle_key(key(KeyCode::Right), &mut state);
         assert!(!screen.is_typing());
         assert_eq!(screen.focus, Pane::Explorer);
+    }
+
+    // --- Custom-paths remove/add verbs (#106/#107/#148) --------------------------------------
+
+    #[test]
+    fn r_removes_the_focused_custom_path_row() {
+        let mut selection = SelectionModel::new(Vec::new());
+        selection.add_custom_path(Path::new("/home/tester/keep.md"), Path::new(HOME));
+        selection.add_custom_path(Path::new("/home/tester/forget.md"), Path::new(HOME));
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+        assert_eq!(screen.focus, Pane::Explorer);
+        let before = screen.explorer_rows(&state);
+        assert_eq!(before.len(), 2);
+        let removed_label = before[screen.explorer_cursor].label.clone();
+
+        screen.handle_key(key(KeyCode::Char('r')), &mut state);
+
+        let after = screen.explorer_rows(&state);
+        assert_eq!(after.len(), 1);
+        assert!(!after.iter().any(|r| r.label == removed_label));
+        assert_eq!(
+            screen.focus,
+            Pane::Explorer,
+            "removal must not reset focus while the Category still holds a path"
+        );
+    }
+
+    #[test]
+    fn r_is_inert_on_the_categories_pane() {
+        let mut selection = SelectionModel::new(Vec::new());
+        selection.add_custom_path(Path::new("/home/tester/notes.md"), Path::new(HOME));
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        assert_eq!(screen.focus, Pane::Categories);
+
+        screen.handle_key(key(KeyCode::Char('r')), &mut state);
+
+        assert_eq!(
+            state.selection().entries_in_category(CUSTOM_PATHS).len(),
+            1,
+            "r must no-op while focus is on the Categories pane"
+        );
+    }
+
+    #[test]
+    fn r_is_inert_on_another_categorys_explorer_row() {
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state); // KDE Plasma row focused in the Explorer
+
+        screen.handle_key(key(KeyCode::Char('r')), &mut state);
+
+        assert_eq!(
+            state.selection().entries().len(),
+            4,
+            "r must no-op on any Category other than Custom paths"
+        );
+    }
+
+    #[test]
+    fn r_removes_a_withheld_custom_path_row() {
+        let mut selection = SelectionModel::new(Vec::new());
+        selection.add_custom_path(Path::new("/home/tester/keep.md"), Path::new(HOME));
+        selection.add_custom_path(Path::new("/home/tester/notes.md"), Path::new(HOME));
+        selection.deselect_entry(Path::new("notes.md"));
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+        let rows = screen.explorer_rows(&state);
+        let withheld_index = rows
+            .iter()
+            .position(|r| r.label.contains("notes.md"))
+            .expect("the withheld row is still listed");
+        screen.explorer_cursor = withheld_index;
+
+        screen.handle_key(key(KeyCode::Char('r')), &mut state);
+
+        assert!(state
+            .selection()
+            .entries_in_category(CUSTOM_PATHS)
+            .iter()
+            .all(|e| e.relative_path != Path::new("notes.md")));
+    }
+
+    #[test]
+    fn cursor_holds_index_after_r_and_the_next_row_slides_under_it() {
+        let mut selection = SelectionModel::new(Vec::new());
+        selection.add_custom_path(Path::new("/home/tester/a.md"), Path::new(HOME));
+        selection.add_custom_path(Path::new("/home/tester/b.md"), Path::new(HOME));
+        selection.add_custom_path(Path::new("/home/tester/c.md"), Path::new(HOME));
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+        let before = screen.explorer_rows(&state);
+        assert_eq!(before.len(), 3);
+        screen.explorer_cursor = 0;
+        let second_label = before[1].label.clone();
+
+        screen.handle_key(key(KeyCode::Char('r')), &mut state);
+
+        let after = screen.explorer_rows(&state);
+        assert_eq!(after.len(), 2);
+        assert_eq!(screen.explorer_cursor, 0, "the cursor holds its index");
+        assert_eq!(
+            after[0].label, second_label,
+            "the next row slides under the held cursor"
+        );
+    }
+
+    #[test]
+    fn removing_the_last_custom_path_opens_the_add_field_and_resets_focus_to_categories() {
+        let mut selection = SelectionModel::new(Vec::new());
+        selection.add_custom_path(Path::new("/home/tester/only.md"), Path::new(HOME));
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+        assert_eq!(screen.focus, Pane::Explorer);
+
+        screen.handle_key(key(KeyCode::Char('r')), &mut state);
+
+        assert!(
+            screen.is_typing(),
+            "removing the last Custom path re-opens the add field"
+        );
+        assert_eq!(screen.focus, Pane::Categories);
+
+        // Esc from the auto-opened field must land back on the Custom-paths row, not an empty
+        // Explorer pane where every key is inert.
+        screen.handle_field_key(
+            key(KeyCode::Esc),
+            &mut state,
+            Path::new(HOME),
+            Privilege::NonRoot,
+            &no_env,
+        );
+        assert!(!screen.is_typing());
+        assert_eq!(screen.focus, Pane::Categories);
+        assert_eq!(screen.category_cursor, custom_paths_index(&screen));
+    }
+
+    #[test]
+    fn a_opens_the_add_field_from_another_category_and_commit_does_not_navigate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        std::fs::write(home.join("notes.md"), b"x").expect("fixture file");
+        let mut state = WizardState::new(nested_selection(), Some(home.to_path_buf()));
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state); // KDE Plasma explorer focused
+        let breadcrumb_before = screen.breadcrumb.clone();
+
+        screen.handle_key(key(KeyCode::Char('a')), &mut state);
+        assert!(screen.is_typing(), "a opens the field from anywhere");
+        assert_eq!(
+            screen.focus,
+            Pane::Explorer,
+            "opening the field must not move focus"
+        );
+
+        drive_field(&mut screen, &mut state, home, "~/notes.md", KeyCode::Enter);
+
+        assert!(!screen.is_typing(), "committing closes the field");
+        assert_eq!(screen.focus, Pane::Explorer, "committing must not navigate");
+        assert_eq!(screen.breadcrumb, breadcrumb_before);
+        assert!(state
+            .selection()
+            .entries()
+            .iter()
+            .any(|e| e.absolute_path == home.join("notes.md")));
+    }
+
+    #[test]
+    fn custom_paths_flat_list_reads_tilde_collapsed_sorted_with_directory_dash_metric() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let other_root = tempfile::tempdir().expect("tempdir");
+
+        let file_path = home.join("notes.md");
+        std::fs::write(&file_path, b"0123456789").expect("write fixture file");
+        let dir_path = home.join("projects");
+        std::fs::create_dir(&dir_path).expect("fixture dir");
+        let absolute_path = other_root.path().join("elsewhere.txt");
+        std::fs::write(&absolute_path, b"x").expect("write fixture file");
+
+        let mut selection = SelectionModel::new(Vec::new());
+        selection.add_custom_path(&file_path, home);
+        selection.add_custom_path(&dir_path, home);
+        selection.add_custom_path(&absolute_path, home);
+
+        let mut state = WizardState::new(selection, Some(home.to_path_buf()));
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+
+        let rows = screen.explorer_rows(&state);
+        assert_eq!(rows.len(), 3);
+
+        // Root-scoped (`/`) rows sort ahead of home-scoped (`~/`) ones for free (ASCII `/` < `~`).
+        assert!(
+            rows[0].label.starts_with('/'),
+            "expected the Absolute-rooted row first: {:?}",
+            rows.iter().map(|r| &r.label).collect::<Vec<_>>()
+        );
+        let home_rows: Vec<&ExplorerRow> =
+            rows.iter().filter(|r| r.label.starts_with('~')).collect();
+        assert_eq!(home_rows.len(), 2);
+        assert_eq!(home_rows[0].label, "~/notes.md");
+        assert_eq!(home_rows[1].label, "~/projects/");
+
+        let notes_row = rows
+            .iter()
+            .find(|r| r.label == "~/notes.md")
+            .expect("file row present");
+        assert_eq!(notes_row.metric(), "10 B");
+        let projects_row = rows
+            .iter()
+            .find(|r| r.label == "~/projects/")
+            .expect("directory row present");
+        assert_eq!(
+            projects_row.metric(),
+            "—",
+            "a directory Custom path shows an unknown-size dash, not an empty-directory dash"
+        );
     }
 
     #[test]

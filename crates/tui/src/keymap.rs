@@ -72,6 +72,12 @@ pub(crate) const CTRL_C: Chord = ctrl("Ctrl-C", KeyCode::Char('c'));
 const CTRL_A: Chord = ctrl("Ctrl-A", KeyCode::Char('a'));
 const CTRL_D: Chord = ctrl("Ctrl-D", KeyCode::Char('d'));
 const SPACE: Chord = plain("Space", KeyCode::Char(' '));
+/// The WHAT step's Custom-paths verbs (#106/#107/#148) — the app's first **bare**-letter
+/// bindings (every prior letter chord rides `Ctrl-`). Spelled lowercase (see `derived_spelling`'s
+/// modifierless-`Char` case below) so the overlay/footer never suggest a Shift chord the reducer
+/// doesn't bind.
+const CHAR_A: Chord = plain("a", KeyCode::Char('a'));
+const CHAR_R: Chord = plain("r", KeyCode::Char('r'));
 
 // Display-only composites: `code`/`mods` are a representative key (never matched), the spelling
 // carries the glyph set the reference prints.
@@ -131,6 +137,7 @@ pub(crate) enum Group {
     Panes,
     PathField,
     Select,
+    CustomPaths,
     Steps,
     Review,
     Reveal,
@@ -149,6 +156,7 @@ impl Group {
             Self::Panes => "Panes",
             Self::PathField => "Path field",
             Self::Select => "Select",
+            Self::CustomPaths => "Custom paths",
             Self::Steps => "Steps",
             Self::Review => "REVIEW",
             Self::Reveal => "Reveal",
@@ -167,6 +175,7 @@ pub(crate) const OVERLAY_GROUPS: &[Group] = &[
     Group::Panes,
     Group::PathField,
     Group::Select,
+    Group::CustomPaths,
     Group::Steps,
     Group::Review,
     Group::Reveal,
@@ -257,6 +266,12 @@ pub(crate) const CLOSE: Binding = Binding {
     // shows no `Enter` hint), the overlay carries it.
     overlay_note: Some("(when done)"),
 };
+/// `a` adds a Custom path from anywhere in the WHAT step (#106/#107/#148) — the creative verb
+/// reaches anywhere, unlike its destructive counterpart below.
+pub(crate) const ADD_CUSTOM_PATH: Binding = binding(CHAR_A, "add", Group::CustomPaths);
+/// `r` removes the focused Custom-paths row, pane-scoped (silently inert off the Custom-paths
+/// Explorer rows) — deliberately narrower than `a`'s reach anywhere.
+pub(crate) const REMOVE_CUSTOM_PATH: Binding = binding(CHAR_R, "remove", Group::CustomPaths);
 pub(crate) const UNLOCK: Binding = footer_only(ENTER, "unlock");
 pub(crate) const SCROLL: Binding = footer_only(UP_DOWN_SLASH, "scroll");
 /// The restore unlock reveal toggle; the footer flips its verb to `hide` while revealed (a state
@@ -284,6 +299,9 @@ pub(crate) const CATALOG: &[Binding] = &[
     binding(SPACE, "toggle (dir = whole subtree)", Group::Select),
     binding(CTRL_A, "all", Group::Select),
     binding(CTRL_D, "none", Group::Select),
+    // Custom paths
+    ADD_CUSTOM_PATH,
+    REMOVE_CUSTOM_PATH,
     // Steps
     NEXT,
     BACK_STEP,
@@ -343,6 +361,21 @@ pub(crate) fn wizard_step_footer(forward_complete: bool, tier: ReflowTier) -> St
         ReflowTier::Minimum | ReflowTier::Refuse => vec![forward, HELP.label()],
     };
     join(&labels)
+}
+
+/// The WHAT step's own footer (#106/#107/#148): the standard step footer plus `a add · r remove`,
+/// so the app's first bare-letter chords are discoverable on first encounter rather than
+/// overlay-only — the auto-open-on-empty behavior (#106) means a first-time user can land in the
+/// add field having never seen `r` mentioned anywhere. `render_footer` selects this only while the
+/// Custom-path field is closed (`!what.is_typing()`): while it's open, `a`/`r` are inert (the
+/// field owns plain keys) and this footer would otherwise advertise two keys that do nothing.
+#[must_use]
+pub(crate) fn what_step_footer(forward_complete: bool, tier: ReflowTier) -> String {
+    join(&[
+        wizard_step_footer(forward_complete, tier),
+        ADD_CUSTOM_PATH.label(),
+        REMOVE_CUSTOM_PATH.label(),
+    ])
 }
 
 /// The wizard footer on the terminal REVIEW step: the forward action is launching the run, so it
@@ -427,6 +460,15 @@ mod tests {
         assert_eq!(START_BACKUP.label(), "Enter start backup"); // was `REVIEW: Enter start`
     }
 
+    /// #106/#107/#148: the app's first bare-letter chords spell lowercase, not the uppercase
+    /// every prior letter chord (always a `Ctrl-` chord) used — `A add`/`R remove` would
+    /// misleadingly read as Shift chords the reducer never binds.
+    #[test]
+    fn bare_letter_custom_path_chords_spell_lowercase() {
+        assert_eq!(ADD_CUSTOM_PATH.label(), "a add");
+        assert_eq!(REMOVE_CUSTOM_PATH.label(), "r remove");
+    }
+
     /// Drift guard: every label any footer can emit is a catalog binding label (or one of the two
     /// documented state variants). A footer built from a chord/verb not in the catalog fails here.
     #[test]
@@ -448,6 +490,8 @@ mod tests {
             footers.push(wizard_step_footer(true, tier));
             footers.push(wizard_step_footer(false, tier));
             footers.push(wizard_review_footer(tier));
+            footers.push(what_step_footer(true, tier));
+            footers.push(what_step_footer(false, tier));
         }
         footers.push(restore_confirm_footer());
         footers.push(restore_unlock_footer(false));
@@ -502,17 +546,25 @@ mod tests {
     /// claims for standard chords; the test below enforces it so a spelling can't silently name a
     /// different key than it binds (`plain("Entr", KeyCode::Enter)` must fail).
     fn derived_spelling(chord: Chord) -> Option<String> {
+        let ctrl = chord.mods.contains(KeyModifiers::CONTROL);
+        let alt = chord.mods.contains(KeyModifiers::ALT);
         let base = match chord.code {
             KeyCode::Enter => "Enter".to_owned(),
             KeyCode::Esc => "Esc".to_owned(),
             KeyCode::Char(' ') => "Space".to_owned(),
-            KeyCode::Char(c) => c.to_ascii_uppercase().to_string(),
+            // A modified letter chord (today, only `Ctrl-A`/`Ctrl-D`) still uppercases — that's
+            // the Shift-adjacent convention every prior letter chord in the catalog used, since
+            // every one of them rode `Ctrl-`. A bare, modifierless letter (#106/#107/#148's `a`/
+            // `r`, the app's first) spells lowercase instead: uppercasing it here would print
+            // `A add`/`R remove`, advertising a Shift chord the reducer never binds.
+            KeyCode::Char(c) if ctrl || alt => c.to_ascii_uppercase().to_string(),
+            KeyCode::Char(c) => c.to_string(),
             KeyCode::F(n) => format!("F{n}"),
             _ => return None,
         };
-        let prefix = if chord.mods.contains(KeyModifiers::CONTROL) {
+        let prefix = if ctrl {
             "Ctrl-"
-        } else if chord.mods.contains(KeyModifiers::ALT) {
+        } else if alt {
             "Alt-"
         } else {
             ""
