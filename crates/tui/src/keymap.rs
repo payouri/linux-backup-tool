@@ -363,19 +363,41 @@ pub(crate) fn wizard_step_footer(forward_complete: bool, tier: ReflowTier) -> St
     join(&labels)
 }
 
-/// The WHAT step's own footer (#106/#107/#148): the standard step footer plus `a add · r remove`,
-/// so the app's first bare-letter chords are discoverable on first encounter rather than
-/// overlay-only — the auto-open-on-empty behavior (#106) means a first-time user can land in the
-/// add field having never seen `r` mentioned anywhere. `render_footer` selects this only while the
-/// Custom-path field is closed (`!what.is_typing()`): while it's open, `a`/`r` are inert (the
-/// field owns plain keys) and this footer would otherwise advertise two keys that do nothing.
+/// The WHAT step's own footer (#106/#107/#148): the step hints with `a add · r remove` spliced in
+/// ahead of `F1 keys`, so the app's first bare-letter chords are discoverable on first encounter
+/// rather than overlay-only — the auto-open-on-empty behavior (#106) means a first-time user can
+/// land in the add field having never seen `r` mentioned anywhere. `render_footer` selects this
+/// only while the Custom-path field is closed (`!what.is_typing()`): while it's open, `a`/`r` are
+/// inert (the field owns plain keys) and this footer would otherwise advertise two keys that do
+/// nothing.
+///
+/// Composed rung-by-rung rather than appended to [`wizard_step_footer`], for two reasons a plain
+/// append gets wrong. It would grow the line at *every* tier — including `Minimum`, where the
+/// ladder has deliberately shed everything but the forward chord and `F1 keys` — and it would
+/// overflow an 80-column terminal at `Comfortable`/`Default` (82 cols complete, 91 with the
+/// `(locked)` suffix the WHAT gate wears whenever the Selection is empty, which is exactly the
+/// first-run state this footer exists for), clipping the two hints it was added to advertise.
+/// `Esc back/close` is what makes room: `Esc` steps *back*, and WHAT is the first step, so on this
+/// one screen that hint names a key that does nothing. Two live verbs displace one inert one, and
+/// `F1 keys` stays last, as it is in every other footer.
 #[must_use]
 pub(crate) fn what_step_footer(forward_complete: bool, tier: ReflowTier) -> String {
-    join(&[
-        wizard_step_footer(forward_complete, tier),
-        ADD_CUSTOM_PATH.label(),
-        REMOVE_CUSTOM_PATH.label(),
-    ])
+    let forward = if forward_complete {
+        NEXT.label()
+    } else {
+        format!("{} (locked)", NEXT.label())
+    };
+    let verbs = [ADD_CUSTOM_PATH.label(), REMOVE_CUSTOM_PATH.label()];
+    let mut labels = match tier {
+        ReflowTier::Comfortable | ReflowTier::Default => {
+            vec![forward, BACK_STEP.label(), JUMP.label()]
+        }
+        ReflowTier::Tight => vec![forward, BACK_STEP.label()],
+        ReflowTier::Minimum | ReflowTier::Refuse => vec![forward],
+    };
+    labels.extend(verbs);
+    labels.push(HELP.label());
+    join(&labels)
 }
 
 /// The wizard footer on the terminal REVIEW step: the forward action is launching the run, so it
@@ -469,16 +491,38 @@ mod tests {
         assert_eq!(REMOVE_CUSTOM_PATH.label(), "r remove");
     }
 
-    /// Drift guard: every label any footer can emit is a catalog binding label (or one of the two
-    /// documented state variants). A footer built from a chord/verb not in the catalog fails here.
+    /// #148 story 26: the WHAT footer advertises both Custom-paths verbs at *every* tier — they
+    /// are the step's own vocabulary, so they outrank the generic step hints the ladder sheds
+    /// around them — and still ends on `F1 keys` like every other footer.
     #[test]
-    fn every_footer_label_is_a_catalog_entry() {
-        let mut allowed: Vec<String> = CATALOG.iter().map(Binding::label).collect();
-        // The two state variants the footer composes off a base binding (#74 "binding + state
-        // suffix", not a parallel literal).
-        allowed.push(format!("{} (locked)", NEXT.label()));
-        allowed.push(format!("{} hide", REVEAL.chord.spelling));
+    fn the_what_footer_keeps_both_custom_path_verbs_at_every_tier() {
+        for tier in [
+            ReflowTier::Comfortable,
+            ReflowTier::Default,
+            ReflowTier::Tight,
+            ReflowTier::Minimum,
+            ReflowTier::Refuse,
+        ] {
+            for footer in [what_step_footer(true, tier), what_step_footer(false, tier)] {
+                assert!(
+                    footer.contains(&ADD_CUSTOM_PATH.label()),
+                    "{tier:?} lost `a add`: {footer:?}"
+                );
+                assert!(
+                    footer.contains(&REMOVE_CUSTOM_PATH.label()),
+                    "{tier:?} lost `r remove`: {footer:?}"
+                );
+                assert!(
+                    footer.ends_with(&HELP.label()),
+                    "{tier:?} must still end on the help hint: {footer:?}"
+                );
+            }
+        }
+    }
 
+    /// Every footer line the app can render, at every reflow tier — the enumeration both drift
+    /// guards below share, so a new footer added to one is covered by the other for free.
+    fn all_footers() -> Vec<String> {
         let mut footers = Vec::new();
         for tier in [
             ReflowTier::Comfortable,
@@ -501,8 +545,43 @@ mod tests {
         footers.push(report_footer(false));
         footers.push(close_footer());
         footers.push(help_only_footer());
+        footers
+    }
 
-        for footer in &footers {
+    /// The reference terminal width the footer must fit. `render_footer` draws its line into an
+    /// unwrapped `Paragraph`, so anything past the terminal's width is silently clipped — and a
+    /// footer's *tail* is where a step's own verbs are appended, so an overflow eats exactly the
+    /// hints the step added. 80 is the same reference the keybinding overlay already caps its
+    /// panel at (`help::render`), and the reflow ladder can't rescue this: its rungs key off
+    /// terminal *height*, so no tier is narrow enough to trigger shedding on a short-but-wide
+    /// terminal.
+    const REFERENCE_COLS: usize = 80;
+
+    /// Drift guard: no footer overflows [`REFERENCE_COLS`]. Every glyph the footers use (`→`,
+    /// `←`, `↑`, `↓`, `·`) is one display column wide, so a `char` count is the column count.
+    #[test]
+    fn no_footer_overflows_the_reference_terminal_width() {
+        for footer in all_footers() {
+            let cols = footer.chars().count();
+            assert!(
+                cols <= REFERENCE_COLS,
+                "footer is {cols} cols wide, past the {REFERENCE_COLS}-col reference — its tail \
+                 will be clipped: {footer:?}"
+            );
+        }
+    }
+
+    /// Drift guard: every label any footer can emit is a catalog binding label (or one of the two
+    /// documented state variants). A footer built from a chord/verb not in the catalog fails here.
+    #[test]
+    fn every_footer_label_is_a_catalog_entry() {
+        let mut allowed: Vec<String> = CATALOG.iter().map(Binding::label).collect();
+        // The two state variants the footer composes off a base binding (#74 "binding + state
+        // suffix", not a parallel literal).
+        allowed.push(format!("{} (locked)", NEXT.label()));
+        allowed.push(format!("{} hide", REVEAL.chord.spelling));
+
+        for footer in &all_footers() {
             for label in footer.split(SEP) {
                 assert!(
                     allowed.iter().any(|a| a == label),
