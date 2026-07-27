@@ -30,6 +30,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
@@ -149,6 +150,36 @@ pub struct WhatScreen {
     /// O(categories × entries) recomputation on every render and folds `category_state`'s prior
     /// double-scan into a single pass.
     category_rows: Vec<CategoryRow>,
+    /// Bumped at each of the same four Selection-mutating choke points that recompute
+    /// [`Self::category_rows`] — the staleness signal in [`Self::explorer_cache`]'s key. A
+    /// counter rather than a `bool` dirty flag so the key is a value comparison with no reset
+    /// step to forget, and it can never report "clean" for a generation it hasn't seen.
+    selection_generation: u64,
+    /// Memoized right-pane explorer rows, keyed by everything that can change them: the
+    /// Selection generation above, the focused Category, and the breadcrumb.
+    ///
+    /// Lazy-with-a-key rather than #112's eager-recompute-at-choke-points shape, because the
+    /// explorer rows depend on two things a Selection mutation doesn't cover — the focused
+    /// Category and the breadcrumb — whose writers (`set_cursor`, `descend`, `climb`) don't
+    /// carry a `&SelectionModel` to recompute from. Putting those inputs *in the key* keeps
+    /// every one of them correct without threading the Selection through the cursor writers,
+    /// and makes a missed choke point impossible for anything but a Selection edit.
+    ///
+    /// Interior mutability for the same reason [`Self::size_cache`] needs it: `render` only ever
+    /// holds `&WhatScreen` (ADR-0005 D1's pure render), and this is the cache that keeps the
+    /// render off the O(Subtree) derivation entirely.
+    explorer_cache: RefCell<Option<ExplorerCache>>,
+}
+
+/// [`WhatScreen::explorer_cache`]'s contents: the derived rows plus the exact inputs they were
+/// derived from. Rows are shared by `Rc` so a hit hands out a clone of the handle, never a copy
+/// of a Subtree's worth of rows.
+#[derive(Debug)]
+struct ExplorerCache {
+    generation: u64,
+    category: Option<&'static str>,
+    breadcrumb: Vec<OsString>,
+    rows: Rc<Vec<ExplorerRow>>,
 }
 
 /// The view state of the Custom-path add field — the buffer plus its autocomplete cursor and
@@ -229,7 +260,12 @@ impl WhatScreen {
     /// (#112). Called eagerly at four choke points (`sync_categories`, `toggle`, `select_scope`,
     /// `commit_custom_path`) rather than on every render. Folds `category_state`'s prior
     /// double-scan into a single pass over entries.
+    ///
+    /// Those four are exactly the points where the Selection can have changed under this screen,
+    /// so this is also where [`Self::selection_generation`] is bumped — keeping the two caches on
+    /// one invalidation path rather than two that can drift apart.
     fn recompute_category_rows(&mut self, selection: &SelectionModel) {
+        self.selection_generation = self.selection_generation.wrapping_add(1);
         self.category_rows = self
             .categories
             .iter()
@@ -478,27 +514,56 @@ impl WhatScreen {
                 }
             }
             Pane::Explorer => {
-                for row in self.explorer_rows(state) {
-                    set_node(state, &row, select);
+                // A snapshot of the rows as they stand before the loop: `set_node` mutates the
+                // Selection the rows were derived from, so iterating the shared handle (rather
+                // than re-deriving per row) is both what keeps this one pass and what keeps it
+                // reading the same list the user saw.
+                let rows = self.explorer_rows(state);
+                for row in rows.iter() {
+                    set_node(state, row, select);
                 }
             }
         }
         self.recompute_category_rows(state.selection());
     }
 
-    /// The rows of the directory the explorer currently shows, derived fresh from the
-    /// Selection (no stored tree).
-    fn explorer_rows(&self, state: &WizardState) -> Vec<ExplorerRow> {
-        self.current_category()
-            .map(|category| {
-                explorer_rows(
-                    state.selection(),
-                    category,
-                    &self.breadcrumb,
-                    &self.size_cache,
-                )
-            })
-            .unwrap_or_default()
+    /// The rows of the directory the explorer currently shows, derived from the Selection (no
+    /// stored tree) and memoized in [`Self::explorer_cache`].
+    ///
+    /// The derivation is `O(log n + k)` in the breadcrumb's own Subtree (#83), but `k` is the
+    /// whole Category at a Category's top level and 20k+ in a real wide directory, and a single
+    /// keypress used to run it three times over (`active_len`, `clamp`, then `render`). Cursor
+    /// motion changes none of this function's inputs, so on a movement key every call after the
+    /// first is a key comparison; only a Selection edit, a Category switch, or a drill-down
+    /// re-derives.
+    fn explorer_rows(&self, state: &WizardState) -> Rc<Vec<ExplorerRow>> {
+        let category = self.current_category();
+        if let Some(cache) = self.explorer_cache.borrow().as_ref()
+            && cache.generation == self.selection_generation
+            && cache.category == category
+            && cache.breadcrumb == self.breadcrumb
+        {
+            return Rc::clone(&cache.rows);
+        }
+        let rows = Rc::new(
+            category
+                .map(|category| {
+                    explorer_rows(
+                        state.selection(),
+                        category,
+                        &self.breadcrumb,
+                        &self.size_cache,
+                    )
+                })
+                .unwrap_or_default(),
+        );
+        *self.explorer_cache.borrow_mut() = Some(ExplorerCache {
+            generation: self.selection_generation,
+            category,
+            breadcrumb: self.breadcrumb.clone(),
+            rows: Rc::clone(&rows),
+        });
+        rows
     }
 
     /// Keeps both cursors within their (possibly shrunk) row counts after any action.
@@ -508,6 +573,15 @@ impl WhatScreen {
             self.category_cursor = self.category_cursor.min(categories - 1);
         } else {
             self.category_cursor = 0;
+        }
+        // A cursor already at 0 is in range for *every* row count — `min(0, len - 1)` is 0, and
+        // the empty-pane branch sets 0 — so the clamp below is a provable no-op there. Skipping
+        // it skips the row derivation it would need, which matters because a Categories-pane
+        // cursor move resets `explorer_cursor` to 0 (#111) and would otherwise re-derive the
+        // newly focused Category's whole listing inside the reducer, on every keystroke, purely
+        // to confirm that 0 is still a valid index.
+        if self.explorer_cursor == 0 {
+            return;
         }
         let explorer = self.explorer_rows(state).len();
         if explorer > 0 {
@@ -1341,9 +1415,17 @@ fn render_explorer(
         split[0],
     );
 
+    // Format only the rows this pane can actually show, rather than formatting all of them and
+    // letting `Paragraph::scroll` discard the rest: a real wide directory is 20k+ rows against a
+    // viewport of a few dozen, and the discarded 99% cost a `format!` each, every frame. Slicing
+    // here is what makes the per-frame cost the viewport's size instead of the Subtree's — so the
+    // scroll is applied by the slice, and the widget itself renders unscrolled.
+    let offset = scroll_offset(split[1].height, cursor) as usize;
     let lines: Vec<Line> = rows
         .iter()
         .enumerate()
+        .skip(offset)
+        .take(split[1].height as usize)
         .map(|(index, row)| {
             let marker = if focused && index == cursor {
                 glyphs.pointer
@@ -1366,10 +1448,7 @@ fn render_explorer(
             }
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(lines).scroll((scroll_offset(split[1].height, cursor), 0)),
-        split[1],
-    );
+    frame.render_widget(Paragraph::new(lines), split[1]);
 }
 
 /// The vertical scroll offset that keeps `cursor` visible in a pane `height` rows tall
@@ -2848,6 +2927,211 @@ mod tests {
                 .iter()
                 .all(|row| row.selected == usize::MAX),
             "a movement burst must not recompute category_rows even on a large Selection"
+        );
+    }
+
+    /// A Category whose top level holds one directory that in turn holds `WIDE` files — the real
+    /// `~/.local/share/icons/<theme>/actions` shape, plus an equally large unrelated sibling.
+    fn wide_directory_selection(wide: usize) -> SelectionModel {
+        let mut entries: Vec<Entry> = (0..wide)
+            .map(|i| {
+                entry(
+                    "KDE Plasma",
+                    EntryType::File,
+                    &format!(".local/share/icons/theme/actions/icon{i}.svg"),
+                )
+            })
+            .collect();
+        entries.extend((0..wide).map(|i| {
+            entry(
+                "KDE Plasma",
+                EntryType::File,
+                &format!(".local/share/icons/sibling-theme/icon{i}.svg"),
+            )
+        }));
+        SelectionModel::new(entries)
+    }
+
+    fn into_wide_leaf(screen: &mut WhatScreen, state: &mut WizardState) {
+        focus_explorer(screen, state);
+        screen.breadcrumb = vec![
+            OsString::from(".local"),
+            OsString::from("share"),
+            OsString::from("icons"),
+            OsString::from("theme"),
+            OsString::from("actions"),
+        ];
+    }
+
+    #[test]
+    fn cursor_motion_in_a_wide_directory_never_re_derives_the_explorer_rows() {
+        // The reported symptom: with a real large Selection the Explorer cursor lagged badly
+        // behind the keypress. A single arrow used to derive the whole directory listing three
+        // times over (`active_len`, `clamp`, then `render`), each an O(Subtree) pass — 20k rows
+        // here. Cursor motion changes none of the rows' inputs, so after the first derivation a
+        // movement burst must be answered entirely from the memo.
+        const WIDE: usize = 20_000;
+        let mut state = state_of(wide_directory_selection(WIDE));
+        let mut screen = WhatScreen::new(state.selection());
+        into_wide_leaf(&mut screen, &mut state);
+
+        // Prime the memo, then swap the derived rows for a sentinel only a re-derivation could
+        // erase — the same observable-staleness trick `explorer_rows_size_cache_avoids_restatting
+        // _an_unchanged_file_on_every_render` uses on the size cache.
+        assert_eq!(screen.explorer_rows(&state).len(), WIDE);
+        if let Some(cache) = screen.explorer_cache.borrow_mut().as_mut() {
+            cache.rows = Rc::new(Vec::new());
+        }
+
+        for _ in 0..200 {
+            screen.handle_key(key(KeyCode::Down), &mut state);
+        }
+        for _ in 0..200 {
+            screen.handle_key(key(KeyCode::Up), &mut state);
+        }
+
+        assert!(
+            screen.explorer_rows(&state).is_empty(),
+            "a 400-key movement burst re-derived the listing — the explorer memo is not holding \
+             across cursor motion, which is exactly the per-keystroke O(Subtree) cost this fixes"
+        );
+    }
+
+    #[test]
+    fn the_explorer_memo_reflects_a_selection_edit_a_category_switch_and_a_drill_down() {
+        // The memo is only safe if every input that changes the rows is in its key. One test per
+        // key dimension, asserting through the rows themselves rather than the cache internals.
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+
+        // Drill-down: the breadcrumb is part of the key.
+        let top = screen.explorer_rows(&state);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].label, ".local/");
+        screen.handle_key(key(KeyCode::Right), &mut state);
+        let descended = screen.explorer_rows(&state);
+        assert_eq!(descended[0].label, "share/", "descent must re-derive");
+        screen.handle_key(key(KeyCode::Left), &mut state);
+        assert_eq!(
+            screen.explorer_rows(&state)[0].label,
+            ".local/",
+            "climbing back must re-derive"
+        );
+
+        // Selection edit: the generation is part of the key.
+        let before = screen.explorer_rows(&state)[0].state;
+        assert_eq!(before, DirectoryState::All);
+        screen.handle_key(key(KeyCode::Char(' ')), &mut state);
+        assert_eq!(
+            screen.explorer_rows(&state)[0].state,
+            DirectoryState::None,
+            "a Space toggle must be visible in the very next derivation"
+        );
+
+        // Category switch: the focused Category is part of the key.
+        screen.handle_key(key(KeyCode::Tab), &mut state);
+        screen.handle_key(key(KeyCode::Down), &mut state);
+        assert_eq!(screen.current_category(), Some("Shell"));
+        assert_eq!(
+            screen.explorer_rows(&state)[0].label,
+            ".zshrc",
+            "switching Category must re-derive against the new Category"
+        );
+    }
+
+    #[test]
+    fn a_scrolled_explorer_draws_the_window_around_its_cursor() {
+        // The render formats only the visible slice rather than every row. The window it picks
+        // must still be the one holding the cursor, with the cursor marker on the right row.
+        const WIDE: usize = 20_000;
+        let mut state = state_of(wide_directory_selection(WIDE));
+        let mut screen = WhatScreen::new(state.selection());
+        into_wide_leaf(&mut screen, &mut state);
+        for _ in 0..500 {
+            screen.handle_key(key(KeyCode::Down), &mut state);
+        }
+        assert_eq!(screen.explorer_cursor, 500);
+
+        // Rows sort case-insensitively by label, so index 500 is whatever that ordering puts
+        // there — read it off the listing rather than assuming a numeric sequence.
+        let rows = screen.explorer_rows(&state);
+        let focused = rows[500].label.clone();
+        let first = rows[0].label.clone();
+
+        let lines = render_to_lines(&screen, &state, 120, 20);
+        let joined = lines.join("\n");
+        let cursor_row = lines
+            .iter()
+            .find(|line| line.contains(Glyphs::UNICODE.pointer))
+            .expect("the focused row is drawn inside the visible window");
+        assert!(
+            cursor_row.contains(&focused),
+            "the cursor marker must sit on row 500 ({focused}), got: {cursor_row}"
+        );
+        assert!(
+            !joined.contains(&first),
+            "row 0 ({first}) is scrolled far out of a 20-row viewport and must not be drawn: \
+             {joined}"
+        );
+    }
+
+    #[test]
+    fn clamp_still_pulls_a_non_zero_out_of_range_explorer_cursor_back_into_range() {
+        // `clamp` now skips its row derivation when the cursor is already 0 — provably in range
+        // for every row count, so the derivation only ever confirmed what arithmetic already
+        // guarantees. The guard must not cost the clamp its actual job on a *non-zero* cursor,
+        // which is the only case it was ever load-bearing for.
+        let mut state = state_of(nested_selection());
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state);
+        // KDE Plasma's top level is the single `.local/` row, so anything above 0 is out of
+        // range. Park the cursor there directly — no production path leaves it there today, and
+        // the point is that clamp corrects it regardless of how it got there.
+        screen.explorer_cursor = 7;
+
+        screen.handle_key(key(KeyCode::Tab), &mut state);
+
+        assert_eq!(
+            screen.explorer_cursor, 0,
+            "a non-zero cursor past the end of the listing must be clamped back into range"
+        );
+    }
+
+    #[test]
+    fn explorer_render_cost_tracks_the_viewport_not_the_listing_length() {
+        // The render formats only the rows the pane can show. Guarding that with an absolute
+        // millisecond budget would just encode this machine's speed, so compare two renders of
+        // the *same viewport* — one over a small directory, one over a 100x larger one. Slicing
+        // makes them near-identical; formatting every row and letting `Paragraph::scroll` throw
+        // the rest away (the shape this replaced) makes the large one scale with the listing.
+        const SMALL: usize = 200;
+        const WIDE: usize = 20_000;
+
+        fn time_renders(rows: usize) -> std::time::Duration {
+            let mut state = state_of(wide_directory_selection(rows));
+            let mut screen = WhatScreen::new(state.selection());
+            into_wide_leaf(&mut screen, &mut state);
+            // Prime the row memo so this times the render alone, not the derivation.
+            assert_eq!(screen.explorer_rows(&state).len(), rows);
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(render_to_lines(&screen, &state, 120, 30));
+            }
+            started.elapsed()
+        }
+
+        // Warm up first: the very first render in a test binary pays one-off allocator and
+        // backend costs that would otherwise land entirely on whichever size runs first.
+        time_renders(SMALL);
+        let small = time_renders(SMALL);
+        let wide = time_renders(WIDE);
+
+        assert!(
+            wide < small * 5,
+            "rendering a {WIDE}-row directory took {wide:?} against {small:?} for a {SMALL}-row \
+             one into the same viewport — render cost is scaling with the listing length again, \
+             so the visible-window slice in `render_explorer` is gone"
         );
     }
 }
