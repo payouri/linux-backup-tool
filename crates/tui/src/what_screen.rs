@@ -1152,16 +1152,16 @@ fn custom_path_rows(
     size_cache: &RefCell<HashMap<PathBuf, u64>>,
 ) -> Vec<ExplorerRow> {
     let root = PathBuf::new();
+    // Both maps are walked because a withheld Custom path stays listed (unchecked) — but each
+    // row's tri-state comes from `directory_state`, not from which map it was found in. That
+    // matters for a directory Custom path sharing its prefix with another Category: `Space` on
+    // it calls the Category-agnostic `deselect_root`, so its checkbox must answer for every
+    // Entry that would touch, exactly as the grouped column's does (ADR-0006's #86 addendum).
     let mut rows: Vec<ExplorerRow> = selection
         .active_entries_under(&root)
+        .chain(selection.withheld_entries_under(&root))
         .filter(|entry| entry.category == CUSTOM_PATHS)
-        .map(|entry| custom_path_row(entry, DirectoryState::All, size_cache))
-        .chain(
-            selection
-                .withheld_entries_under(&root)
-                .filter(|entry| entry.category == CUSTOM_PATHS)
-                .map(|entry| custom_path_row(entry, DirectoryState::None, size_cache)),
-        )
+        .map(|entry| custom_path_row(selection, entry, size_cache))
         .collect();
     // Sorted on the rendered label (#107 decision 10): root-scoped (`/`) rows group ahead of
     // home-scoped (`~/`) ones for free (ASCII `/` < `~`), and the order is always explainable
@@ -1178,9 +1178,14 @@ fn custom_path_rows(
 /// typed (the add field prefills `~/` non-root, `/` root) and stays honest about an Absolute
 /// root: a bare `relative_path` would render `/etc/hosts` as `etc/hosts`, indistinguishable from
 /// a Home-rooted `~/etc/hosts`.
+///
+/// The checkbox comes from [`SelectionModel::directory_state`] — the same Category-agnostic
+/// source the grouped column uses (ADR-0006's #86 addendum) — rather than from whether the Entry
+/// was found active or withheld: a directory Custom path over another Category's Entries reads
+/// `[~]`, which is what `Space`'s Category-agnostic `deselect_root` would actually act on.
 fn custom_path_row(
+    selection: &SelectionModel,
     entry: &Entry,
-    state: DirectoryState,
     size_cache: &RefCell<HashMap<PathBuf, u64>>,
 ) -> ExplorerRow {
     let root_prefix = match entry.root {
@@ -1211,7 +1216,7 @@ fn custom_path_row(
         // renders as `DirectoryUnknownSize` and so has no probe to key a spinner against.
         absolute_path: (!is_directory).then(|| entry.absolute_path.clone()),
         kind,
-        state,
+        state: selection.directory_state(&entry.relative_path),
     }
 }
 
@@ -2478,6 +2483,11 @@ mod tests {
             .iter()
             .position(|r| r.label.contains("notes.md"))
             .expect("the withheld row is still listed");
+        assert_eq!(
+            rows[withheld_index].state,
+            DirectoryState::None,
+            "a withheld Custom path is listed unchecked, not hidden"
+        );
         screen.explorer_cursor = withheld_index;
 
         screen.handle_key(key(KeyCode::Char('r')), &mut state);
@@ -2628,6 +2638,34 @@ mod tests {
             projects_row.metric(),
             "—",
             "a directory Custom path shows an unknown-size dash, not an empty-directory dash"
+        );
+    }
+
+    #[test]
+    fn a_directory_custom_path_row_reads_partial_over_another_categorys_withheld_entries() {
+        // ADR-0006's #86 addendum: an explorer directory row's tri-state is Category-agnostic,
+        // because `Space` on it calls the Category-agnostic `deselect_root`. A `~/.config` Custom
+        // path sitting over a withheld Program configs Entry must therefore read `[~]` — a `[x]`
+        // there claims a state the toggle would not produce, which is the same dishonesty #86
+        // fixed for the grouped column.
+        let mut selection = SelectionModel::new(vec![
+            entry(CUSTOM_PATHS, EntryType::Directory, ".config"),
+            entry("Program configs", EntryType::File, ".config/foo.conf"),
+        ]);
+        selection.deselect_entry(Path::new(".config/foo.conf"));
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+
+        let rows = screen.explorer_rows(&state);
+        assert_eq!(rows.len(), 1, "one row per Custom path, never its children");
+        assert_eq!(rows[0].label, "~/.config/");
+        assert_eq!(
+            rows[0].state,
+            DirectoryState::Partial,
+            "the row's checkbox must reflect every Entry `Space` would withhold, not just the \
+             Custom-paths Category's share"
         );
     }
 
