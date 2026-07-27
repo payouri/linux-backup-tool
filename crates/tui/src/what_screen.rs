@@ -632,6 +632,18 @@ impl WhatScreen {
         rows
     }
 
+    /// The trail the Explorer header should caption its column with: empty for the flat,
+    /// non-drilling Custom-paths column (#106/#107/#148), whose rows are already full paths and
+    /// have no depth for a trail to describe. `breadcrumb` is *not* reset when the Category cursor
+    /// moves (it belongs to whichever Category was last drilled into), so captioning the flat list
+    /// with it would print a path trail the rows on screen contradict.
+    fn explorer_crumbs(&self) -> &[OsString] {
+        match self.current_category() {
+            Some(CUSTOM_PATHS) => &[],
+            _ => &self.breadcrumb,
+        }
+    }
+
     /// Keeps both cursors within their (possibly shrunk) row counts after any action.
     fn clamp(&mut self, state: &WizardState) {
         let categories = self.categories.len();
@@ -1345,7 +1357,7 @@ pub fn render(
                         area,
                         &rows,
                         screen.current_category(),
-                        &screen.breadcrumb,
+                        screen.explorer_crumbs(),
                         screen.explorer_cursor,
                         true,
                         glyphs,
@@ -1377,7 +1389,7 @@ pub fn render(
             columns[1],
             &rows,
             screen.current_category(),
-            &screen.breadcrumb,
+            screen.explorer_crumbs(),
             screen.explorer_cursor,
             screen.focus == Pane::Explorer,
             glyphs,
@@ -2642,6 +2654,35 @@ mod tests {
             projects_row.metric(),
             "—",
             "a directory Custom path shows an unknown-size dash, not an empty-directory dash"
+        );
+    }
+
+    #[test]
+    fn the_custom_paths_column_captions_itself_with_no_drilled_trail() {
+        // The flat column has no depth, and `breadcrumb` survives a Category-cursor move, so
+        // without the opt-out the header would caption the flat list with the trail left over
+        // from the Category the user last drilled into — a path the rows on screen contradict.
+        let mut selection = nested_selection();
+        selection.add_custom_path(Path::new("/home/tester/notes.md"), Path::new(HOME));
+        let mut state = state_of(selection);
+        let mut screen = WhatScreen::new(state.selection());
+        focus_explorer(&mut screen, &mut state); // KDE Plasma
+        screen.handle_key(key(KeyCode::Right), &mut state); // drill into `.local/`
+        assert_eq!(screen.breadcrumb.len(), 1, "drilled one level");
+
+        screen.handle_key(key(KeyCode::Tab), &mut state);
+        screen.category_cursor = custom_paths_index(&screen);
+        screen.handle_key(key(KeyCode::Right), &mut state);
+        assert_eq!(screen.focus, Pane::Explorer);
+
+        let joined = render_to_lines(&screen, &state, 90, 20).join("\n");
+        assert!(
+            joined.contains("~/notes.md"),
+            "the flat list is on screen: {joined}"
+        );
+        assert!(
+            !joined.contains(".local"),
+            "the stale drilled trail must not caption the flat column: {joined}"
         );
     }
 
