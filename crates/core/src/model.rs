@@ -1558,6 +1558,74 @@ mod tests {
     }
 
     #[test]
+    fn re_adding_a_withheld_directory_custom_path_reactivates_its_root() {
+        // The directory half of the same dedupe fix, which routes through `reselect_root` rather
+        // than `reselect_entry` because a directory Custom path is withheld by a *Subtree*
+        // deselection at its own key. `reselect_entry` cannot reverse that — it bails on
+        // `is_under_deselected_root`, which the key's own root satisfies — so the path would come
+        // back still unchecked with no feedback, the silent no-op #106 rejected.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let dir_path = home.join("myproj");
+        std::fs::create_dir(&dir_path).expect("create dir");
+        let mut selection = SelectionModel::new(Vec::new());
+
+        selection.add_custom_path(&dir_path, home);
+        selection.deselect_root(Path::new("myproj"));
+        assert!(selection.entries().is_empty());
+        assert!(selection.is_root_deselected(Path::new("myproj")));
+
+        selection.add_custom_path(&dir_path, home);
+
+        assert_eq!(selection.entries().len(), 1);
+        assert_eq!(selection.entries()[0].relative_path, Path::new("myproj"));
+        assert!(
+            !selection.is_root_deselected(Path::new("myproj")),
+            "the Subtree deselection must be lifted, not left excluding the Entry it covers"
+        );
+        assert_eq!(
+            selection
+                .entries_in_category(catalog::CUSTOM_PATHS.name)
+                .len(),
+            1,
+            "reactivating must not leave a second, duplicate Entry behind"
+        );
+    }
+
+    #[test]
+    fn re_adding_a_custom_path_withheld_by_a_deselected_ancestor_stays_withheld() {
+        // Deliberate, per ADR-0006 Decision 2: exclusion is prefix-wins with no carve-outs, so a
+        // Custom path withheld by an *ancestor's* Subtree deselection does not reactivate on
+        // re-add — the ancestor still excludes it, and re-including one child of a deselected
+        // parent is exactly the negation model Decision 2 rejected. Pinned so anyone reading
+        // #106's "re-adding reactivates it" as unconditional gets a red test saying it isn't.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let nested = home.join(".config").join("nvim");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        let mut selection = SelectionModel::new(Vec::new());
+
+        selection.add_custom_path(&nested, home);
+        selection.deselect_root(Path::new(".config"));
+        assert!(selection.entries().is_empty());
+
+        selection.add_custom_path(&nested, home);
+
+        assert!(
+            selection.entries().is_empty(),
+            "prefix-wins: the ancestor's Subtree deselection still excludes it"
+        );
+        assert!(selection.is_root_deselected(Path::new(".config")));
+        assert_eq!(
+            selection
+                .entries_in_category(catalog::CUSTOM_PATHS.name)
+                .len(),
+            1,
+            "the withheld Entry must still be the only one — never duplicated by the re-add"
+        );
+    }
+
+    #[test]
     fn remove_custom_path_drops_an_active_entry() {
         let mut selection =
             SelectionModel::new(vec![entry(catalog::CUSTOM_PATHS.name, false, "notes.md")]);
