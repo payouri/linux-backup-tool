@@ -33,12 +33,20 @@ use crate::scan::CategoryScan;
 /// to remember *which Categories were on*, not their Entry lists, which would go stale.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
-    /// The names of every Category that was selected (had at least one active Entry).
+    /// The names of every Category that was selected (had at least one **active** Entry) —
+    /// deliberately active-only, unlike `custom_paths` below (#132): this field is the filter
+    /// `to_selection_model` uses to decide which fresh scans get pulled back in, so a Category
+    /// with only withheld Entries (only possible for Custom paths) correctly stays absent.
     #[serde(default)]
     pub selected_categories: Vec<String>,
-    /// The absolute paths of the Custom-paths Category's Entries — the one path-typed part of
-    /// a Selection that can't be re-derived from a fresh scan, so it's stored verbatim and
-    /// pruned on load if it no longer exists.
+    /// The absolute paths of the Custom-paths Category's **active and withheld** Entries — the
+    /// one path-typed part of a Selection that can't be re-derived from a fresh scan, so it's
+    /// stored verbatim and pruned on load if it no longer exists. Withheld ones persist too
+    /// (#132): Custom paths are the only Category whose Entries a fresh scan can never
+    /// rediscover, so dropping a toggled-off one here would be unrecoverable data loss —
+    /// unlike a Programs Entry, which simply re-scans next run. See ADR-0006's dated addendum
+    /// under Decision 4 for why this field and `selected_categories` legitimately read from
+    /// different sets.
     #[serde(default)]
     pub custom_paths: Vec<PathBuf>,
     /// Drill-down deselected relative paths, straight from
@@ -68,10 +76,15 @@ pub struct LoadedProfile {
 impl Profile {
     /// Captures the persistable state of `selection` plus the run's bound `output_location`.
     ///
-    /// A Category counts as selected when it has at least one *active* Entry; the Custom-paths
-    /// Category's active Entries are additionally recorded by absolute path (so they survive a
-    /// scan that can't re-discover them). Category names are deduplicated and sorted so the
-    /// written `profile.toml` is stable run-to-run when the Selection hasn't changed.
+    /// A Category counts as selected when it has at least one *active* Entry. The Custom-paths
+    /// Category is the one exception (#132): its **active _and_ withheld** Entries are both
+    /// recorded by absolute path, because Custom paths are the one Category a fresh scan can
+    /// never re-discover (their allowlist is empty by design) — dropping a withheld one here
+    /// would be silent, permanent data loss, unlike a Programs Entry, which simply re-scans
+    /// next run. `selected_categories` deliberately stays active-only even so: see its field
+    /// doc and ADR-0006's dated addendum under Decision 4 for why the two fields legitimately
+    /// read from different sets. Category names are deduplicated and sorted so the written
+    /// `profile.toml` is stable run-to-run when the Selection hasn't changed.
     pub fn from_selection(selection: &SelectionModel, output_location: Option<PathBuf>) -> Self {
         let selected_categories: Vec<String> = selection
             .entries()
@@ -82,9 +95,8 @@ impl Profile {
             .collect();
 
         let custom_paths = selection
-            .entries()
+            .entries_in_category(catalog::CUSTOM_PATHS.name)
             .iter()
-            .filter(|entry| entry.category == catalog::CUSTOM_PATHS.name)
             .map(|entry| entry.absolute_path.clone())
             .collect();
 
@@ -428,6 +440,125 @@ mod tests {
             reconstructed.deselected_roots(),
             original.deselected_roots()
         );
+    }
+
+    #[test]
+    fn a_withheld_file_custom_path_round_trips_as_withheld() {
+        // #132: a toggled-off Custom path must come back next run as a restored-but-unchecked
+        // row, not vanish — matching every other Category.
+        let home = PathBuf::from("/home/test");
+        let mut original = SelectionModel::new(Vec::new());
+        original.add_custom_path(Path::new("/home/test/notes.md"), &home);
+        original.deselect_entry(Path::new("notes.md"));
+
+        let profile = Profile::from_selection(&original, None);
+        assert_eq!(
+            profile.custom_paths,
+            vec![PathBuf::from("/home/test/notes.md")]
+        );
+
+        let reconstructed = profile.to_selection_model(&[], &home);
+
+        assert!(reconstructed.entries().is_empty());
+        assert_eq!(
+            reconstructed
+                .entries_in_category(catalog::CUSTOM_PATHS.name)
+                .len(),
+            1,
+            "a withheld Custom path must be visible to the Category accessor even though \
+             it's absent from the active Selection"
+        );
+    }
+
+    #[test]
+    fn a_withheld_directory_custom_path_round_trips_with_its_root() {
+        // #132's phantom-root bug: today the root ends up pointing at nothing because the
+        // path it excluded was never persisted. Fails without the `from_selection` fix.
+        let home = PathBuf::from("/home/test");
+        let mut original = SelectionModel::new(Vec::new());
+        original.add_custom_path(Path::new("/home/test/myproj"), &home);
+        original.deselect_root(Path::new("myproj"));
+
+        let profile = Profile::from_selection(&original, None);
+        assert_eq!(
+            profile.custom_paths,
+            vec![PathBuf::from("/home/test/myproj")]
+        );
+        assert_eq!(profile.deselected_roots, vec![PathBuf::from("myproj")]);
+
+        let reconstructed = profile.to_selection_model(&[], &home);
+
+        assert!(reconstructed.entries().is_empty());
+        assert!(reconstructed.is_root_deselected(Path::new("myproj")));
+        assert_eq!(
+            reconstructed
+                .entries_in_category(catalog::CUSTOM_PATHS.name)
+                .len(),
+            1,
+            "the root must cover the reconstructed Entry, not point at nothing"
+        );
+    }
+
+    #[test]
+    fn withholding_a_custom_path_keeps_it_while_removing_it_drops_it() {
+        // The money test: remove-vs-withhold as an externally observable difference in the
+        // Profile — the premise #107 and #148 both rest on.
+        let home = PathBuf::from("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+        selection.add_custom_path(Path::new("/home/test/keep.md"), &home);
+        selection.add_custom_path(Path::new("/home/test/forget.md"), &home);
+        selection.deselect_entry(Path::new("keep.md"));
+        selection.remove_custom_path(Path::new("forget.md"));
+
+        let profile = Profile::from_selection(&selection, None);
+
+        assert_eq!(
+            profile.custom_paths,
+            vec![PathBuf::from("/home/test/keep.md")],
+            "withheld keeps the path in the Profile; removed drops it"
+        );
+    }
+
+    #[test]
+    fn a_withheld_custom_path_is_not_a_selected_category() {
+        // Deliberate asymmetry: `selected_categories` stays active-only even after the
+        // `custom_paths` fix, because its documented meaning ("had at least one active
+        // Entry") is the filter deciding which fresh scans get pulled in. Pinned here so
+        // anyone "unifying" `from_selection` back to one pass gets a red test whose name
+        // says it was on purpose.
+        let home = PathBuf::from("/home/test");
+        let mut original = SelectionModel::new(Vec::new());
+        original.add_custom_path(Path::new("/home/test/notes.md"), &home);
+        original.deselect_entry(Path::new("notes.md"));
+
+        let profile = Profile::from_selection(&original, None);
+
+        assert_eq!(
+            profile.custom_paths,
+            vec![PathBuf::from("/home/test/notes.md")]
+        );
+        assert!(
+            !profile
+                .selected_categories
+                .contains(&catalog::CUSTOM_PATHS.name.to_string()),
+            "a Category with only withheld Entries must not read as selected"
+        );
+    }
+
+    #[test]
+    fn removing_a_custom_path_leaves_no_residue_in_the_profile() {
+        let home = PathBuf::from("/home/test");
+        let mut selection = SelectionModel::new(Vec::new());
+        selection.add_custom_path(Path::new("/home/test/myproj"), &home);
+        selection.deselect_root(Path::new("myproj"));
+
+        selection.remove_custom_path(Path::new("myproj"));
+
+        let profile = Profile::from_selection(&selection, None);
+
+        assert!(profile.custom_paths.is_empty());
+        assert!(profile.deselected_paths.is_empty());
+        assert!(profile.deselected_roots.is_empty());
     }
 
     #[test]

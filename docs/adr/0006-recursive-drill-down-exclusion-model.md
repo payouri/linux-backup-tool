@@ -181,3 +181,41 @@ there were fully selected. This is a direct, correct consequence of Decision 5's
 `directory_state`/`deselect_root` pairing, not a bug: the checkbox tells the truth about what the
 toggle does. A future UI affordance to communicate "this toggle also affects other Categories" is
 a separate, later concern with no ticket currently open for it.
+
+## Addendum: 2026-07-27 — a withheld Custom path persists too, and Custom paths opt out of the recursive explorer (issues #132 / #106 / #107 / #148)
+
+Decision 4 established that `deselected_paths`/`deselected_roots` persist unchanged and need no
+migration for deep exclusion. It did not, on its own, guarantee the Entry a deselection *excludes*
+also persists — and for every Category but one that's fine, because `scan::scan_taxonomy`
+rediscovers a Category's Entries fresh each run regardless of what the Profile remembers. Custom
+paths are the one Category with no allowlist to rescan: the path only exists in the model because
+the user typed it. `Profile::from_selection` recorded only *active* Custom paths, so toggling one
+off (a Drill-down withhold, meant to be reversible) and finishing the run dropped it from
+`profile.toml` entirely — indistinguishable from `remove_custom_path` (#106) permanently forgetting
+it, and for a directory Custom path it left `deselected_roots` pointing at a path no longer in the
+model at all.
+
+**Fix:** `Profile::from_selection` derives `custom_paths` from
+`SelectionModel::entries_in_category` (active ∪ withheld, filtered by Category) instead of
+`entries()` (active only). `selected_categories` deliberately keeps reading from `entries()` —
+active only — because its documented job is deciding which fresh scans `to_selection_model` pulls
+back in, and a Category with only withheld Entries must not look selected for that purpose. After
+the fix, one function reads two different sets for two different fields; that is not the bug this
+addendum warns about; *removing* the asymmetry is. Whoever "tidies" `from_selection` back to a
+single `entries()` pass reintroduces the drop-on-withhold data loss this addendum exists to
+prevent — `a_withheld_custom_path_is_not_a_selected_category` (`crates/core/src/profile.rs`) is
+the red flag for exactly that change.
+
+No new Profile field, no migration, no `SCHEMA_VERSION` bump: the shape Decision 4 already fixed
+is untouched, this only changes which Entries populate the existing `custom_paths` field.
+
+**Also decided alongside this (#107):** the recursive Drill-down explorer (Decisions 1–5 above)
+does not extend to the Custom-paths Category. Its Explorer column is a flat, non-recursive list of
+the added Custom paths — there is nothing to drill into, since a Custom path is always exactly one
+Entry with no allowlist-derived children of its own. This is a narrower carve-out than Decision
+2's rejected "gitignore-style negation": it doesn't touch the exclusion *model* (still the flat
+two-set `deselected`/`deselected_roots`, unchanged) or `directory_state`/`deselect_root`'s
+semantics (still Category-agnostic, still prefix-wins) — it only means the Custom-paths Category's
+Explorer *rendering* stops presenting a tree at all. `remove_custom_path` (#106) and the withhold
+persistence above are what make a flat list sufficient: add, withhold, remove is the Category's
+whole vocabulary, and none of the three needs a directory tree to act on.
