@@ -122,7 +122,7 @@ jobs:
           flatpak-node-generator npm crates/gui/ui/package-lock.json \
             -o crates/gui/flatpak/node-sources.json
 
-      - uses: flatpak/flatpak-github-actions/flatpak-builder@401fe28a8384095fc1531b9d320b292f0ee45adb # v6.7
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
         with:
           bundle: linux-backup-gui.flatpak
           manifest-path: crates/gui/flatpak/io.github.payouri.linux-backup.yml
